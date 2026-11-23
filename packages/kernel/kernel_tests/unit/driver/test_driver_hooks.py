@@ -83,8 +83,9 @@ async def test_sdk_stop_hook_forwards_last_assistant_text(monkeypatch):
     sdk_hooks = getattr(d, "_build_sdk_hooks")(hooks)
 
     cb = sdk_hooks["Stop"][0].hooks[0]
-    out = await cb({}, None, None)
+    out = await cb({"background_tasks": [{"id": "task-1", "type": "shell"}]}, None, None)
     assert captured["data"]["last_assistant_message"] == "done analysis"
+    assert captured["data"]["background_tasks"] == [{"id": "task-1", "type": "shell"}]
     assert out["decision"] == "block"
 
 
@@ -130,14 +131,24 @@ async def test_make_driver_hooks_stop_passes_final_text(tmp_path, monkeypatch):
     orch = Orchestrator.create_default(config_dir=tmp_path)
     seen: dict = {}
 
-    async def fake_decide_stop(mig_id, final_text, *, block_key):
-        seen.update(mig_id=mig_id, final_text=final_text, block_key=block_key)
+    async def fake_decide_stop(mig_id, final_text, *, block_key, background_tasks):
+        seen.update(
+            mig_id=mig_id,
+            final_text=final_text,
+            block_key=block_key,
+            background_tasks=background_tasks,
+        )
         return None
 
     monkeypatch.setattr(orch, "_decide_stop", fake_decide_stop)
     dh = orch.make_driver_hooks("mig-9")
-    await dh.on_stop("mig-9", {"last_assistant_message": "spec done"})
-    assert seen == {"mig_id": "mig-9", "final_text": "spec done", "block_key": "mig-9"}
+    await dh.on_stop("mig-9", {"last_assistant_message": "spec done", "background_tasks": []})
+    assert seen == {
+        "mig_id": "mig-9",
+        "final_text": "spec done",
+        "block_key": "mig-9",
+        "background_tasks": [],
+    }
 
 
 # ── subagent hooks: SDK adapter registers + forwards ──

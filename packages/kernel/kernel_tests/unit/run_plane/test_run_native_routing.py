@@ -37,7 +37,7 @@ class TestNativeHookRouting:
         assert not getattr(restored, "_cli_to_workflow_controller_session")
         calls = []
 
-        async def decide_stop(session_id, final_text, *, block_key):
+        async def decide_stop(session_id, final_text, *, block_key, background_tasks):
             calls.append((session_id, final_text, block_key))
             return {"decision": "block", "reason": "reviewer feedback"}
 

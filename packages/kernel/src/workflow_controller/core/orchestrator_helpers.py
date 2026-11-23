@@ -226,17 +226,26 @@ def _build_stop_requested_event(
     final_text: str,
     block_key: str,
     role: str,
+    *,
+    background_tasks: object = None,
 ) -> Event:
     """stop_requested 控制事件（角色随池内 session，缺席按 worker）。"""
+    data: dict[str, Any] = {
+        "final_text": final_text,
+        "block_key": block_key,
+        "role": role,
+    }
+    if isinstance(background_tasks, list):
+        data["background_tasks"] = [
+            {key: str(task[key]) for key in ("id", "type", "status") if key in task}
+            for task in background_tasks
+            if isinstance(task, dict)
+        ]
     return Event.create(
         session_id=mig_session_id,
         iteration=0,
         event_type="stop_requested",
-        data={
-            "final_text": final_text,
-            "block_key": block_key,
-            "role": role,
-        },
+        data=data,
     )
 
 
