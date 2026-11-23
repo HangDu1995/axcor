@@ -131,7 +131,6 @@ async def test_send_interrupts_active_query_before_injecting() -> None:
 
     async def resume(_sid: str) -> None:
         steps.append("resume")
-        session.current_iteration = 1
 
     orch = SimpleNamespace(
         affiliation=SimpleNamespace(resolve=lambda _sid: None),
