@@ -317,15 +317,28 @@ class ReviewerInterceptor:
         # 在途子代理非空时直接放行本次 Stop：主 agent 只是在等子代理结果，
         # 原查询仍在运行，不经 reviewer 判定。检查必须先于疑问句分支，
         # 否则带疑问句的等待会被误路由到提问路径造成刷屏。
-        in_flight = self._host.subagent_status(mig_session_id)
+        background_tasks = event.data.get("background_tasks")
+        if isinstance(background_tasks, list):
+            in_flight = [
+                {"id": task.get("id"), "type": task.get("type"), "status": task.get("status")}
+                for task in background_tasks
+                if isinstance(task, dict)
+            ]
+            hook = "stop_hook_background_task_wait"
+        else:
+            in_flight = [
+                {**agent, "agent_id": agent_id}
+                for agent_id, agent in self._host.subagent_status(mig_session_id).items()
+            ]
+            hook = "stop_hook_native_subagent_wait"
         if in_flight:
             self._emitter.emit_async(
                 mig_session_id,
-                "stop_hook_native_subagent_wait",
+                hook,
                 {
                     "action": "stop",
-                    "rationale": "query remains active while sub-agents run",
-                    "subagents": [{**v, "agent_id": k} for k, v in in_flight.items()],
+                    "rationale": "query remains active while background work runs",
+                    "background_tasks": in_flight,
                 },
             )
             return InterceptResult(action="stop")

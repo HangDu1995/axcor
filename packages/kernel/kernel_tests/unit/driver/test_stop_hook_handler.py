@@ -70,6 +70,48 @@ def _patch_reviewer(orch: Orchestrator, decision: HookDecision) -> list[str]:
 
 
 class TestStopHookBasicGating:
+    def test_stop_event_keeps_only_task_identity(self) -> None:
+        from workflow_controller.core.orchestrator_helpers import _build_stop_requested_event
+
+        event = _build_stop_requested_event(
+            "session-1",
+            "等待",
+            "query-1",
+            "worker",
+            background_tasks=[
+                {
+                    "id": "bash-1",
+                    "type": "shell",
+                    "status": "running",
+                    "command": "contains private arguments",
+                }
+            ],
+        )
+        assert event.data["background_tasks"] == [
+            {"id": "bash-1", "type": "shell", "status": "running"}
+        ]
+
+    async def test_cli_stop_forwards_background_task_snapshot(self, monkeypatch, orch) -> None:
+        getattr(orch, "_cli_to_workflow_controller_session")["cli-1"] = "ouro-1"
+        seen = {}
+
+        async def decide(session_id, final_text, *, block_key, background_tasks):
+            seen.update(
+                session_id=session_id,
+                final_text=final_text,
+                block_key=block_key,
+                background_tasks=background_tasks,
+            )
+            return None
+
+        monkeypatch.setattr(orch, "_decide_stop", decide)
+        payload = _payload(cli_session_id="cli-1")
+        payload["background_tasks"] = [{"id": "bash-1", "type": "shell"}]
+        await getattr(orch, "_handle_stop_request")("cli-1", payload)
+
+        assert seen["background_tasks"] == payload["background_tasks"]
+        assert seen["session_id"] == "ouro-1"
+
     async def test_returns_none_when_reviewer_disabled(
         self,
         base_config: AppConfig,

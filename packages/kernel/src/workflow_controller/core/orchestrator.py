@@ -650,6 +650,7 @@ class Orchestrator:
                 sid,
                 data.get("last_assistant_message", "") or "",
                 block_key=sid,
+                background_tasks=data.get("background_tasks"),
             ),
             on_subagent_start=self._subagents.on_start,
             on_subagent_progress=self._subagents.on_progress,
@@ -1631,7 +1632,12 @@ class Orchestrator:
                 session_id,
             )
             return None
-        return await self._decide_stop(mig_session_id, final_text, block_key=session_id)
+        return await self._decide_stop(
+            mig_session_id,
+            final_text,
+            block_key=session_id,
+            background_tasks=data.get("background_tasks"),
+        )
 
     async def _decide_stop(
         self,
@@ -1639,6 +1645,7 @@ class Orchestrator:
         final_text: str,
         *,
         block_key: str,
+        background_tasks: object = None,
     ) -> dict[str, Any] | None:
         """Reviewer decision for a stop hook. Driver-agnostic.
 
@@ -1677,6 +1684,7 @@ class Orchestrator:
             final_text,
             block_key,
             session_obj.config.role if session_obj else "worker",
+            background_tasks=background_tasks,
         )
         stop_result = await self.bus.emit(stop_event)
         if stop_result is not None:
