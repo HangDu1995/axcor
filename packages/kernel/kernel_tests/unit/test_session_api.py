@@ -17,7 +17,9 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,6 +28,116 @@ from workflow_controller.api.session_api import ReviewerStartOverrides, SessionA
 from workflow_controller.config.settings import AppConfig, SessionConfig, SessionReviewerConfig
 from workflow_controller.session.manager import SessionPool
 from workflow_controller.session.session import Session, SessionState
+
+
+@pytest.mark.asyncio
+async def test_send_restores_evicted_session_before_inject_and_resume() -> None:
+    """A restored idle session receives the message before its query resumes."""
+
+    @asynccontextmanager
+    async def guard():
+        yield
+
+    session = SimpleNamespace(
+        state=SimpleNamespace(value="idle"),
+        is_query_active=False,
+        manual_prompt_guard=guard,
+    )
+    current = [None]
+    steps: list[str] = []
+
+    def restore(_sid: str):
+        steps.append("restore")
+        current[0] = session
+        return session
+
+    async def inject(_sid: str, _text: str):
+        assert current[0] is session
+        steps.append("inject")
+
+    async def resume(_sid: str):
+        assert current[0] is session
+        steps.append("resume")
+
+    orch = SimpleNamespace(
+        affiliation=SimpleNamespace(resolve=lambda _sid: None),
+        pool=SimpleNamespace(get=lambda _sid: current[0]),
+        restore_session_from_store=restore,
+        inject_prompt=inject,
+        resume_session=resume,
+    )
+    assert await SessionAPI(orch).send_message("s1", "hello") is True
+    assert steps == ["restore", "inject", "resume"]
+
+
+@pytest.mark.asyncio
+async def test_send_interrupts_active_query_before_injecting() -> None:
+    """An active query drains before input and keeps its iteration number."""
+    steps: list[str] = []
+
+    @asynccontextmanager
+    async def guard():
+        yield
+
+    session = SimpleNamespace(
+        state=SimpleNamespace(value="running"),
+        is_query_active=True,
+        current_iteration=7,
+        manual_prompt_guard=guard,
+    )
+
+    async def pause(_sid: str) -> bool:
+        steps.append("pause")
+        session.state.value = "idle"
+        return True
+
+    async def inject(_sid: str, text: str) -> None:
+        assert text == "check old process"
+        steps.append("inject")
+
+    async def resume(_sid: str) -> None:
+        steps.append("resume")
+        session.current_iteration = 1
+
+    orch = SimpleNamespace(
+        affiliation=SimpleNamespace(resolve=lambda _sid: None),
+        pool=SimpleNamespace(get=lambda _sid: session),
+        pause_session=pause,
+        inject_prompt=inject,
+        resume_session=resume,
+    )
+    assert await SessionAPI(orch).send_message("s1", "check old process") is True
+    assert steps == ["pause", "inject", "resume"]
+    assert session.current_iteration == 7
+
+
+@pytest.mark.asyncio
+async def test_send_does_not_inject_when_active_query_does_not_drain() -> None:
+    """A failed drain leaves the message undelivered."""
+
+    @asynccontextmanager
+    async def guard():
+        yield
+
+    session = SimpleNamespace(
+        state=SimpleNamespace(value="running"),
+        is_query_active=True,
+        current_iteration=7,
+        manual_prompt_guard=guard,
+    )
+    inject = AsyncMock()
+    resume = AsyncMock()
+    orch = SimpleNamespace(
+        affiliation=SimpleNamespace(resolve=lambda _sid: None),
+        pool=SimpleNamespace(get=lambda _sid: session),
+        pause_session=AsyncMock(return_value=False),
+        inject_prompt=inject,
+        resume_session=resume,
+    )
+    with pytest.raises(RuntimeError, match="did not drain"):
+        await SessionAPI(orch).send_message("s1", "check old process")
+    inject.assert_not_awaited()
+    resume.assert_not_awaited()
 
 
 def test_list_claude_sessions_discovers_other_user_home(tmp_path, monkeypatch):

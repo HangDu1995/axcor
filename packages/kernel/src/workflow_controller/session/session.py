@@ -19,6 +19,7 @@ import logging
 import os
 import time
 import traceback
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -115,6 +116,7 @@ class Session:
         self._active_since: float | None = None
 
         self._manual_prompt_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._manual_prompt_lock = asyncio.Lock()
         self.waiting_for_auto_reply_fallback = False
         self._stop_requested: bool = False
         # resume() 后下次 query 用 sdk_session_id 续同一个 claude session
@@ -426,6 +428,15 @@ class Session:
 
     async def inject_prompt(self, prompt: str) -> None:
         await self._manual_prompt_queue.put(prompt)
+
+    @property
+    def is_query_active(self) -> bool:
+        return self._active_since is not None
+
+    @asynccontextmanager
+    async def manual_prompt_guard(self):
+        async with self._manual_prompt_lock:
+            yield
 
     async def poll_manual_prompt(self) -> str | None:
         try:
