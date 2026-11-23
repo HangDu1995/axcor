@@ -901,12 +901,12 @@ class Orchestrator:
                 prepare=lambda: self.pool.play(session_id),
             )
 
-    async def resume_session(self, session_id: str) -> None:
+    async def resume_session(self, session_id: str, *, preserve_iteration: bool = False) -> None:
         session = self.pool.get(session_id)
         if session:
             await self._activate_session(
                 session,
-                prepare=lambda: self.pool.resume(session_id),
+                prepare=lambda: self.pool.resume(session_id, preserve_iteration=preserve_iteration),
             )
 
     async def continue_session(self, session_id: str, prompt: str | None = None) -> None:

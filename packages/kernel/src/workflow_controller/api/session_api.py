@@ -1009,7 +1009,6 @@ class SessionAPI:
         async with session.manual_prompt_guard():
             was_running = session.is_query_active
             if was_running:
-                saved_iteration = session.current_iteration
                 drained = await self._orch.pause_session(session_id)
                 if not drained:
                     raise RuntimeError(
@@ -1017,9 +1016,10 @@ class SessionAPI:
                     )
             await self._orch.inject_prompt(session_id, text)
             if was_running or session.state.value == "idle":
-                await self._orch.resume_session(session_id)
                 if was_running:
-                    session.current_iteration = saved_iteration
+                    await self._orch.resume_session(session_id, preserve_iteration=True)
+                else:
+                    await self._orch.resume_session(session_id)
                 return True
             return False
 

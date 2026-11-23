@@ -95,9 +95,9 @@ async def test_send_interrupts_active_query_before_injecting() -> None:
         assert text == "check old process"
         steps.append("inject")
 
-    async def resume(_sid: str) -> None:
+    async def resume(_sid: str, *, preserve_iteration: bool = False) -> None:
+        assert preserve_iteration is True
         steps.append("resume")
-        session.current_iteration = 1
 
     orch = SimpleNamespace(
         affiliation=SimpleNamespace(resolve=lambda _sid: None),

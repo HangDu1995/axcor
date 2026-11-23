@@ -402,7 +402,7 @@ class Session:
         self.active_seconds = 0.0
         self._active_since = None
 
-    async def resume(self) -> None:
+    async def resume(self, *, preserve_iteration: bool = False) -> None:
         """Resume after pause, continuing the SAME opencode session (sdk_session_id)
         on the next query via --session. If sdk_session_id is not yet captured,
         tries to recover it from opencode.db as a best-effort fallback; if still
@@ -420,7 +420,8 @@ class Session:
         self.state = SessionState.RUNNING
         self.loop_status = "yes"
         self.stop_reason = None
-        self.current_iteration = 1
+        if not preserve_iteration:
+            self.current_iteration = 1
         self.result = None
         # 续跑按新执行段计时，旧执行段耗时不挤占本段预算。
         self.active_seconds = 0.0

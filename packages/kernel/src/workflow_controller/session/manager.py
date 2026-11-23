@@ -161,10 +161,10 @@ class SessionPool:
             await session.play()
             await self._persist_session(session)
 
-    async def resume(self, session_id: str) -> None:
+    async def resume(self, session_id: str, *, preserve_iteration: bool = False) -> None:
         session = self._sessions.get(session_id)
         if session:
-            await session.resume()
+            await session.resume(preserve_iteration=preserve_iteration)
             await self._persist_session(session)
 
     async def inject_prompt(self, session_id: str, prompt: str) -> None:
