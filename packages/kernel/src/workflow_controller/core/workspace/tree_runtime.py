@@ -53,7 +53,7 @@ from workflow_controller.plugin.workspace import RebuildScriptDecl, WorkspaceTre
 
 if TYPE_CHECKING:
     from workflow_controller.core.checkpoints import CheckpointStore
-    from workflow_controller.core.conversation_restore import ConversationRestoreData
+    from workflow_controller.core.restore.conversation import ConversationRestoreData
     from workflow_controller.core.workspace.manager import BackgroundDrainHook
 
 __all__ = [

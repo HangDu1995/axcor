@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from workflow_controller.core.checkpoints import DispatchAnchor
-from workflow_controller.core.conversation_restore import (
+from workflow_controller.core.restore.conversation import (
     CONTINUE_SIGNAL,
     ConversationRestorePlan,
     ConversationRestorer,

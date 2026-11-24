@@ -78,6 +78,7 @@ from workflow_controller.core.reviewer_runner import DriverReviewerRunner
 from workflow_controller.core.reviewer_service import ReviewerService
 from workflow_controller.core.runs import RunKind, RunNotFoundError, RunStore
 from workflow_controller.core.session_run_affiliation import SessionRunAffiliationService
+from workflow_controller.core.session_traceback import SessionTracebackHost
 from workflow_controller.core.session_workspace import SessionWorkspaceHost
 from workflow_controller.core.subagent_tracker import SubagentTracker
 from workflow_controller.driver.hooks import (
@@ -164,13 +165,32 @@ class Orchestrator:
         self._affiliation: SessionRunAffiliationService | None = (
             None  # 懒建（affiliation 属性），随 run_store
         )
+
         # 单会话工作区宿主：traceback 工作区模式的会话树/终态同步/实时视图
+        async def _async_pool_get(session_id: str) -> Session | None:
+            return self.pool.get(session_id)
+
         self._session_workspaces = SessionWorkspaceHost(
             checkpoint_db_path=lambda: self.run_store.db_path,
-            resolve_session=self.pool.get,
+            resolve_session=_async_pool_get,
             persist_session=self.pool.persist,
             stop_session=self.stop_session,
             start_resumed_session=self.start_session_with_resume,
+        )
+        # 历史检查点兼容面：快照代检查点读取/预览/重放与 session 导入
+        self._session_traceback = SessionTracebackHost(
+            checkpoint_db_path=lambda: self.run_store.db_path,
+            resolve_session=_async_pool_get,
+            load_roster_session=self.event_router.get_session,
+            session_workspaces=self._session_workspaces,
+            start_resumed_session=self.start_session_with_resume,
+            create_session=self.pool.create,
+            persist_session=self.pool.persist,
+            store_events=self.event_router.store_many,
+            default_runtime=lambda: self.config.runtime,
+            resolve_runtime=self._resolve_runtime_name,
+            work_dir=lambda: self.default_project_dir,
+            write_hook_config=self.generate_hook_config,
         )
         # 激活后挂靠钩子：显式归属在 _runtime_lock 临界区内落账的唯一通道
         self._post_attach_hook: Callable[[Session], Awaitable[None]] | None = None
@@ -183,6 +203,18 @@ class Orchestrator:
     def session_workspaces(self) -> SessionWorkspaceHost:
         """单会话工作区宿主（run 平面查询/回滚面与实时视图消费）。"""
         return self._session_workspaces
+
+    @property
+    def session_traceback(self) -> SessionTracebackHost:
+        """历史检查点兼容面（快照代读取/预览/重放与 session 导入）。"""
+        return self._session_traceback
+
+    @staticmethod
+    def _resolve_runtime_name(runtime: str | None) -> str:
+        """runtime 名解析（环境变量优先，与驱动工厂同一优先序）。"""
+        from workflow_controller.driver.factory import resolve_runtime as _resolve_runtime
+
+        return _resolve_runtime(runtime)
 
     @property
     def plugin_registry(self) -> PluginRegistry:
@@ -434,6 +466,9 @@ class Orchestrator:
         # 单会话托管工作区随删除整树回收（对已同步树为幂等空操作）
         with contextlib.suppress(Exception):
             await self._session_workspaces.cleanup_session(session_id)
+        # 重放 fork 目录随删除回收（内存映射缺失时回落持久化溯源行）
+        with contextlib.suppress(Exception):
+            await self._session_traceback.cleanup_fork(session_id)
         # 直查 _affiliation 而非属性：未铸过归属时不触记录（懒建纪律）。
         if self._affiliation is None:
             return

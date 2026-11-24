@@ -56,7 +56,7 @@ from workflow_controller.core.checkpoints import (
     ScopeCheckpoint,
     checkpoint_to_dict,
 )
-from workflow_controller.core.conversation_restore import (
+from workflow_controller.core.restore.conversation import (
     ConversationRestorePlan,
     ConversationRestorer,
     TranscriptLocator,
@@ -1323,6 +1323,42 @@ class RunCoordinator:
     async def list_session_workspace_checkpoints(self, session_id: str) -> list[dict[str, Any]]:
         """单会话树的检查点查询。"""
         return await self._orch.list_session_workspace_checkpoints(session_id)
+
+    async def list_session_checkpoints(self, session_id: str) -> list[dict[str, Any]]:
+        """单会话两代检查点合并查询（工作区模式行 + 旧表历史行）。"""
+        return await self._orch.session_traceback.list_checkpoints(session_id)
+
+    async def list_session_checkpoint_files(
+        self, session_id: str, checkpoint_id: str, subpath: str = ""
+    ) -> list[dict[str, Any]]:
+        """按检查点列文件态子项（快照代与工作区代统一预览面）。"""
+        return await self._orch.session_traceback.list_checkpoint_files(
+            session_id, checkpoint_id, subpath
+        )
+
+    async def read_session_checkpoint_file(
+        self, session_id: str, checkpoint_id: str, path: str
+    ) -> dict[str, Any] | None:
+        """按检查点读单文件内容（快照代与工作区代统一预览面）。"""
+        return await self._orch.session_traceback.read_checkpoint_file(
+            session_id, checkpoint_id, path
+        )
+
+    async def replay_session_checkpoint(
+        self,
+        session_id: str,
+        checkpoint_id: str,
+        *,
+        runtime: str | None = None,
+        overrides: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """从历史检查点重放新会话（旧 traceback 触发的内核等价物）。"""
+        return await self._orch.session_traceback.replay_checkpoint(
+            session_id,
+            checkpoint_id,
+            runtime=runtime,
+            overrides=overrides,
+        )
 
     async def restore_session_subagent(
         self,
