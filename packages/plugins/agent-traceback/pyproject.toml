@@ -1,0 +1,33 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "workflow-controller-plugin-agent-traceback"
+version = "0.1.0"
+description = "检查点回放插件：subagent 起点快照文件态，支持检查点重放与会话重建"
+requires-python = ">=3.12"
+license = "LicenseRef-CANN-2.0"
+authors = [{ name = "Workflow Controller Contributors" }]
+dependencies = ["workflow-controller-kernel"]
+
+[project.entry-points."workflow_controller.plugins"]
+agent_traceback = "workflow_controller.plugins.agent_traceback.plugin:AgentTracebackPlugin"
+
+[tool.uv.sources]
+workflow-controller-kernel = { workspace = true }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["workflow_controller*"]
+
+[tool.setuptools.package-data]
+"workflow_controller.plugins.agent_traceback" = ["config.yaml"]
