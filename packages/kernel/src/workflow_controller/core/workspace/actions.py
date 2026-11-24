@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from workflow_controller.core.workspace.integration import IntegrationConflict
     from workflow_controller.core.workspace.manifest import InheritBinding
     from workflow_controller.core.workspace.scope_tree import ScopeKind
@@ -59,12 +61,17 @@ class ScopeWorkspaceSpec:
 
 @dataclass(frozen=True)
 class PrepareScopeWorkspace:
-    """建区动作请求：在父作用域当前头建子工作区并登记账本。"""
+    """建区动作请求：在父作用域当前头建子工作区并登记账本。
+
+    workspace_dir 显式指定工作区落点（默认 workspaces/<scope_key>）：
+    单会话主写者用固定 ``root/`` 落点承载终态检出。
+    """
 
     parent_scope_id: str
     scope_key: str
     spec: ScopeWorkspaceSpec
     client_op_id: str
+    workspace_dir: Path | None = None
 
 
 @dataclass(frozen=True)

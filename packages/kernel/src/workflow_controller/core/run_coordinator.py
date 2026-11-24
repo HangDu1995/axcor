@@ -57,7 +57,6 @@ from workflow_controller.core.checkpoints import (
     checkpoint_to_dict,
 )
 from workflow_controller.core.conversation_restore import (
-    ConversationRestoreData,
     ConversationRestorePlan,
     ConversationRestorer,
     TranscriptLocator,
@@ -79,12 +78,7 @@ from workflow_controller.core.status_maps import (
     next_pause_gear,
 )
 from workflow_controller.core.workspace import (
-    ConflictPolicy,
     ScopeKind,
-    ScopeTree,
-    WorkspaceManager,
-    WorkspaceManifest,
-    WorkspaceRepository,
 )
 from workflow_controller.core.workspace.actions import (
     AbandonScope as CoreAbandonScope,
@@ -108,24 +102,16 @@ from workflow_controller.core.workspace.claims import (
 from workflow_controller.core.workspace.dispatch_groups import (
     WORKSPACE_READER,
     ChildDispatchRequest,
-    DispatchGroupArbiter,
-    DispatchReplayLedger,
     ReplayRejectedError,
 )
-from workflow_controller.core.workspace.integration import IntegrationCoordinator
 from workflow_controller.core.workspace.manager import ScopeQuiesceFailedError
-from workflow_controller.core.workspace.manifest import (
-    DEFAULT_WRITER_LOCAL_PATHSPECS,
-    RebuildScript,
-)
-from workflow_controller.core.workspace.oplog import SagaOplog
-from workflow_controller.core.workspace.recovery import (
-    WorkspaceRecoveryReport,
-    rebuild_workspace_tree,
+from workflow_controller.core.workspace.tree_runtime import (
+    PendingSubagentRestore,
+    WorkspaceTreeRuntime,
+    load_tree_config,
 )
 from workflow_controller.driver.hooks import BarrierDeny, BarrierOutcome, BarrierProceed
 from workflow_controller.plugin.dispatch_barrier import (
-    COMPAT_LATE_BARRIER,
     dispatch_capabilities_for,
     group_arbitration_block_reason,
     writer_dispatch_block_reason,
@@ -167,7 +153,6 @@ from workflow_controller.plugin.workspace import (
     IntegrateScope,
     IntegrationLineRetracted,
     PrepareScopeWorkspace,
-    RebuildScriptDecl,
     RestoreCommitted,
     RestoreScope,
     RestoreSessionBound,
@@ -849,100 +834,6 @@ _WORKSPACE_SCOPE_KINDS = {
 }
 
 
-def _tree_manifest(config: WorkspaceTreeConfig) -> WorkspaceManifest:
-    """SDK 路径策略声明 → 内核清单；未声明的桶交内核取默认。"""
-    rebuild_scripts = {
-        pathspec: RebuildScript(cmd=decl.cmd, verify=decl.verify)
-        for pathspec, decl in dict(config.rebuild_scripts).items()
-        if decl.cmd and decl.verify
-    }
-    return WorkspaceManifest(
-        merge=tuple(config.merge),
-        writer_local=tuple(config.writer_local) or DEFAULT_WRITER_LOCAL_PATHSPECS,
-        shared_readonly=tuple(config.shared_readonly),
-        shared_exclusive=tuple(config.shared_exclusive),
-        external=tuple(config.external),
-        rebuild_scripts=rebuild_scripts,
-    )
-
-
-def _workspace_branch_of(scope: ScopeRecord) -> str | None:
-    """从工作区引用（路径|分支）解出分支名供检查点行落账。"""
-    if not scope.workspace_ref:
-        return None
-    return scope.workspace_ref.rpartition("|")[2] or None
-
-
-# 树配置的持久化文件名（住仓树目录；崩溃后非建区动作也能按它重建树）
-_TREE_CONFIG_FILENAME = "tree-config.json"
-
-
-def _persist_tree_config(tree_dir: Path, config: WorkspaceTreeConfig) -> None:
-    """树配置落盘：重开/崩溃后无配置动作（废弃/恢复/回退）的重建依据。"""
-    payload = {
-        "root_dir": config.root_dir,
-        "conflict_policy": config.conflict_policy,
-        "retain_after_merge": config.retain_after_merge,
-        "claims_enforce": config.claims_enforce,
-        "on_no_dispatch_barrier": config.on_no_dispatch_barrier,
-        "background_drain_timeout_s": config.background_drain_timeout_s,
-        "merge": list(config.merge),
-        "writer_local": list(config.writer_local),
-        "shared_readonly": list(config.shared_readonly),
-        "shared_exclusive": list(config.shared_exclusive),
-        "external": list(config.external),
-        "rebuild_scripts": {
-            pathspec: {"cmd": decl.cmd, "verify": decl.verify}
-            for pathspec, decl in config.rebuild_scripts.items()
-        },
-    }
-    tree_dir.mkdir(parents=True, exist_ok=True)
-    (tree_dir / _TREE_CONFIG_FILENAME).write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-
-def _load_tree_config(work_dir: str | None, run_id: str) -> WorkspaceTreeConfig | None:
-    """读回持久化的树配置；工作目录缺失或未落盘返回 None。"""
-    if not work_dir:
-        return None
-    path = Path(work_dir) / ".workflow-controller" / "scopes" / run_id / _TREE_CONFIG_FILENAME
-    if not path.is_file():
-        return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return WorkspaceTreeConfig(
-            root_dir=str(payload["root_dir"]),
-            conflict_policy=str(payload.get("conflict_policy", "git_merge")),
-            retain_after_merge=bool(payload.get("retain_after_merge", False)),
-            claims_enforce=bool(payload.get("claims_enforce", False)),
-            on_no_dispatch_barrier=str(payload.get("on_no_dispatch_barrier", "fail")),
-            background_drain_timeout_s=float(payload.get("background_drain_timeout_s", 60.0)),
-            merge=tuple(str(p) for p in payload.get("merge", ())),
-            writer_local=tuple(str(p) for p in payload.get("writer_local", ())),
-            shared_readonly=tuple(str(p) for p in payload.get("shared_readonly", ())),
-            shared_exclusive=tuple(str(p) for p in payload.get("shared_exclusive", ())),
-            external=tuple(str(p) for p in payload.get("external", ())),
-            rebuild_scripts={
-                str(pathspec): RebuildScriptDecl(
-                    cmd=str(decl.get("cmd", "")), verify=str(decl.get("verify", ""))
-                )
-                for pathspec, decl in dict(payload.get("rebuild_scripts", {})).items()
-            },
-        )
-    except (OSError, ValueError, KeyError, TypeError):
-        logger.warning("树配置读回失败：%s", path, exc_info=True)
-        return None
-
-
-@dataclass
-class _PendingSubagentRestore:
-    """子代理回滚链的待绑定恢复：数据就绪，会话在确认后创建。"""
-
-    data: ConversationRestoreData
-    bound_session_id: str | None = None
-
-
 def _default_transcript_locator(native_session_id: str, workspace_path: str) -> Path | None:
     """默认 L2 定位：按父会话原生标识与工作目录解析 claude 系 JSONL。"""
     if not native_session_id:
@@ -951,94 +842,11 @@ def _default_transcript_locator(native_session_id: str, workspace_path: str) -> 
     return found
 
 
-class _WorkspaceTree:
-    """单 run 的工作区树运行时：装配好的管理器与根作用域标识。
-
-    树随首个工作区动作惰性建立；重开或崩溃后的既有仓经深度恢复重建
-    账本（作用域/两层代次/状态按检查点行与私有仓事实推断、操作日志
-    三态核对），对不上账显式失败。检查点账本与 run 记账库同库（表经
-    统一迁移铺设），随树装配接线。
-    """
-
-    def __init__(
-        self,
-        config: WorkspaceTreeConfig,
-        run_id: str,
-        checkpoints: CheckpointStore,
-        *,
-        drain_background_writers: BackgroundDrainHook | None = None,
-    ) -> None:
-        """按动作携带的配置装配私有仓、清单、协调器、管理器与检查点账本。
-
-        冲突档位词面校验失败即抛错（经执行桥转失败通知），不静默取默认；
-        drain_background_writers 为可注入的后台写进程排空回调。
-        """
-        repository = WorkspaceRepository(Path(config.root_dir), tree_id=run_id)
-        self.tree_dir = repository.tree_dir
-        self.repository = repository
-        self.replay_ledger = DispatchReplayLedger(repository.tree_dir / "dispatch")
-        scope_tree = ScopeTree()
-        oplog = SagaOplog(repository.tree_dir)
-        integration = IntegrationCoordinator(
-            repository, conflict_policy=ConflictPolicy(config.conflict_policy)
-        )
-        self.scope_tree = scope_tree
-        self.oplog = oplog
-        self.integration = integration
-        self.manager = WorkspaceManager(
-            repository=repository,
-            scope_tree=scope_tree,
-            oplog=oplog,
-            manifest=_tree_manifest(config),
-            integration_coordinator=integration,
-            drain_background_writers=drain_background_writers,
-            claims_enforce=config.claims_enforce,
-        )
-        self.checkpoints = checkpoints
-        self.arbiter = DispatchGroupArbiter(self.manager, checkpoints, self.replay_ledger)
-        self.retain_after_merge = config.retain_after_merge
-        self.on_no_dispatch_barrier = config.on_no_dispatch_barrier
-        self.barrier_wait_timeout_s = config.background_drain_timeout_s
-        self.root_scope_id = f"{run_id}-root"
-        self._config = config
-        self._child_seq = 0
-        # 子代理回滚链的待绑定恢复数据（scope_id → 恢复事实与已绑定会话）
-        self.pending_restores: dict[str, _PendingSubagentRestore] = {}
-        # 深度恢复结论（仅经恢复路径建立时非空，供日志与观测）
-        self.recovery_report: WorkspaceRecoveryReport | None = None
-
-    async def initialize(self) -> None:
-        """建立根作用域并持久化树配置；私有仓已存在时走深度恢复重建账本。"""
-        if self.repository.repo_dir.exists():
-            self.recovery_report = await rebuild_workspace_tree(
-                repository=self.repository,
-                scope_tree=self.scope_tree,
-                integration=self.integration,
-                manager=self.manager,
-                checkpoints=self.checkpoints,
-                oplog=self.oplog,
-                root_scope_id=self.root_scope_id,
-            )
-            if self.recovery_report.degraded:
-                logger.warning(
-                    "工作区树 %s 深度恢复降级项：%s",
-                    self.root_scope_id,
-                    "；".join(self.recovery_report.degraded),
-                )
-            return
-        _persist_tree_config(self.repository.tree_dir, self._config)
-        await self.manager.initialize_root(scope_id=self.root_scope_id)
-
-    def next_child_identity(self, parent_scope_id: str) -> tuple[str, str]:
-        """预分配一个子代理作用域键与配套操作号（键在树内不重号）。"""
-        self._child_seq += 1
-        scope_key = f"{parent_scope_id}-c{self._child_seq}"
-        return scope_key, f"dispatch-{self._child_seq}"
-
-    @property
-    def strict_barrier(self) -> bool:
-        """派发屏障是否严格档（非显式弱化即严格）。"""
-        return self.on_no_dispatch_barrier != COMPAT_LATE_BARRIER
+def _workspace_branch_of(scope: ScopeRecord) -> str | None:
+    """从工作区引用（路径|分支）解出分支名供检查点行落账。"""
+    if not scope.workspace_ref:
+        return None
+    return scope.workspace_ref.rpartition("|")[2] or None
 
 
 class RunCoordinator:
@@ -1112,7 +920,7 @@ class RunCoordinator:
         self._runtimes: dict[str, RunRuntime] = {}  # run_id → 运行时（仅 workflow run）
         self._tasks: dict[str, asyncio.Task[None]] = {}  # run_id → run 任务（唯一 spawn 口登记）
         self._workspace_trees: dict[
-            str, _WorkspaceTree
+            str, WorkspaceTreeRuntime
         ] = {}  # run_id → 工作区树运行时（首个工作区动作惰性建立）
         # 派发准入的子会话回填线索：(run_id, tool_use_id) → (检查点, 子作用域)
         self._dispatch_admissions: dict[tuple[str, str], tuple[str, str]] = {}
@@ -2516,7 +2324,7 @@ class RunCoordinator:
         return BarrierProceed(child_cwd=admission.child_cwd)
 
     async def _barrier_parent_scope(
-        self, tree: _WorkspaceTree, req: DispatchBarrierRequest
+        self, tree: WorkspaceTreeRuntime, req: DispatchBarrierRequest
     ) -> ScopeRecord:
         """按会话归属上下文解析屏障父作用域（成员 context 形如 node=<id>）。"""
         context = req.context or ""
@@ -2714,7 +2522,7 @@ class RunCoordinator:
 
     async def _ensure_workspace_tree(
         self, rt: RunRuntime, config: WorkspaceTreeConfig | None = None
-    ) -> _WorkspaceTree | None:
+    ) -> WorkspaceTreeRuntime | None:
         """取本 run 的工作区树；缺席时按持久化配置（或建区携带的配置）重建。
 
         建区动作携带完整配置，可全新初始化；其余动作（废弃/恢复/回退）
@@ -2726,10 +2534,10 @@ class RunCoordinator:
             return tree
         if config is None:
             run = await self._run_store.get(rt.run_id)
-            config = _load_tree_config(run.work_dir, rt.run_id)
+            config = load_tree_config(run.work_dir, rt.run_id)
             if config is None:
                 return None
-        tree = _WorkspaceTree(
+        tree = WorkspaceTreeRuntime(
             config,
             rt.run_id,
             CheckpointStore(self._run_store.db_path),
@@ -2994,7 +2802,7 @@ class RunCoordinator:
 
     async def _record_workspace_checkpoint(
         self,
-        tree: _WorkspaceTree,
+        tree: WorkspaceTreeRuntime,
         *,
         scope: ScopeRecord,
         trigger: CheckpointTrigger,
@@ -3126,7 +2934,7 @@ class RunCoordinator:
                 ),
             )
             data = await self._restorer.prepare(plan)
-            tree.pending_restores[action.scope_id] = _PendingSubagentRestore(data=data)
+            tree.pending_restores[action.scope_id] = PendingSubagentRestore(data=data)
             # 组恢复点已回退：该作用域的活动组失效（新 message 开新组）
             tree.arbiter.forget(action.scope_id)
         except Exception as e:

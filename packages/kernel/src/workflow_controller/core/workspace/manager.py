@@ -130,15 +130,27 @@ class WorkspaceManager:
         # reader 子代理作用域（detached worktree）：永不进集成线
         self._reader_scopes: set[str] = set()
 
-    async def initialize_root(self, *, scope_id: str, owner_ref: str | None = None) -> RootRefs:
-        """建立根作用域：导入基线、立根双引用并登记账本。"""
+    async def initialize_root(
+        self,
+        *,
+        scope_id: str,
+        owner_ref: str | None = None,
+        root_workspace_dir: Path | None = None,
+    ) -> RootRefs:
+        """建立根作用域：导入基线、立根双引用并登记账本。
+
+        root_workspace_dir 显式指定根检出落点（默认根目录本身）：单会话
+        树的原目录须保持基线不动，集成线检出落在树目录内的内部目录。
+        """
         refs = await self._repository.import_baseline(
             writer_local_pathspecs=self._manifest.git_writer_local_specs(),
         )
         await self._tree.create_root_scope(
             scope_id=scope_id,
             owner_ref=owner_ref,
-            workspace_ref=self._repository.root_dir.as_posix(),
+            workspace_ref=(
+                root_workspace_dir if root_workspace_dir is not None else self._repository.root_dir
+            ).as_posix(),
             scope_base_commit=refs.seed_checkpoint,
             integration_base_commit=refs.integration_head,
         )
@@ -196,6 +208,7 @@ class WorkspaceManager:
                 materialize_from=materialize_from,
                 materialize_specs=materialize_specs,
                 client_op_id=request.client_op_id,
+                workspace_dir=request.workspace_dir,
             )
             await self._oplog.record_new_head(request.client_op_id, workspace.base_commit)
             workspace_ref = self._format_workspace_ref(workspace)
@@ -791,6 +804,7 @@ class WorkspaceManager:
         materialize_from: str | None,
         materialize_specs: tuple[str, ...],
         client_op_id: str,
+        workspace_dir: Path | None = None,
     ) -> ScopeWorkspace:
         """建区失败即清理半成品工作区并放弃操作意图，异常原样上抛。"""
         workspace_scope_key = f"{scope_id}-e{epoch}" if epoch > 1 else scope_id
@@ -800,9 +814,14 @@ class WorkspaceManager:
                 base_commit=base,
                 materialize_from=materialize_from,
                 materialize_pathspecs=materialize_specs,
+                workspace_dir=workspace_dir,
             )
         except Exception:
-            candidate = self._repository.workspaces_dir / workspace_scope_key
+            candidate = (
+                workspace_dir
+                if workspace_dir is not None
+                else self._repository.workspaces_dir / workspace_scope_key
+            )
             if candidate.exists():
                 with suppress(Exception):
                     await self._coordinator.release_worktree(candidate)
@@ -842,9 +861,10 @@ class WorkspaceManager:
             await self._drain_hook(scope_id)
 
     def _target_for(self, record: ScopeRecord) -> WorkspaceTarget:
-        """把账本行转为可提交的 git 工作区定位。"""
+        """把账本行转为可提交的 git 工作区定位（根检出按账面引用落点）。"""
         if record.scope_kind is ScopeKind.ROOT:
-            return WorkspaceTarget(path=self._repository.root_dir, separated_env=True)
+            path = Path(record.workspace_ref) if record.workspace_ref else self._repository.root_dir
+            return WorkspaceTarget(path=path, separated_env=True)
         path, _branch = self._require_workspace(record)
         return WorkspaceTarget(path=path, separated_env=False)
 

@@ -331,6 +331,16 @@ class IntegrationCoordinator:
         target = WorkspaceTarget(path=self._repository.root_dir, separated_env=True)
         await self._run_target_git(target, ["read-tree", "-u", "--reset", new_head])
 
+    async def populate_checkout(self, work_tree: Path, commit: str) -> None:
+        """把指定提交检出到独立工作目录（分离环境，目录内不留 git 元数据）。
+
+        单会话树的内部集成线检出用：原目录保持基线不动，线状态落在
+        树目录里的内部目录上。
+        """
+        work_tree.mkdir(parents=True, exist_ok=True)
+        target = WorkspaceTarget(path=work_tree, separated_env=True)
+        await self._run_target_git(target, ["read-tree", "-u", "--reset", commit])
+
     async def commit_pending_state(
         self,
         target: WorkspaceTarget,

@@ -25,7 +25,9 @@ seed 物化 writer_local 路径后提交建区基线。
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import re
 import shutil
 import uuid
 from dataclasses import dataclass
@@ -161,12 +163,20 @@ class WorkspaceRepository:
         base_commit: str,
         materialize_from: str | None = None,
         materialize_pathspecs: Sequence[str] = (),
+        workspace_dir: Path | None = None,
     ) -> ScopeWorkspace:
-        """建作用域工作区：自 base_commit 检出、按需物化路径后提交建区基线。"""
+        """建作用域工作区：自 base_commit 检出、按需物化路径后提交建区基线。
+
+        workspace_dir 显式指定落点（默认 ``workspaces/<scope_key>``），
+        分支名始终取 scope_key——单会话主写者的固定 ``root/`` 落点用它
+        保住建区代次命名的分支空间。
+        """
         if not scope_key or "/" in scope_key:
             raise WorkspaceRepositoryError(f"非法 scope_key：{scope_key!r}")
         branch = f"{_SCOPE_BRANCH_PREFIX}{scope_key}"
-        workspace_path = self.workspaces_dir / scope_key
+        workspace_path = (
+            workspace_dir if workspace_dir is not None else self.workspaces_dir / scope_key
+        )
         if workspace_path.exists():
             raise WorkspaceRepositoryError(f"作用域工作区已存在：{workspace_path}")
         await self._run_repo_git(
@@ -237,6 +247,33 @@ class WorkspaceRepository:
             if exc.returncode == 1:
                 return None
             raise
+
+    async def tree_blob_entries(self, commit: str) -> dict[str, str]:
+        """列出一个提交树的全部 blob：路径 → blob 哈希（子模块等非 blob 项跳过）。"""
+        out = await self._run_repo_git(["ls-tree", "-r", "-z", commit])
+        entries: dict[str, str] = {}
+        for record in out.split("\0"):
+            if not record:
+                continue
+            meta, _, path = record.partition("\t")
+            fields = meta.split()
+            if len(fields) >= 3 and fields[1] == "blob":
+                entries[path] = fields[2]
+        return entries
+
+    async def prune_scope_residue(self, workspace_dir: Path, scope_key: str) -> None:
+        """清理无账的半成品建区残留：工作树与同名分支（含代次后缀）一并移除。"""
+        if workspace_dir.exists():
+            with contextlib.suppress(WorkspaceRepositoryError):
+                await self._run_repo_git(["worktree", "remove", "--force", str(workspace_dir)])
+        prefix = f"{_SCOPE_BRANCH_PREFIX}{scope_key}"
+        out = await self._run_repo_git(
+            ["for-each-ref", "--format=%(refname:short)", f"refs/heads/{prefix}"]
+        )
+        pattern = re.compile(rf"^{re.escape(prefix)}(-e\d+)?$")
+        for branch in (line.strip() for line in out.splitlines()):
+            if branch and pattern.match(branch):
+                await self._run_repo_git(["branch", "-D", branch])
 
     async def _init_bare_repo(self) -> None:
         """初始化裸私有仓：禁 hooks、关换行归一、HEAD 指向集成线。"""

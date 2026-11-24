@@ -47,6 +47,7 @@ from workflow_controller.core.workspace.scope_tree import (
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from pathlib import Path
 
     from workflow_controller.core.checkpoints import CheckpointStore, ScopeCheckpoint
     from workflow_controller.core.workspace.integration import IntegrationCoordinator
@@ -90,8 +91,14 @@ async def rebuild_workspace_tree(
     checkpoints: CheckpointStore,
     oplog: SagaOplog,
     root_scope_id: str,
+    root_checkout_dir: Path | None = None,
+    main_writer_workspace_dir: Path | None = None,
 ) -> WorkspaceRecoveryReport:
-    """重建作用域账本并对账操作日志；对不上账抛错（分叉即停）。"""
+    """重建作用域账本并对账操作日志；对不上账抛错（分叉即停）。
+
+    root_checkout_dir / main_writer_workspace_dir 服务单会话树形态：根
+    检出与主写者工作区落在树目录内的固定目录（原目录保持基线不动）。
+    """
     report = WorkspaceRecoveryReport()
     head = await repository.resolve_ref(ROOT_INTEGRATION_REF)
     seed = await repository.resolve_ref(ROOT_SEED_REF)
@@ -110,6 +117,8 @@ async def rebuild_workspace_tree(
         seed=seed,
         repository=repository,
         integrated_scopes=integrated_scopes,
+        root_checkout_dir=root_checkout_dir,
+        main_writer_workspace_dir=main_writer_workspace_dir,
     )
     root_epoch = _infer_root_epoch(records, oplog.all_operations())
     records[0] = replace(records[0], root_epoch=root_epoch)
@@ -145,6 +154,8 @@ async def _rebuild_records(
     seed: str,
     repository: WorkspaceRepository,
     integrated_scopes: set[str],
+    root_checkout_dir: Path | None = None,
+    main_writer_workspace_dir: Path | None = None,
 ) -> list[ScopeRecord]:
     """由检查点行推断作用域行：根在前、子按行序，状态按事实定档。"""
     root = ScopeRecord(
@@ -152,7 +163,9 @@ async def _rebuild_records(
         parent_scope_id=None,
         scope_kind=ScopeKind.ROOT,
         owner_ref=None,
-        workspace_ref=repository.root_dir.as_posix(),
+        workspace_ref=(
+            root_checkout_dir if root_checkout_dir is not None else repository.root_dir
+        ).as_posix(),
         scope_base_commit=seed,
         integration_base_commit=head,
         scope_epoch=INITIAL_EPOCH,
@@ -179,7 +192,14 @@ async def _rebuild_records(
         workspace_ref: str | None = None
         state = ScopeState.DISCARDED
         if branch:
-            workspace_path = repository.workspaces_dir / branch.removeprefix("scope/")
+            if (
+                main_writer_workspace_dir is not None
+                and latest.parent_scope_id == root_scope_id
+                and latest.scope_kind is ScopeKind.MAIN_WRITER
+            ):
+                workspace_path = main_writer_workspace_dir
+            else:
+                workspace_path = repository.workspaces_dir / branch.removeprefix("scope/")
             workspace_ref = f"{workspace_path.as_posix()}|{branch}"
             if workspace_path.exists():
                 state = ScopeState.ACTIVE
