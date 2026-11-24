@@ -65,6 +65,10 @@ from workflow_controller.store.event_store import (
     RUN_EVENTS_DDL,
     SESSIONS_DDL,
 )
+from workflow_controller.watchdog.ledger import (
+    IDX_WATCHDOG_NODE_CLOCKS_RUN_DDL,
+    WATCHDOG_NODE_CLOCKS_DDL,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -103,8 +107,9 @@ def _coerce_enum(value: str, enum_cls: type[StrEnum]) -> str:
 # v1 = runs 族建表；v2 = events 重建（维度列/持久主键）+ run_events + runs 扩删列；
 # v3 = 驱动状态两表（最新快照 + append-only 历史）；
 # v4 = run_driver_state 增终态投影列（/state 降级读源）；
-# v5 = 作用域检查点账本表（与遗留插件的旧检查点表并存，互不相扰）。
-SCHEMA_VERSION = 5
+# v5 = 作用域检查点账本表（与遗留插件的旧检查点表并存，互不相扰）；
+# v6 = watchdog 节点累计时钟账本表（节点超时规则的重启保留面）。
+SCHEMA_VERSION = 6
 
 # 档位特征列：判定库 schema 是否齐备（幂等位探针）。
 _V1_RUNS_FEATURES = ("kind", "work_dir", "reopened_at")
@@ -112,6 +117,7 @@ _V2_RUNS_FEATURES = ("pause_reason", "max_parallel")
 _V3_TABLES = ("run_driver_state", "run_driver_snapshots")
 _V4_RDS_FEATURES = ("projection",)
 _V5_TABLES = ("scope_checkpoints",)
+_V6_TABLES = ("watchdog_node_clocks",)
 # v2 撤销的预算两列（run 级预算不实现）
 _RETIRED_RUNS_COLUMNS = ("max_budget_usd", "spent_usd")
 _V1_SESSIONS_ADDITIONS = (
@@ -357,6 +363,7 @@ class RunStore:
         v3_ok = set(_V3_TABLES) <= tables
         v4_ok = set(_V4_RDS_FEATURES) <= _table_columns(conn, "run_driver_state")
         v5_ok = set(_V5_TABLES) <= tables
+        v6_ok = set(_V6_TABLES) <= tables
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         return (
             runs_ok
@@ -366,6 +373,7 @@ class RunStore:
             and v3_ok
             and v4_ok
             and v5_ok
+            and v6_ok
             and version >= SCHEMA_VERSION
         )
 
@@ -688,6 +696,8 @@ class RunStore:
             conn.execute(IDX_RDS_HIST_DDL)
             conn.execute(SCOPE_CHECKPOINTS_DDL)
             conn.execute(IDX_SCOPE_CHECKPOINTS_SCOPE_DDL)
+            conn.execute(WATCHDOG_NODE_CLOCKS_DDL)
+            conn.execute(IDX_WATCHDOG_NODE_CLOCKS_RUN_DDL)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.execute("COMMIT")
         except BaseException:
@@ -1184,6 +1194,7 @@ class RunStore:
                 conn.execute("DELETE FROM run_events WHERE run_id = ?", (run_id,))
                 conn.execute("DELETE FROM run_driver_snapshots WHERE run_id = ?", (run_id,))
                 conn.execute("DELETE FROM run_driver_state WHERE run_id = ?", (run_id,))
+                conn.execute("DELETE FROM watchdog_node_clocks WHERE run_id = ?", (run_id,))
                 conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
                 conn.execute("COMMIT")
             except BaseException:

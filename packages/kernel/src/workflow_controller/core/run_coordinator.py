@@ -44,6 +44,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
+from uuid import uuid4
 
 import yaml
 
@@ -2218,6 +2219,20 @@ class RunCoordinator:
         elif isinstance(action, EmitEvent):
             await self._host.emit_run_event(
                 rt.run_id, action.event_type, action.data or {}, context=action.context
+            )
+            # 驱动 run 键事件同流总线分发（只分发不落库）：watchdog 等内核
+            # 订阅者由此观察节点/图生命周期，节点身份经事件载荷透传
+            await self._bus.emit_ephemeral(
+                Event(
+                    id=uuid4().hex,
+                    session_id="",
+                    iteration=0,
+                    timestamp=datetime.now(tz=UTC),
+                    event_type=action.event_type,
+                    data=dict(action.data or {}),
+                    run_id=rt.run_id,
+                    context=action.context,
+                )
             )
         elif isinstance(action, PersistDriverState):
             await self._host.persist_driver_state(rt.run_id, dict(action.blob), history=False)

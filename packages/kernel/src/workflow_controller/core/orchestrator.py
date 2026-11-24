@@ -323,6 +323,8 @@ class Orchestrator:
         self.pool.load_sessions()
         self.bus.start()
         self.bus.observe(EventType.ITERATION_START, self._register_session)
+        # 节点时钟账本恢复先于规则接入：崩溃开段按冻结收段、已用时间保留
+        await self.watchdog.restore_node_clocks()
         self.watchdog.start()
         if self.config.hook_server.enabled:
             self._hook_server = self._build_hook_server()
@@ -1062,6 +1064,8 @@ class Orchestrator:
             self._reviewer = None
         if self._hook_server:
             await self._hook_server.stop_server()
+        # watchdog 巡检任务与账本连接收尾先于总线停止（巡检回调依赖总线）
+        await self.watchdog.stop()
         await self.bus.stop()
 
     def generate_hook_config(self, project_dir: Path | None = None) -> None:
@@ -2258,11 +2262,13 @@ class Orchestrator:
 
     def _init_plane_integrations(self) -> None:
         """平面集成组件初始化：watchdog/subagent/overlay/文件变更（__init__ 专用）。"""
-        # watchdog（subagent 异常检测通用能力，规则以事件库订阅者接入）
+        # watchdog（subagent 异常检测通用能力，规则以事件库订阅者接入）；
+        # 账本锚守护进程库 events.db（节点累计时钟的重启保留面）
         self.watchdog = WatchdogCore(
             self.config.watchdog,
             self.bus,
             self.pool,
+            self.event_router.db_path,
         )
         # In-flight sub-agent tracking + SUBAGENT_* event emission + precise
         # WAITING_RETRY wake (dc370e6 overlay 剥离相同手法抽出).

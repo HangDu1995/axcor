@@ -2057,3 +2057,41 @@ class TestEventFace:
         )
         assert history.data["verify_type"] == "script"
         assert history.data["gen"] == 0
+
+    @staticmethod
+    def test_node_history_carries_resolved_timeout_seconds(tmp_path):
+        """节点累计超时时限随档案事件透传：默认、单节点覆盖与关闭三态。"""
+        driver = build_driver(
+            tmp_path,
+            [
+                bash_node("a", "true", acceptance={"enabled": False}),
+                bash_node("b", "true", acceptance={"enabled": False}),
+                bash_node("c", "true", acceptance={"enabled": False}),
+            ],
+            timeouts={"node_seconds": 7200, "nodes": {"b": 300, "c": 0}},
+        )
+        decide(driver)
+        actions = []
+        for node in ("a", "b", "c"):
+            actions.extend(
+                decide(
+                    driver, [ProcessExit(proc_id=f"p-{node}", context=f"node={node}", returncode=0)]
+                )
+            )
+        timeouts_by_node = {
+            e.data["node_id"]: e.data.get("timeout_seconds")
+            for e in actions
+            if isinstance(e, EmitEvent) and e.event_type == "node_history"
+        }
+        assert timeouts_by_node == {"a": 7200, "b": 300, "c": None}
+
+    @staticmethod
+    def test_node_history_omits_timeout_seconds_when_unconfigured(tmp_path):
+        """未配置 timeouts 段的图：档案事件不带时限字段（规则对该图关闭）。"""
+        driver = build_driver(tmp_path, [bash_node("a", "true", acceptance={"enabled": False})])
+        decide(driver)
+        actions = decide(driver, [ProcessExit(proc_id="p1", context="node=a", returncode=0)])
+        history = next(
+            e for e in actions if isinstance(e, EmitEvent) and e.event_type == "node_history"
+        )
+        assert "timeout_seconds" not in history.data

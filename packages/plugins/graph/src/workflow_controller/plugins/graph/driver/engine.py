@@ -150,6 +150,37 @@ def _node_writes(node: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(str(item) for item in writes if str(item))
 
 
+def _node_timeout_resolver(
+    config: Mapping[str, Any],
+) -> Callable[[str], int | None]:
+    """解析节点累计超时时限（整图默认 + 单节点覆盖），随事件载荷透传给 watchdog。
+
+    yaml 顶层 ``timeouts`` 段：``node_seconds`` 整图默认，``nodes`` 单节点
+    覆盖；值 ≤ 0 或未配置 = 该节点关闭规则（解析为 None）。
+    """
+    timeouts = config.get("timeouts")
+    if not isinstance(timeouts, dict):
+        return lambda node_id: None
+    overrides = timeouts.get("nodes")
+    node_overrides = overrides if isinstance(overrides, dict) else {}
+
+    def _positive(raw: Any) -> int | None:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    default = _positive(timeouts.get("node_seconds"))
+
+    def resolve(node_id: str) -> int | None:
+        if node_id in node_overrides:
+            return _positive(node_overrides[node_id])
+        return default
+
+    return resolve
+
+
 # 运行配置项键集：构造入参与驱动快照 options 共用，防两处键漂移
 RUNNER_OPTION_KEYS = (
     "runtime",
@@ -306,6 +337,8 @@ class GraphDriver:
         self._init_runner_options(options or {})
         # 工作区隔离配置：未开启为 None，出生派发与目录注入据此分流
         self._workspace_config = _workspace_tree_config(program.config, work_dir)
+        # 节点累计超时时限解析器（整图默认 + 单节点覆盖，随 node_history 透传）
+        self._node_timeout = _node_timeout_resolver(program.config)
         self._dag_needs_members = any(self._node_needs_member(n) for n in self._dag.nodes)
         # 建区键序号：驱动生命周期内单调递增，保证不重号
         self._workspace_seq = 0
@@ -2881,26 +2914,26 @@ class GraphDriver:
     ) -> None:
         """节点尝试档案事件动作（run_events 回放面）。"""
         info = self._state.snapshot()["nodes"].get(node_id, {})
-        actions.append(
-            EmitEvent(
-                event_type="node_history",
-                data={
-                    "graph_id": self._graph_id,
-                    "node_id": node_id,
-                    "attempt": attempt if attempt is not None else info.get("attempts", 0),
-                    "status": status,
-                    "workflow_controller_session_id": info.get("workflow_controller_session_id"),
-                    "failure_reason": failure_reason,
-                    "output": info.get("output"),
-                    "started_at": info.get("started_at"),
-                    "finished_at": info.get("finished_at"),
-                    "verify_type": (verify or {}).get("verify_type"),
-                    "verify_session_id": (verify or {}).get("verify_session_id"),
-                    "verify_reason": (verify or {}).get("verify_reason"),
-                    "gen": info.get("gen", 0),
-                },
-            )
-        )
+        payload = {
+            "graph_id": self._graph_id,
+            "node_id": node_id,
+            "attempt": attempt if attempt is not None else info.get("attempts", 0),
+            "status": status,
+            "workflow_controller_session_id": info.get("workflow_controller_session_id"),
+            "failure_reason": failure_reason,
+            "output": info.get("output"),
+            "started_at": info.get("started_at"),
+            "finished_at": info.get("finished_at"),
+            "verify_type": (verify or {}).get("verify_type"),
+            "verify_session_id": (verify or {}).get("verify_session_id"),
+            "verify_reason": (verify or {}).get("verify_reason"),
+            "gen": info.get("gen", 0),
+        }
+        # 节点累计超时时限（配置了才透传；watchdog 据此建账）
+        timeout_seconds = self._node_timeout(node_id)
+        if timeout_seconds is not None:
+            payload["timeout_seconds"] = timeout_seconds
+        actions.append(EmitEvent(event_type="node_history", data=payload))
 
     def _emit_verify_running_history(
         self,
