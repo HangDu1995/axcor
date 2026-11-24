@@ -487,6 +487,57 @@ class RunAPI:
         except RunNotFoundError as e:
             raise RunApiNotFoundError(e.args[0] if e.args else run_id) from e
 
+    # ── 单会话工作区查询与回滚面（HTTP 路由装配住控制台发行包）──
+
+    async def get_session_live_view(
+        self, session_id: str, path: str | None = None
+    ) -> dict[str, Any]:
+        """单会话托管工作区的只读实时视图（目录树或单文件内容）。"""
+        try:
+            return await self._coord.get_session_live_view(session_id, path)
+        except LookupError as e:
+            raise RunApiSessionNotFoundError(str(e)) from e
+
+    async def list_session_workspace_checkpoints(self, session_id: str) -> list[dict[str, Any]]:
+        """单会话树的检查点查询（子代理回滚的核对面）。"""
+        try:
+            return await self._coord.list_session_workspace_checkpoints(session_id)
+        except LookupError as e:
+            raise RunApiSessionNotFoundError(str(e)) from e
+
+    async def request_session_subagent_rollback(
+        self,
+        session_id: str,
+        *,
+        checkpoint_id: str,
+        expected_epoch: int,
+        client_op_id: str,
+        replay_dispatch: bool = False,
+    ) -> dict[str, Any]:
+        """单会话子代理回滚：组检查点恢复并绑定恢复会话，返回恢复结论。
+
+        检查点先对会话树核验为派发组恢复点行；expected_epoch 为主写者
+        作用域当前代次（取检查点行 scope_epoch 之外的实时值须先经查询面）。
+        """
+        rows = await self.list_session_workspace_checkpoints(session_id)
+        row = next((r for r in rows if r["checkpoint_id"] == checkpoint_id), None)
+        if row is None:
+            raise ValueError(f"检查点不存在于该会话：{checkpoint_id}")
+        if row.get("trigger") != "before_child" or not (row.get("dispatch_anchor") or {}).get(
+            "dispatch_group_id"
+        ):
+            raise ValueError(f"回滚目标须为派发组检查点：{checkpoint_id}")
+        try:
+            return await self._coord.restore_session_subagent(
+                session_id,
+                checkpoint_id=checkpoint_id,
+                expected_epoch=expected_epoch,
+                client_op_id=client_op_id,
+                replay_dispatch=replay_dispatch,
+            )
+        except LookupError as e:
+            raise RunApiSessionNotFoundError(str(e)) from e
+
     async def reload_run_definition(
         self, run_id: str, program_path: str | Path | None = None
     ) -> dict[str, Any]:

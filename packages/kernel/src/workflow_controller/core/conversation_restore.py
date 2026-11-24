@@ -91,6 +91,8 @@ class ConversationRestorePlan:
     session_runtime: str | None = None
     replay_tool_name: str = ""
     replay_tool_input: Mapping[str, Any] | None = None
+    # 单会话工作区模式的配置透传：恢复会话须接续同一棵托管作用域树
+    traceback: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -273,7 +275,8 @@ class ConversationRestorer:
             initial_prompt=data.first_signal,
             runtime=plan.session_runtime,
             env_overrides=dict(data.fork_env),
-            run_id=plan.run_id,
+            run_id=plan.run_id or None,
+            traceback=plan.traceback,
         )
         metadata = {
             "workspace_restore": {

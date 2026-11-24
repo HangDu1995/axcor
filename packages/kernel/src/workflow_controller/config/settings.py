@@ -96,6 +96,29 @@ class SessionReviewerConfig(BaseModel):
         return _migrate_thinking_enabled(data)
 
 
+class SessionTracebackConfig(BaseModel):
+    """单会话 traceback 工作区模式配置（内核侧配置通道）。
+
+    词面与工作流侧 traceback 段对齐：未携带或 ``enabled`` 关闭的会话
+    行为不变；snapshot 兼容模式继续由 agent_traceback 插件自身配置
+    承载，本通道只管 workspace 模式。
+    """
+
+    enabled: bool = True
+    # 模式仅支持 workspace：snapshot_compatible 由插件承载，此处显式拒绝
+    mode: str = "workspace"
+    # 派发屏障弱化档：fail（默认，严格）| compat_late_barrier（显式弱化）
+    on_no_dispatch_barrier: str = "fail"
+    conflict_policy: str = "git_merge"
+    retain_after_merge: bool = False
+    background_drain_timeout_s: float = 60.0
+    merge: list[str] = []
+    writer_local: list[str] = []
+    shared_readonly: list[str] = []
+    shared_exclusive: list[str] = []
+    external: list[str] = []
+
+
 class SessionConfig(BaseModel):
     name: str
     role: str = "worker"
@@ -148,6 +171,9 @@ class SessionConfig(BaseModel):
     # labels 里的 run_id 是给消费者免 join 的冗余，归属判定以 run_id 为准。
     run_id: str | None = None
     labels: dict[str, str] = {}
+    # 单会话 traceback 工作区模式开关（None = 未开启，行为逐字不变）：
+    # 开启后原目录只做基线导入，会话工作在托管工作区，终态经三方同步写回
+    traceback: SessionTracebackConfig | None = None
 
 
 class HookServerConfig(BaseModel):

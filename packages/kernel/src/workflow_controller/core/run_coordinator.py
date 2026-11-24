@@ -1312,6 +1312,36 @@ class RunCoordinator:
             rows = [row for row in rows if row.scope_id == scope_id]
         return [checkpoint_to_dict(row) for row in rows]
 
+    # ── 单会话工作区查询与回滚面（实时视图住控制台路由，跨仓 PR）──
+
+    async def get_session_live_view(
+        self, session_id: str, path: str | None = None
+    ) -> dict[str, Any]:
+        """单会话托管工作区的只读实时视图（编排器会话宿主承载）。"""
+        return await self._orch.get_session_live_view(session_id, path)
+
+    async def list_session_workspace_checkpoints(self, session_id: str) -> list[dict[str, Any]]:
+        """单会话树的检查点查询。"""
+        return await self._orch.list_session_workspace_checkpoints(session_id)
+
+    async def restore_session_subagent(
+        self,
+        session_id: str,
+        *,
+        checkpoint_id: str,
+        expected_epoch: int,
+        client_op_id: str,
+        replay_dispatch: bool = False,
+    ) -> dict[str, Any]:
+        """单会话子代理回滚请求（宿主链内串行执行，返回恢复结论）。"""
+        return await self._orch.restore_session_subagent(
+            session_id,
+            checkpoint_id=checkpoint_id,
+            expected_epoch=expected_epoch,
+            client_op_id=client_op_id,
+            replay_dispatch=replay_dispatch,
+        )
+
     # ── 成员 session 管理（成员始终为 session）─────────────────────
 
     async def pause_run_session(self, run_id: str, session_id: str) -> None:
