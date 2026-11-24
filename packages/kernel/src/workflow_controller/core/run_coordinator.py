@@ -62,6 +62,29 @@ from workflow_controller.core.status_maps import (
     implicit_projection_status,
     next_pause_gear,
 )
+from workflow_controller.core.workspace import (
+    ConflictPolicy,
+    ScopeKind,
+    ScopeTree,
+    WorkspaceManager,
+    WorkspaceManifest,
+    WorkspaceRepository,
+)
+from workflow_controller.core.workspace.actions import (
+    AbandonScope as CoreAbandonScope,
+)
+from workflow_controller.core.workspace.actions import (
+    PrepareScopeWorkspace as CorePrepareScopeWorkspace,
+)
+from workflow_controller.core.workspace.actions import (
+    ScopeWorkspaceSpec as CoreScopeWorkspaceSpec,
+)
+from workflow_controller.core.workspace.integration import IntegrationCoordinator
+from workflow_controller.core.workspace.manifest import (
+    DEFAULT_WRITER_LOCAL_PATHSPECS,
+    RebuildScript,
+)
+from workflow_controller.core.workspace.oplog import SagaOplog
 from workflow_controller.plugin.run_driver import (
     START_LIKE_ACTIONS,
     AllSessionsTerminal,
@@ -91,6 +114,16 @@ from workflow_controller.plugin.run_driver import (
     SessionOutcomeReplayed,
     StartProcess,
     StartSession,
+)
+from workflow_controller.plugin.workspace import (
+    AbandonScope,
+    IntegrateScope,
+    PrepareScopeWorkspace,
+    ScopeAbandoned,
+    ScopeWorkspacePrepared,
+    WorkspaceActionFailed,
+    WorkspaceScopeKind,
+    WorkspaceTreeConfig,
 )
 from workflow_controller.session.events import Event, EventType, SessionOutcome
 
@@ -734,6 +767,59 @@ class _RecoveryService:
         await self._run_store.finish(run.run_id, RunStatus.FAILED, error=reason)
 
 
+# SDK 作用域种类 → 内核账本种类
+_WORKSPACE_SCOPE_KINDS = {
+    WorkspaceScopeKind.MAIN_WRITER: ScopeKind.MAIN_WRITER,
+    WorkspaceScopeKind.SUBAGENT: ScopeKind.SUBAGENT,
+}
+
+
+def _tree_manifest(config: WorkspaceTreeConfig) -> WorkspaceManifest:
+    """SDK 路径策略声明 → 内核清单；未声明的桶交内核取默认。"""
+    rebuild_scripts = {
+        pathspec: RebuildScript(cmd=decl.cmd, verify=decl.verify)
+        for pathspec, decl in dict(config.rebuild_scripts).items()
+        if decl.cmd and decl.verify
+    }
+    return WorkspaceManifest(
+        merge=tuple(config.merge),
+        writer_local=tuple(config.writer_local) or DEFAULT_WRITER_LOCAL_PATHSPECS,
+        shared_readonly=tuple(config.shared_readonly),
+        shared_exclusive=tuple(config.shared_exclusive),
+        external=tuple(config.external),
+        rebuild_scripts=rebuild_scripts,
+    )
+
+
+class _WorkspaceTree:
+    """单 run 的工作区树运行时：装配好的管理器与根作用域标识。
+
+    树随首个工作区动作惰性建立；重开或崩溃后的既有仓不在此重建，
+    相应恢复对账属回滚能力接线，当前一律显式失败。
+    """
+
+    def __init__(self, config: WorkspaceTreeConfig, run_id: str) -> None:
+        """按动作携带的配置装配私有仓、清单、协调器与管理器。
+
+        冲突档位词面校验失败即抛错（经执行桥转失败通知），不静默取默认。
+        """
+        repository = WorkspaceRepository(Path(config.root_dir), tree_id=run_id)
+        self.manager = WorkspaceManager(
+            repository=repository,
+            scope_tree=ScopeTree(),
+            oplog=SagaOplog(repository.tree_dir),
+            manifest=_tree_manifest(config),
+            integration_coordinator=IntegrationCoordinator(
+                repository, conflict_policy=ConflictPolicy(config.conflict_policy)
+            ),
+        )
+        self.root_scope_id = f"{run_id}-root"
+
+    async def initialize(self) -> None:
+        """导入基线并建根作用域；私有仓已存在时显式失败。"""
+        await self.manager.initialize_root(scope_id=self.root_scope_id)
+
+
 class RunCoordinator:
     """run 平面协调器：run 生命周期、成员编排与决策循环宿主。
 
@@ -784,6 +870,9 @@ class RunCoordinator:
         self._export_service_guard = threading.Lock()
         self._runtimes: dict[str, RunRuntime] = {}  # run_id → 运行时（仅 workflow run）
         self._tasks: dict[str, asyncio.Task[None]] = {}  # run_id → run 任务（唯一 spawn 口登记）
+        self._workspace_trees: dict[
+            str, _WorkspaceTree
+        ] = {}  # run_id → 工作区树运行时（首个工作区动作惰性建立）
         self._decide_pools: dict[
             str, ThreadPoolExecutor
         ] = {}  # format → decide 线程子池（惰性创建）
@@ -1617,6 +1706,7 @@ class RunCoordinator:
             self._tasks.pop(run_id, None)
             # 旧任务迟到回调不得清掉同一 run 新任务的停止受理标记。
             self._stop_marked.discard(run_id)
+        self._workspace_trees.pop(run_id, None)
         if not task.cancelled() and task.exception() is not None:
             logger.error("run %s 任务异常结束", run_id, exc_info=task.exception())
 
@@ -1968,6 +2058,8 @@ class RunCoordinator:
             return
         if await self._dispatch_process_action(rt, action):
             return
+        if await self._dispatch_workspace_action(rt, action):
+            return
         raise NotImplementedError(f"动作 {type(action).__name__} 的执行面尚未落地")
 
     async def _dispatch_session_action(self, rt: RunRuntime, action: RunAction) -> bool:
@@ -2038,6 +2130,122 @@ class RunCoordinator:
         else:
             return False
         return True
+
+    async def _dispatch_workspace_action(self, rt: RunRuntime, action: RunAction) -> bool:
+        """工作区类动作派发：经每 run 工作区树执行，结果以通知回投。"""
+        if isinstance(action, IntegrateScope):
+            # 集成定序尚未接线：显式回执未实现，不静默丢弃
+            self._notify(
+                rt.run_id,
+                WorkspaceActionFailed(
+                    action="IntegrateScope",
+                    client_op_id=action.client_op_id,
+                    error="集成动作尚未接入",
+                    context=action.context,
+                ),
+            )
+            return True
+        if isinstance(action, PrepareScopeWorkspace):
+            await self._execute_workspace_prepare(rt, action)
+            return True
+        if isinstance(action, AbandonScope):
+            await self._execute_workspace_abandon(rt, action)
+            return True
+        return False
+
+    async def _execute_workspace_prepare(
+        self, rt: RunRuntime, action: PrepareScopeWorkspace
+    ) -> None:
+        """执行建区：首动作惰性建树（基线导入 + 根作用域），再建子工作区。"""
+        try:
+            tree = self._workspace_trees.get(rt.run_id)
+            if tree is None:
+                tree = _WorkspaceTree(action.config, rt.run_id)
+                await tree.initialize()
+                self._workspace_trees[rt.run_id] = tree
+            scope_kind = _WORKSPACE_SCOPE_KINDS.get(action.scope_kind)
+            if scope_kind is None:
+                raise ValueError(f"未知作用域种类：{action.scope_kind!r}")
+            prepared = await tree.manager.prepare_scope_workspace(
+                CorePrepareScopeWorkspace(
+                    parent_scope_id=(
+                        tree.root_scope_id
+                        if action.parent_scope_id is None
+                        else action.parent_scope_id
+                    ),
+                    scope_key=action.scope_key,
+                    spec=CoreScopeWorkspaceSpec(
+                        scope_kind=scope_kind,
+                        owner_ref=action.owner_ref,
+                    ),
+                    client_op_id=action.client_op_id,
+                )
+            )
+        except Exception as e:
+            self._notify(
+                rt.run_id,
+                WorkspaceActionFailed(
+                    action="PrepareScopeWorkspace",
+                    client_op_id=action.client_op_id,
+                    error=f"{type(e).__name__}: {e}",
+                    context=action.context,
+                ),
+            )
+            return
+        self._notify(
+            rt.run_id,
+            ScopeWorkspacePrepared(
+                scope_id=prepared.scope_id,
+                scope_epoch=prepared.scope_epoch,
+                base_commit=prepared.base_commit,
+                integration_base_commit=prepared.integration_base_commit,
+                workspace_path=prepared.workspace_path,
+                context=action.context,
+            ),
+        )
+
+    async def _execute_workspace_abandon(self, rt: RunRuntime, action: AbandonScope) -> None:
+        """执行废弃：移除作用域及后代工作区并各自换代。"""
+        tree = self._workspace_trees.get(rt.run_id)
+        if tree is None:
+            self._notify(
+                rt.run_id,
+                WorkspaceActionFailed(
+                    action="AbandonScope",
+                    client_op_id=action.client_op_id,
+                    error=f"run {rt.run_id} 无工作区树",
+                    context=action.context,
+                ),
+            )
+            return
+        try:
+            abandoned = await tree.manager.abandon_scope(
+                CoreAbandonScope(
+                    scope_id=action.scope_id,
+                    expected_scope_epoch=action.expected_scope_epoch,
+                    client_op_id=action.client_op_id,
+                )
+            )
+        except Exception as e:
+            self._notify(
+                rt.run_id,
+                WorkspaceActionFailed(
+                    action="AbandonScope",
+                    client_op_id=action.client_op_id,
+                    error=f"{type(e).__name__}: {e}",
+                    context=action.context,
+                ),
+            )
+            return
+        self._notify(
+            rt.run_id,
+            ScopeAbandoned(
+                scope_id=abandoned.scope_id,
+                new_scope_epoch=abandoned.new_scope_epoch,
+                abandoned_descendants=abandoned.abandoned_descendants,
+                context=action.context,
+            ),
+        )
 
     async def _await_sessions_task(self, rt: RunRuntime, action: AwaitSessions) -> None:
         """session 等待后台任务：等待完成（超时已保证停 session）后仅唤醒循环。"""

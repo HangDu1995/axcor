@@ -1,0 +1,142 @@
+# Copyright (c) 2026 Workflow Controller Contributors
+#
+# Licensed under the MIT License (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://opensource.org/licenses/MIT
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""工作区作用域动作与通知——编排驱动与宿主执行面之间的文件态协议。
+
+驱动以动作请求建立、废弃作用域工作区等文件态操作，宿主执行后以通知
+回投结果；失败同样显式回投，不静默丢弃。本模块只承载 DTO，字段保持
+可 JSON 序列化；内核实现与编排插件互不因本协议产生直接依赖，映射与
+执行归宿主。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import TYPE_CHECKING
+
+from workflow_controller.plugin.run_driver import RunAction, RunNotification
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+__all__ = [
+    "AbandonScope",
+    "IntegrateScope",
+    "PrepareScopeWorkspace",
+    "RebuildScriptDecl",
+    "ScopeAbandoned",
+    "ScopeWorkspacePrepared",
+    "WorkspaceActionFailed",
+    "WorkspaceScopeKind",
+    "WorkspaceTreeConfig",
+]
+
+
+class WorkspaceScopeKind(StrEnum):
+    """作用域种类词表：编排层对执行单元的形态声明。"""
+
+    MAIN_WRITER = "main_writer"
+    SUBAGENT = "subagent"
+
+
+@dataclass(frozen=True)
+class RebuildScriptDecl:
+    """可重建路径的确定性脚本与验收命令声明。"""
+
+    cmd: str
+    verify: str
+
+
+@dataclass(frozen=True)
+class WorkspaceTreeConfig:
+    """一棵作用域树的装配配置：根目录、路径策略与冲突档位。
+
+    首个到达宿主的工作区动作携带本配置完成惰性装配，其后动作携带的
+    配置不再生效；未给出的策略桶与冲突档位由宿主取默认。
+    """
+
+    root_dir: str
+    conflict_policy: str = "git_merge"
+    merge: tuple[str, ...] = ()
+    writer_local: tuple[str, ...] = ()
+    shared_readonly: tuple[str, ...] = ()
+    shared_exclusive: tuple[str, ...] = ()
+    external: tuple[str, ...] = ()
+    rebuild_scripts: Mapping[str, RebuildScriptDecl] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PrepareScopeWorkspace(RunAction):
+    """建区动作：宿主在父作用域当前头建子工作区并登记账本。"""
+
+    config: WorkspaceTreeConfig
+    scope_key: str
+    client_op_id: str
+    parent_scope_id: str | None = None  # None = 本 run 的根作用域
+    scope_kind: str = WorkspaceScopeKind.MAIN_WRITER
+    owner_ref: str | None = None
+    context: str | None = None
+
+
+@dataclass(frozen=True)
+class AbandonScope(RunAction):
+    """废弃动作：宿主移除作用域及后代工作区并各自换代。"""
+
+    scope_id: str
+    expected_scope_epoch: int
+    client_op_id: str
+    context: str | None = None
+
+
+@dataclass(frozen=True)
+class IntegrateScope(RunAction):
+    """集成动作：定序接线前宿主对执行明确回执未实现。"""
+
+    scope_id: str
+    client_op_id: str
+    receipt: str | None = None
+    context: str | None = None
+
+
+@dataclass(frozen=True)
+class ScopeWorkspacePrepared(RunNotification):
+    """建区完成通知：工作区路径供宿主注入执行单元的出生目录。"""
+
+    scope_id: str
+    scope_epoch: int
+    base_commit: str
+    integration_base_commit: str
+    workspace_path: str
+    context: str | None = None
+
+
+@dataclass(frozen=True)
+class ScopeAbandoned(RunNotification):
+    """废弃完成通知：目标与一并废弃的后代各自新代次。"""
+
+    scope_id: str
+    new_scope_epoch: int
+    abandoned_descendants: tuple[tuple[str, int], ...] = ()
+    context: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkspaceActionFailed(RunNotification):
+    """动作失败回执：错误串供编排层按执行失败收口。"""
+
+    action: str
+    client_op_id: str
+    error: str
+    context: str | None = None

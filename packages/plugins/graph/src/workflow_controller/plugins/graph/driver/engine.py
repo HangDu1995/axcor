@@ -58,6 +58,14 @@ from workflow_controller.plugin.run_driver import (
     StartSession,
     TimerFired,
 )
+from workflow_controller.plugin.workspace import (
+    PrepareScopeWorkspace,
+    RebuildScriptDecl,
+    ScopeWorkspacePrepared,
+    WorkspaceActionFailed,
+    WorkspaceScopeKind,
+    WorkspaceTreeConfig,
+)
 from workflow_controller.plugins.graph import translator
 from workflow_controller.plugins.graph.driver import gates, prompts, scheduler
 from workflow_controller.plugins.graph.driver.dag import prefix_subgraph_nodes, subgraph_topology
@@ -88,6 +96,37 @@ def _resolve_timeout(raw: Any, default: float = 7200.0) -> float | None:
     return value if value > 0 else None
 
 
+def _workspace_tree_config(
+    config: Mapping[str, Any],
+    work_dir: Path,
+) -> WorkspaceTreeConfig | None:
+    """从工作流配置解析工作区隔离配置；未开启或兼容模式返回 None。"""
+    traceback_cfg = config.get("traceback")
+    if not isinstance(traceback_cfg, dict) or not traceback_cfg.get("enabled"):
+        return None
+    if traceback_cfg.get("mode", "workspace") != "workspace":
+        return None
+    workspace_cfg = traceback_cfg.get("workspace") or {}
+    manifest_cfg = workspace_cfg.get("manifest") or {}
+    rebuild_decls: dict[str, RebuildScriptDecl] = {}
+    for pathspec, decl in (manifest_cfg.get("rebuild_scripts") or {}).items():
+        if isinstance(decl, dict):
+            rebuild_decls[str(pathspec)] = RebuildScriptDecl(
+                cmd=str(decl.get("cmd", "")),
+                verify=str(decl.get("verify", "")),
+            )
+    return WorkspaceTreeConfig(
+        root_dir=str(work_dir),
+        conflict_policy=str(workspace_cfg.get("conflict_policy", "git_merge")),
+        merge=tuple(str(p) for p in manifest_cfg.get("merge") or ()),
+        writer_local=tuple(str(p) for p in manifest_cfg.get("writer_local") or ()),
+        shared_readonly=tuple(str(p) for p in manifest_cfg.get("shared_readonly") or ()),
+        shared_exclusive=tuple(str(p) for p in manifest_cfg.get("shared_exclusive") or ()),
+        external=tuple(str(p) for p in manifest_cfg.get("external") or ()),
+        rebuild_scripts=rebuild_decls,
+    )
+
+
 # 运行配置项键集：构造入参与驱动快照 options 共用，防两处键漂移
 RUNNER_OPTION_KEYS = (
     "runtime",
@@ -112,7 +151,8 @@ def pick_runner_options(src: Mapping[str, Any]) -> dict[str, Any]:
     return {k: src[k] for k in RUNNER_OPTION_KEYS if src.get(k) is not None}
 
 
-# 节点活动阶段：执行（bash 进程 / agent 成员）→ 子图读取 → 报告落盘 → 验收
+# 节点活动阶段：建区等待 → 执行（bash 进程 / agent 成员）→ 子图读取 → 报告落盘 → 验收
+_PHASE_WORKSPACE = "workspace"
 _PHASE_EXEC_PROC = "exec_proc"
 _PHASE_SPAWN = "spawn"
 _PHASE_RUNNING = "running"
@@ -173,6 +213,10 @@ class NodeActivity:
     verify_tail: list[str] = field(default_factory=list)
     verify_kill_pending: bool = False
     restoring_missing: bool = False
+    # 节点作用域工作区映射：建区回执回填，executor/verifier 共用
+    workspace_path: str | None = None
+    workspace_scope_id: str | None = None
+    workspace_scope_epoch: int = 0
 
 
 def _resume_reconcile_target(
@@ -225,6 +269,11 @@ class GraphDriver:
         self._user_prompt_path = user_prompt_path
         self._applied_reopen_at = applied_reopen_at
         self._init_runner_options(options or {})
+        # 工作区隔离配置：未开启为 None，出生派发与目录注入据此分流
+        self._workspace_config = _workspace_tree_config(program.config, work_dir)
+        self._dag_needs_members = any(self._node_needs_member(n) for n in self._dag.nodes)
+        # 建区键序号：驱动生命周期内单调递增，保证不重号
+        self._workspace_seq = 0
         # 步进状态（runtime-only；恢复后由调度重建）
         self._nodes: dict[str, NodeActivity] = {}
         self._agents_ready = program.agents_dir is None
@@ -681,6 +730,10 @@ class GraphDriver:
             self._on_artifact(note, actions)
         elif isinstance(note, TimerFired):
             self._on_timer(note, actions)
+        elif isinstance(note, ScopeWorkspacePrepared):
+            self._on_workspace_prepared(note, actions)
+        elif isinstance(note, WorkspaceActionFailed):
+            self._on_workspace_failed(note, actions)
         elif isinstance(note, SessionControlApplied):
             self._on_member_control(note, world, actions)
 
@@ -1122,11 +1175,47 @@ class GraphDriver:
                 spec_override=SessionSpec(
                     name=f"graph:{act.node_id}",
                     prompt=continue_prompt,
-                    cwd=str(self._work_dir),
+                    cwd=self._node_workspace(act.node_id) or str(self._work_dir),
                 ),
                 context_override=self._restart_context(act),
             )
         )
+
+    def _on_workspace_prepared(
+        self, note: ScopeWorkspacePrepared, actions: list[RunAction]
+    ) -> None:
+        """建区回执：记录工作区映射，补发该节点被挂起的执行出生。"""
+        act = self._activity_by_context(note.context)
+        if act is None or act.phase != _PHASE_WORKSPACE:
+            return
+        act.workspace_path = note.workspace_path
+        act.workspace_scope_id = note.scope_id
+        act.workspace_scope_epoch = note.scope_epoch
+        node = self._dag_node(act.node_id)
+        if node is None:
+            self._drop_activity(act)
+            return
+        ctx = {
+            **self._program.variables,
+            "node_id": act.node_id,
+            "attempt": str(act.attempt),
+        }
+        member_node = node.get("task_type") == "agent" or (
+            node.get("task_type") == "generator" and node.get("generator_type", "agent") != "bash"
+        )
+        if member_node:
+            act.phase = _PHASE_SPAWN
+            self._spawn_member_node(node, act.node_id, ctx, act.attempt, actions)
+        else:
+            self._spawn_bash_node(node, act.node_id, ctx, act.attempt, actions)
+
+    def _on_workspace_failed(self, note: WorkspaceActionFailed, actions: list[RunAction]) -> None:
+        """工作区动作失败回执：按执行错误收口，不降级共享目录继续跑。"""
+        act = self._activity_by_context(note.context)
+        if act is None or act.phase != _PHASE_WORKSPACE:
+            return
+        act.executor_error = f"节点工作区建立失败: {note.error}"
+        self._after_executor(act, actions)
 
     def _on_member_control(
         self,
@@ -1416,7 +1505,13 @@ class GraphDriver:
         ready = scheduler.select_ready_nodes(self._dag, self._state)
         if not ready:
             return actions
-        if not self._agents_ready and any(self._node_needs_member(n) for n in ready):
+        # 工作区隔离开启时软链必须先进基线（首个建区动作触发基线导入，
+        # 之后才落的软链不会出现在任何作用域工作区），故按全图是否含
+        # 成员节点把关，不限当轮就绪集
+        if not self._agents_ready and (
+            any(self._node_needs_member(n) for n in ready)
+            or (self._workspace_config is not None and self._dag_needs_members)
+        ):
             # agent 成员出生前先备好 cwd 下的 agents 软链（opencode 发现面）
             if not self._agents_prep_inflight:
                 self._agents_prep_inflight = True
@@ -1461,17 +1556,52 @@ class GraphDriver:
             if self._start_merged_generator(node, node_id, ctx, attempt, actions):
                 return actions
             if node.get("generator_type") == "bash":
+                if self._await_node_workspace(node_id, attempt, actions):
+                    return actions
                 return self._spawn_bash_node(node, node_id, ctx, attempt, actions)
 
         if task_type == "bash":
+            if self._await_node_workspace(node_id, attempt, actions):
+                return actions
             return self._spawn_bash_node(node, node_id, ctx, attempt, actions)
 
         # agent 成员（执行器或 generator 编排）
         reused = self._reuse_member_node(node, node_id, existing_sid, attempt, world, actions)
         if reused is not None:
             return reused
+        if self._await_node_workspace(node_id, attempt, actions):
+            return actions
         self._spawn_member_node(node, node_id, ctx, attempt, actions)
         return actions
+
+    def _await_node_workspace(
+        self,
+        node_id: str,
+        attempt: int,
+        actions: list[RunAction],
+    ) -> bool:
+        """开启工作区隔离且本代未建区时先发建区动作，回执到达后再出生执行。"""
+        if self._workspace_config is None:
+            return False
+        act = self._nodes.get(node_id)
+        if act is not None and act.workspace_path is not None:
+            return False
+        if act is None:
+            act = NodeActivity(node_id=node_id, phase=_PHASE_WORKSPACE, attempt=attempt)
+            self._nodes[node_id] = act
+        act.phase = _PHASE_WORKSPACE
+        self._workspace_seq += 1
+        actions.append(
+            PrepareScopeWorkspace(
+                config=self._workspace_config,
+                scope_key=f"{node_id}-w{self._workspace_seq}",
+                client_op_id=f"prepare-{self._workspace_seq}",
+                scope_kind=WorkspaceScopeKind.MAIN_WRITER,
+                owner_ref=node_id,
+                context=f"node={node_id}",
+            )
+        )
+        return True
 
     def _start_merged_generator(
         self,
@@ -1572,15 +1702,18 @@ class GraphDriver:
         self, node: dict, node_id: str, ctx: dict, attempt: int, actions: list[RunAction]
     ) -> list[RunAction]:
         """bash 节点起进程（generator 与 task 两条派发入口共用）。"""
-        self._nodes[node_id] = NodeActivity(
-            node_id=node_id, phase=_PHASE_EXEC_PROC, attempt=attempt
-        )
+        act = self._nodes.get(node_id)
+        if act is None:
+            act = NodeActivity(node_id=node_id, phase=_PHASE_EXEC_PROC, attempt=attempt)
+            self._nodes[node_id] = act
+        act.phase = _PHASE_EXEC_PROC
+        workspace = self._node_workspace(node_id)
         actions.append(
             StartProcess(
                 cmd=render(node.get("command", "true"), ctx),
-                cwd=str(self._work_dir),
+                cwd=workspace or str(self._work_dir),
                 context=f"node={node_id}",
-                env=self._graph_env(),
+                env=self._graph_env(workspace),
             )
         )
         return actions
@@ -1657,7 +1790,7 @@ class GraphDriver:
             actions.append(
                 StartProcess(
                     cmd=self._report_command(act, node, ctx),
-                    cwd=str(self._work_dir),
+                    cwd=self._node_workspace(act.node_id) or str(self._work_dir),
                     context=f"node={act.node_id}/report",
                     stream=False,
                 )
@@ -1718,12 +1851,13 @@ class GraphDriver:
         script = render(acc.get("script", "true"), ctx)
         act.verify = {"verify_type": "script", "script": script}
         self._arm_timer(act, _TIMER_VERIFY_SCRIPT, _VERIFY_SCRIPT_TIMEOUT_S, actions)
+        verify_workspace = self._node_workspace(act.node_id)
         actions.append(
             StartProcess(
                 cmd=script,
-                cwd=str(self._work_dir),
+                cwd=verify_workspace or str(self._work_dir),
                 context=f"node={act.node_id}/verify",
-                env=self._graph_env(),
+                env=self._graph_env(verify_workspace),
             )
         )
 
@@ -1951,13 +2085,21 @@ class GraphDriver:
         )
         self._state.set_subgraph_nodes(act.node_id, topology)
 
-    def _graph_env(self) -> dict[str, str]:
-        if self._user_prompt_path is None:
-            return {}
-        return {
-            "WORK_DIR": str(self._work_dir),
-            "USER_PROMPT": str(self._user_prompt_path),
-        }
+    def _graph_env(self, workspace: str | None = None) -> dict[str, str]:
+        """进程/成员的环境注入：写者工作区在位时工作目录变量指向其自身。"""
+        env: dict[str, str] = {}
+        if self._user_prompt_path is not None:
+            env["WORK_DIR"] = str(self._work_dir)
+            env["USER_PROMPT"] = str(self._user_prompt_path)
+        if workspace is not None:
+            env["WORKSPACE_DIR"] = workspace
+            env["WORK_DIR"] = workspace
+        return env
+
+    def _node_workspace(self, node_id: str) -> str | None:
+        """节点当前的作用域工作区路径（未开启或未建成为 None）。"""
+        act = self._nodes.get(node_id)
+        return act.workspace_path if act is not None else None
 
     def _member_spec(
         self,
@@ -1985,14 +2127,15 @@ class GraphDriver:
         if self._cli_wrapper is not None:
             config_overrides["cli_wrapper"] = self._cli_wrapper or ""
         config_overrides["model_pinned"] = self._model_pinned
+        workspace = self._node_workspace(node_id)
         return SessionSpec(
             name=name,
             prompt=prompt,
-            cwd=str(self._work_dir),
+            cwd=workspace or str(self._work_dir),
             agent_name=agent_name,
             model=self._model,
             provider_index=self._provider_index,
-            env_overrides=self._graph_env(),
+            env_overrides=self._graph_env(workspace),
             loop=LoopConfig(max_iterations=int(loop_max_iter), evaluator=loop_evaluator),
             config_overrides=config_overrides,
             reviewer_profile=self._reviewer_profile_json(),
@@ -2130,7 +2273,7 @@ class GraphDriver:
         return SessionSpec(
             name=f"graph:{node_id}",
             prompt="",
-            cwd=str(self._work_dir),
+            cwd=self._node_workspace(node_id) or str(self._work_dir),
             model=self._model,
             provider_index=self._provider_index,
             config_overrides={
