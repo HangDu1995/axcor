@@ -34,6 +34,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from workflow_controller.plugin.dispatch_barrier import (
+    COMPAT_LATE_BARRIER,
+    DISPATCH_TOOL_NAMES,
+    dispatch_capabilities_for,
+    writer_dispatch_block_reason,
+)
 from workflow_controller.plugin.run_driver import (
     ArmTimer,
     ArtifactRead,
@@ -123,6 +129,7 @@ def _workspace_tree_config(
     workspace_cfg = traceback_cfg.get("workspace") or {}
     claims_cfg = traceback_cfg.get("claims") or {}
     manifest_cfg = workspace_cfg.get("manifest") or {}
+    gate_cfg = workspace_cfg.get("gate") or {}
     rebuild_decls: dict[str, RebuildScriptDecl] = {}
     for pathspec, decl in (manifest_cfg.get("rebuild_scripts") or {}).items():
         if isinstance(decl, dict):
@@ -135,6 +142,8 @@ def _workspace_tree_config(
         conflict_policy=str(workspace_cfg.get("conflict_policy", "git_merge")),
         retain_after_merge=bool(workspace_cfg.get("retain_after_merge", False)),
         claims_enforce=bool(claims_cfg.get("enforce", False)),
+        on_no_dispatch_barrier=str(traceback_cfg.get("on_no_dispatch_barrier", "fail")),
+        background_drain_timeout_s=float(gate_cfg.get("background_drain_timeout_s", 60.0)),
         merge=tuple(str(p) for p in manifest_cfg.get("merge") or ()),
         writer_local=tuple(str(p) for p in manifest_cfg.get("writer_local") or ()),
         shared_readonly=tuple(str(p) for p in manifest_cfg.get("shared_readonly") or ()),
@@ -142,6 +151,31 @@ def _workspace_tree_config(
         external=tuple(str(p) for p in manifest_cfg.get("external") or ()),
         rebuild_scripts=rebuild_decls,
     )
+
+
+def _strict_dispatch_barrier(program_config: Mapping[str, Any]) -> bool:
+    """派发屏障是否严格档：traceback 工作区模式开启且未显式选弱化档。"""
+    traceback_cfg = program_config.get("traceback")
+    if not isinstance(traceback_cfg, dict) or not traceback_cfg.get("enabled"):
+        return False
+    if traceback_cfg.get("mode", "workspace") != "workspace":
+        return False
+    return traceback_cfg.get("on_no_dispatch_barrier", "fail") != COMPAT_LATE_BARRIER
+
+
+def _writer_dispatch_tool_denial(runtime: str | None) -> tuple[str, ...]:
+    """严格档下 runtime 缺 cwd 注入能力时禁用的派发工具（cc 词面）。
+
+    runtime 未声明（None）时不做出生侧拒绝——该形态由屏障链侧按会话
+    实际 runtime 裁决；显式声明的无屏障 runtime（如 opencode）在此
+    fail-closed。
+    """
+    if not runtime:
+        return ()
+    caps = dispatch_capabilities_for(runtime)
+    if writer_dispatch_block_reason(caps, strict=True) is None:
+        return ()
+    return DISPATCH_TOOL_NAMES
 
 
 def _node_writes(node: Mapping[str, Any]) -> tuple[str, ...]:
@@ -342,6 +376,13 @@ class GraphDriver:
         self._init_runner_options(options or {})
         # 工作区隔离配置：未开启为 None，出生派发与目录注入据此分流
         self._workspace_config = _workspace_tree_config(program.config, work_dir)
+        # 派发屏障严格档 + runtime 缺 cwd 注入能力时禁 task 派发工具
+        # （writer 子代理 fail-closed 的出生侧落点；屏障链侧另有关卡）
+        self._writer_dispatch_denial = (
+            _writer_dispatch_tool_denial(self._runtime)
+            if _strict_dispatch_barrier(program.config)
+            else ()
+        )
         # 节点累计超时时限解析器（整图默认 + 单节点覆盖，随 node_history 透传）
         self._node_timeout = _node_timeout_resolver(program.config)
         self._dag_needs_members = any(self._node_needs_member(n) for n in self._dag.nodes)
@@ -2333,6 +2374,11 @@ class GraphDriver:
         self._dag = program.dag
         self._main_node_ids = frozenset(new_ids)
         self._workspace_config = _workspace_tree_config(program.config, self._work_dir)
+        self._writer_dispatch_denial = (
+            _writer_dispatch_tool_denial(self._runtime)
+            if _strict_dispatch_barrier(program.config)
+            else ()
+        )
         self._node_timeout = _node_timeout_resolver(program.config)
         self._dag_needs_members = any(self._node_needs_member(n) for n in self._dag.nodes)
         if program.agents_dir != agents_dir_before:
@@ -2691,6 +2737,9 @@ class GraphDriver:
         if self._cli_wrapper is not None:
             config_overrides["cli_wrapper"] = self._cli_wrapper or ""
         config_overrides["model_pinned"] = self._model_pinned
+        if self._writer_dispatch_denial:
+            # 严格档缺 cwd 注入能力：禁 task 派发工具，writer 子代理拒绝启动
+            config_overrides["disallowed_tools"] = list(self._writer_dispatch_denial)
         workspace = self._node_workspace(node_id)
         return SessionSpec(
             name=name,

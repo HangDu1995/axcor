@@ -309,12 +309,20 @@ class WorkspaceManager:
         单步 git 提交自身原子，崩溃间隙只产生孤儿提交、无账可错位，
         不入操作日志；检查点行由调用方在其后落账。
         """
+        return await self.commit_scope_state(scope_id, message=f"scope {scope_id} terminal state")
+
+    async def commit_scope_state(self, scope_id: str, *, message: str) -> tuple[str, str]:
+        """闸门内提交作用域当前文件态（终态/组检查点共用的提交步）。
+
+        排除规格与终态提交一致：不入检查点的路径不落提交。返回提交与
+        分支；检查点行由调用方在其后落账。
+        """
         record = await self._require_scope(scope_id)
         if record.scope_kind is ScopeKind.ROOT:
             raise WorkspaceManagerError("根作用域无终态执行态提交")
         if record.state is not ScopeState.ACTIVE:
             raise WorkspaceManagerError(
-                f"作用域非活动态不能提交终态：{scope_id}（{record.state.value}）"
+                f"作用域非活动态不能提交状态：{scope_id}（{record.state.value}）"
             )
         writer_path, branch = self._require_workspace(record)
         writer_target = WorkspaceTarget(path=writer_path, separated_env=False)
@@ -322,7 +330,7 @@ class WorkspaceManager:
             commit = await self._coordinator.commit_pending_state(
                 writer_target,
                 exclude_pathspecs=self._manifest.git_scope_commit_exclude_specs(),
-                message=f"scope {scope_id} terminal state",
+                message=message,
             )
         return commit, branch
 

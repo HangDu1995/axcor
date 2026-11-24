@@ -78,6 +78,11 @@ class WorkspaceTreeConfig:
     conflict_policy: str = "git_merge"
     retain_after_merge: bool = False
     claims_enforce: bool = False
+    # 派发屏障弱化档：fail（默认，严格）| compat_late_barrier（显式弱化，
+    # 检查点标注 late_barrier）；驱动屏障受理与编排出生侧共用
+    on_no_dispatch_barrier: str = "fail"
+    # 屏障有界等待窗口（秒），与后台写进程排空窗口同界
+    background_drain_timeout_s: float = 60.0
     merge: tuple[str, ...] = ()
     writer_local: tuple[str, ...] = ()
     shared_readonly: tuple[str, ...] = ()

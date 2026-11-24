@@ -67,8 +67,16 @@ if TYPE_CHECKING:
 _RUN = RunRecord(run_id="r1", program_ref="/tmp/wf.yaml", format="graph-yaml@1")
 
 
-def build_driver(tmp_path: Path, nodes: list[dict], **cfg: object) -> GraphDriver:
-    """从节点清单构造驱动（yaml 落盘后经翻译器走生产构造路径）。"""
+def build_driver(
+    tmp_path: Path,
+    nodes: list[dict],
+    **cfg: object,
+) -> GraphDriver:
+    """从节点清单构造驱动（yaml 落盘后经翻译器走生产构造路径）。
+
+    ``runner_options`` 为驱动构造入参（runtime 等运行项，yaml 之外的通道）。
+    """
+    runner_options = dict(cfg.pop("_runner_options", {}))  # type: ignore[arg-type]
     cfg.setdefault("workflow", "wf")
     cfg.setdefault("max_parallel", 2)
     yaml_path = tmp_path / "wf.yaml"
@@ -85,7 +93,7 @@ def build_driver(tmp_path: Path, nodes: list[dict], **cfg: object) -> GraphDrive
         state=state,
         work_dir=tmp_path,
         yaml_path=yaml_path,
-        options={},
+        options=runner_options,
     )
 
 

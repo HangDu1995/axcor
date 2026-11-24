@@ -301,6 +301,9 @@ class Session:
                 cwd=self.config.cwd if self.config.cwd else None,
                 max_turns=self.config.max_turns if self.config.max_turns else None,
                 allowed_tools=list(self.config.allowed_tools) if self.config.allowed_tools else [],
+                disallowed_tools=(
+                    list(self.config.disallowed_tools) if self.config.disallowed_tools else []
+                ),
                 env=sdk_env,
                 hooks=self._driver_hooks,
                 system_prompt=self.config.system_prompt,

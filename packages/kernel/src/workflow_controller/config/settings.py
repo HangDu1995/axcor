@@ -106,6 +106,9 @@ class SessionConfig(BaseModel):
     initial_prompt: str = ""
     permission_mode: str = "bypassPermissions"
     allowed_tools: list[str] | None = None
+    # 禁用工具（cc PascalCase 词面）：严格 traceback 下缺屏障能力的 runtime
+    # 借此拒绝 writer 子代理派发（opencode 顶层 permission deny / cc 原生禁用）
+    disallowed_tools: list[str] | None = None
     max_turns: int | None = None
     max_budget_usd: float | None = None
     model: str | None = None

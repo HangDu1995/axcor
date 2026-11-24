@@ -450,6 +450,24 @@ class OpRequest(RunNotification):
     reply: Any = None
 
 
+@dataclass(frozen=True)
+class DispatchBarrierRequest(RunNotification):
+    """派发屏障请求：会话宿主发起，run 任务内执行核心动作后经 Future 回传。
+
+    kind 词面：side_effect（⑤ 写文件类/Bash 副作用前）| dispatch（① task
+    创建前）。data 为驱动层规整后的 CC 风格载荷（tool_name/tool_input/
+    tool_use_id/native 会话与消息标识）；reply 为 asyncio.Future，结果为
+    驱动层屏障结果（放行 + 子工作区 cwd / 拒绝）。
+    """
+
+    kind: str
+    session_id: str
+    runtime: str
+    context: str | None = None
+    data: Mapping[str, Any] = field(default_factory=dict)
+    reply: Any = None
+
+
 # ── 协议 ──────────────────────────────────────────────────────────
 
 

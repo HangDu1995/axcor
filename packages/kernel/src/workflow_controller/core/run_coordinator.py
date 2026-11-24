@@ -52,6 +52,7 @@ from workflow_controller.core.checkpoints import (
     BarrierQuality,
     CheckpointStore,
     CheckpointTrigger,
+    DispatchAnchor,
     ScopeCheckpoint,
     checkpoint_to_dict,
 )
@@ -98,6 +99,10 @@ from workflow_controller.core.workspace.claims import (
     WORKSPACE_CLAIM_REJECTED_EVENT,
     ClaimRejectedError,
 )
+from workflow_controller.core.workspace.dispatch_groups import (
+    ChildDispatchRequest,
+    DispatchGroupArbiter,
+)
 from workflow_controller.core.workspace.integration import IntegrationCoordinator
 from workflow_controller.core.workspace.manager import ScopeQuiesceFailedError
 from workflow_controller.core.workspace.manifest import (
@@ -105,6 +110,13 @@ from workflow_controller.core.workspace.manifest import (
     RebuildScript,
 )
 from workflow_controller.core.workspace.oplog import SagaOplog
+from workflow_controller.driver.hooks import BarrierDeny, BarrierOutcome, BarrierProceed
+from workflow_controller.plugin.dispatch_barrier import (
+    COMPAT_LATE_BARRIER,
+    dispatch_capabilities_for,
+    group_arbitration_block_reason,
+    writer_dispatch_block_reason,
+)
 from workflow_controller.plugin.run_driver import (
     START_LIKE_ACTIONS,
     AllSessionsTerminal,
@@ -114,6 +126,7 @@ from workflow_controller.plugin.run_driver import (
     ControlKind,
     ControlNotification,
     DiscardSession,
+    DispatchBarrierRequest,
     EmitEvent,
     FinishRun,
     KillProcesses,
@@ -864,12 +877,27 @@ class _WorkspaceTree:
             claims_enforce=config.claims_enforce,
         )
         self.checkpoints = checkpoints
+        self.arbiter = DispatchGroupArbiter(self.manager, checkpoints)
         self.retain_after_merge = config.retain_after_merge
+        self.on_no_dispatch_barrier = config.on_no_dispatch_barrier
+        self.barrier_wait_timeout_s = config.background_drain_timeout_s
         self.root_scope_id = f"{run_id}-root"
+        self._child_seq = 0
 
     async def initialize(self) -> None:
         """导入基线并建根作用域；私有仓已存在时显式失败。"""
         await self.manager.initialize_root(scope_id=self.root_scope_id)
+
+    def next_child_identity(self, parent_scope_id: str) -> tuple[str, str]:
+        """预分配一个子代理作用域键与配套操作号（键在树内不重号）。"""
+        self._child_seq += 1
+        scope_key = f"{parent_scope_id}-c{self._child_seq}"
+        return scope_key, f"dispatch-{self._child_seq}"
+
+    @property
+    def strict_barrier(self) -> bool:
+        """派发屏障是否严格档（非显式弱化即严格）。"""
+        return self.on_no_dispatch_barrier != COMPAT_LATE_BARRIER
 
 
 class RunCoordinator:
@@ -894,6 +922,10 @@ class RunCoordinator:
         self._orch = orchestrator
         self._run_store = run_store
         self._bus = bus
+        # 会话宿主侧的派发屏障端口：屏障请求经协调器队列执行（唯一 I/O 手）
+        set_barrier_port = getattr(orchestrator, "set_dispatch_barrier_port", None)
+        if callable(set_barrier_port):
+            set_barrier_port(self.submit_dispatch_barrier)
         # 工作区闸门的可注入后台写进程排空回调（后台写者清单接线前默认无）
         self._workspace_drain_hook = workspace_drain_hook
         # 冻结映射：工厂集在插件装载后不可变（无热重载），重名注册已在
@@ -961,10 +993,11 @@ class RunCoordinator:
     @staticmethod
     def _drain_controls(
         rt: RunRuntime,
-    ) -> tuple[list[ControlNotification], list[OpRequest]]:
-        """取走控制通知与应答请求，其余保序滞留 FIFO（暂停期专用，成员事件不丢失）。"""
+    ) -> tuple[list[ControlNotification], list[OpRequest], list[DispatchBarrierRequest]]:
+        """取走控制通知、应答请求与屏障请求，其余保序滞留 FIFO（暂停期专用，成员事件不丢失）。"""
         ctrls: list[ControlNotification] = []
         ops: list[OpRequest] = []
+        barriers: list[DispatchBarrierRequest] = []
         rest: deque[RunNotification] = deque()
         while rt.notifications:
             n = rt.notifications.popleft()
@@ -972,10 +1005,12 @@ class RunCoordinator:
                 ctrls.append(n)
             elif isinstance(n, OpRequest):
                 ops.append(n)
+            elif isinstance(n, DispatchBarrierRequest):
+                barriers.append(n)
             else:
                 rest.append(n)
         rt.notifications.extend(rest)
-        return ctrls, ops
+        return ctrls, ops, barriers
 
     @staticmethod
     def _settle_op_reply(op: OpRequest, outcome: dict[str, Any] | BaseException) -> None:
@@ -1425,6 +1460,55 @@ class RunCoordinator:
         reply: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._notify(run_id, OpRequest(op=op, args=dict(args or {}), reply=reply))
         return await asyncio.wait_for(reply, timeout_s)
+
+    async def submit_dispatch_barrier(
+        self,
+        session_id: str,
+        kind: str,
+        data: Mapping[str, Any],
+        *,
+        runtime: str = "",
+    ) -> BarrierOutcome:
+        """派发屏障入口：会话宿主发起，经 FIFO 在 run 任务内执行核心动作。
+
+        有界等待：窗口与后台排空同界，超窗按 fault.scope_quiesce_failed
+        语义收口为拒绝，不让 hook 挂死。非 traceback 工作区 run（无树）
+        直接放行——不注入 cwd、不建组，与既有路径零差异。
+        """
+        affiliation = self._affiliation.resolve(session_id)
+        if affiliation is None:
+            return BarrierProceed()
+        tree = self._workspace_trees.get(affiliation.run_id)
+        if tree is None:
+            return BarrierProceed()
+        rt = self._runtimes.get(affiliation.run_id)
+        if rt is None or rt.poisoned:
+            return BarrierDeny(
+                reason=f"run {affiliation.run_id} 无可用驱动运行时，屏障无法受理",
+                fault=None,
+            )
+        reply: asyncio.Future[BarrierOutcome] = asyncio.get_running_loop().create_future()
+        self._notify(
+            affiliation.run_id,
+            DispatchBarrierRequest(
+                kind=kind,
+                session_id=session_id,
+                runtime=runtime,
+                context=affiliation.context,
+                data=dict(data),
+                reply=reply,
+            ),
+        )
+        try:
+            return await asyncio.wait_for(reply, timeout=tree.barrier_wait_timeout_s)
+        except TimeoutError:
+            return BarrierDeny(
+                reason=(
+                    f"派发屏障等待超窗（>{tree.barrier_wait_timeout_s}s），"
+                    f"按 {fault_event_type(SCOPE_QUIESCE_FAILED_RULE)} 收口，本次副作用不执行"
+                ),
+                fault=fault_event_type(SCOPE_QUIESCE_FAILED_RULE),
+            )
 
     async def load_driver_snapshot(self, run_id: str) -> dict[str, Any] | None:
         """最新驱动快照（读盘；配置重读与外部对账用）。"""
@@ -2051,11 +2135,12 @@ class RunCoordinator:
         return LoopState.DRAINING
 
     async def _run_paused_round(self, rt: RunRuntime) -> list[ControlNotification]:
-        """暂停轮：排空控制/应答、落快照；返回待携带入主路径收尾的终态控制。"""
-        ctrls, ops = self._drain_controls(rt)
+        """暂停轮：排空控制/应答/屏障、落快照；返回待携带入主路径收尾的终态控制。"""
+        ctrls, ops, barriers = self._drain_controls(rt)
         for c in ctrls:
             await self._call_control(rt, c)
         await self._serve_ops(rt, ops)
+        await self._serve_dispatch_barriers(rt, barriers)
         await self._persist_snapshot(rt)
         carried = [c for c in ctrls if c.is_terminal()]
         if not carried:
@@ -2066,14 +2151,20 @@ class RunCoordinator:
     async def _drain_round_notifications(
         self, rt: RunRuntime
     ) -> tuple[list[RunNotification], list[ControlNotification]]:
-        """排空通知 FIFO：控制类即时处理、应答类服务，剩余成员事件按序返回。"""
+        """排空通知 FIFO：控制类即时处理、应答与屏障类服务，剩余成员事件按序返回。"""
         notes = self._drain_notifications(rt)
         ctrls = [n for n in notes if isinstance(n, ControlNotification)]
         ops = [n for n in notes if isinstance(n, OpRequest)]
-        notes = [n for n in notes if not isinstance(n, (ControlNotification, OpRequest))]
+        barriers = [n for n in notes if isinstance(n, DispatchBarrierRequest)]
+        notes = [
+            n
+            for n in notes
+            if not isinstance(n, (ControlNotification, OpRequest, DispatchBarrierRequest))
+        ]
         for c in ctrls:
             await self._call_control(rt, c)
         await self._serve_ops(rt, ops)
+        await self._serve_dispatch_barriers(rt, barriers)
         return notes, ctrls
 
     async def _settle_round_terminality(
@@ -2159,6 +2250,105 @@ class RunCoordinator:
                 self._settle_op_reply(op, e)
             else:
                 self._settle_op_reply(op, result)
+
+    async def _serve_dispatch_barriers(
+        self, rt: RunRuntime, requests: list[DispatchBarrierRequest]
+    ) -> None:
+        """消费派发屏障请求：执行核心动作后回填 Future，与 decide 串行不交错。"""
+        for req in requests:
+            try:
+                outcome = await self._execute_dispatch_barrier(rt, req)
+            except Exception as e:
+                self._settle_barrier_reply(req, BarrierDeny(reason=f"{type(e).__name__}: {e}"))
+            else:
+                self._settle_barrier_reply(req, outcome)
+
+    async def _execute_dispatch_barrier(
+        self, rt: RunRuntime, req: DispatchBarrierRequest
+    ) -> BarrierOutcome:
+        """执行屏障核心动作链：能力门 → 编排状态先持久化 → 组仲裁 → 回 cwd/放行。
+
+        屏障内一切 I/O 由本方法（宿主侧）执行，hook 不直写核心；编排状态
+        版本先于文件提交（与生命周期检查点同一持久化顺序）。
+        """
+        tree = self._workspace_trees.get(rt.run_id)
+        if tree is None:
+            return BarrierProceed()
+        caps = dispatch_capabilities_for(req.runtime)
+        strict = tree.strict_barrier
+        if req.kind == "dispatch":
+            block = writer_dispatch_block_reason(caps, strict=strict)
+        else:
+            block = group_arbitration_block_reason(caps, strict=strict)
+        if block is not None:
+            return BarrierDeny(reason=block)
+        parent_scope = await self._barrier_parent_scope(tree, req)
+        child: ChildDispatchRequest | None = None
+        preallocated = ""
+        if req.kind == "dispatch":
+            scope_key, client_op_id = tree.next_child_identity(parent_scope.scope_id)
+            child = ChildDispatchRequest(
+                scope_key=scope_key,
+                client_op_id=client_op_id,
+                owner_ref=f"session={req.session_id}",
+            )
+            preallocated = scope_key
+        anchor = self._barrier_anchor(req, preallocated)
+        orchestration_ref = await self._persist_orchestration_ref(rt)
+        admission = await tree.arbiter.admit_side_effect(
+            parent_scope_id=parent_scope.scope_id,
+            anchor=anchor,
+            child=child,
+            barrier_quality=(BarrierQuality.PRECISE if strict else BarrierQuality.LATE_BARRIER),
+            orchestration_state_ref=orchestration_ref,
+        )
+        return BarrierProceed(child_cwd=admission.child_cwd)
+
+    async def _barrier_parent_scope(
+        self, tree: _WorkspaceTree, req: DispatchBarrierRequest
+    ) -> ScopeRecord:
+        """按会话归属上下文解析屏障父作用域（成员 context 形如 node=<id>）。"""
+        context = req.context or ""
+        if not context.startswith("node="):
+            raise RuntimeError(f"会话 {req.session_id} 缺少节点上下文，屏障无法定位父作用域")
+        node_id = context.removeprefix("node=")
+        if not node_id:
+            raise RuntimeError(f"会话 {req.session_id} 节点上下文为空，屏障无法定位父作用域")
+        for record in await tree.manager.list_scopes():
+            if record.owner_ref == node_id:
+                return record
+        raise RuntimeError(f"屏障父作用域未找到：node={node_id}")
+
+    @staticmethod
+    def _barrier_anchor(req: DispatchBarrierRequest, preallocated_scope_id: str) -> DispatchAnchor:
+        """由屏障载荷构造锚点草稿（组标识由组仲裁回填）。"""
+        data = req.data
+        message_key = str(data.get("prompt_id") or data.get("message_id") or "")
+        if not message_key:
+            raise RuntimeError("屏障载荷缺少消息标识，无法形成派发锚点")
+        return DispatchAnchor(
+            parent_native_session_id=str(
+                data.get("native_session_id") or data.get("session_id") or ""
+            ),
+            parent_message_id=message_key,
+            tool_use_id=str(data.get("tool_use_id") or ""),
+            preallocated_scope_id=preallocated_scope_id,
+            exclude_message_id=message_key,
+            dispatch_group_id="",
+        )
+
+    @staticmethod
+    def _settle_barrier_reply(req: DispatchBarrierRequest, outcome: BarrierOutcome) -> None:
+        """回填屏障应答；调用方已超时离场时留痕（该次派发按拒绝收口）。"""
+        reply: asyncio.Future[BarrierOutcome] = req.reply
+        if reply.done():
+            logger.warning(
+                "派发屏障 %s 应答晚于调用方等待上界：结果未送达: %r",
+                req.kind,
+                outcome,
+            )
+            return
+        reply.set_result(outcome)
 
     async def _execute_op(self, rt: RunRuntime, op: OpRequest) -> Any:
         """单个操作的执行体：projection / world op / 普通 op 三分支。"""

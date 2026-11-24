@@ -80,6 +80,8 @@ from workflow_controller.core.runs import RunKind, RunNotFoundError, RunStore
 from workflow_controller.core.session_run_affiliation import SessionRunAffiliationService
 from workflow_controller.core.subagent_tracker import SubagentTracker
 from workflow_controller.driver.hooks import (
+    BarrierOutcome,
+    BarrierProceed,
     CodexHookConfigWriter,
     DriverHooks,
     SubagentProgressBridge,
@@ -137,6 +139,8 @@ class Orchestrator:
     _reviewer_mode: str
     _stop_block_counts: dict[str, int]
     _stop_block_limit: int
+    # 派发屏障端口：run 平面注册后会话宿主把屏障请求转交协调器队列
+    _dispatch_barrier_port: Callable[..., Awaitable[BarrierOutcome]] | None
 
     def __init__(
         self,
@@ -615,6 +619,28 @@ class Orchestrator:
         if loop is not None and loop.is_current_id(session_id):
             loop.mark_reviewer_let_exit()
 
+    def set_dispatch_barrier_port(self, port: Callable[..., Awaitable[BarrierOutcome]]) -> None:
+        """登记派发屏障端口（run 平面注册；此后新激活会话接线屏障回调）。"""
+        self._dispatch_barrier_port = port
+
+    async def _handle_dispatch_barrier(
+        self,
+        session_id: str,
+        kind: str,
+        data: dict[str, Any],
+    ) -> BarrierOutcome:
+        """屏障回调入口：解析会话 runtime 后转交 run 平面端口（有界等待在端口侧）。"""
+        from workflow_controller.driver.factory import resolve_runtime
+
+        port = self._dispatch_barrier_port
+        if port is None:
+            return BarrierProceed()
+        session = self.pool.get(session_id)
+        runtime = ""
+        if session is not None:
+            runtime = resolve_runtime(session.config.runtime or self.config.runtime)
+        return await port(session_id, kind, data, runtime=runtime)
+
     def make_driver_hooks(
         self,
         mig_session_id: str,
@@ -640,6 +666,12 @@ class Orchestrator:
                 self._codex_hooks_are_managed,
                 mig_session_id,
             )
+        # 派发屏障回调：run 平面端口注册后才接线（未注册时驱动层零变化）
+        before_side_effect_tool = None
+        before_subagent_dispatch = None
+        if self._dispatch_barrier_port is not None:
+            before_side_effect_tool = partial(self._handle_dispatch_barrier, kind="side_effect")
+            before_subagent_dispatch = partial(self._handle_dispatch_barrier, kind="dispatch")
         return DriverHooks(
             session_id=mig_session_id,
             on_pre_tool_use=self._handle_driver_pre_tool_use,
@@ -656,6 +688,8 @@ class Orchestrator:
             on_subagent_start=self._subagents.on_start,
             on_subagent_progress=self._subagents.on_progress,
             on_subagent_stop=self._subagents.on_stop,
+            before_side_effect_tool=before_side_effect_tool,
+            before_subagent_dispatch=before_subagent_dispatch,
             subagent_progress_bridge=SubagentProgressBridge(),
             # opencode gate (AskUserQuestion-equivalent); ignored by cc drivers.
             on_gate_question=self._resolve_gate_question,
@@ -2259,6 +2293,9 @@ class Orchestrator:
         self._reviewer_interceptor = None
         self._hook_decision_emitter = None
         self._cli_to_workflow_controller_session = {}
+        # 派发屏障端口：run 平面（RunCoordinator）注册；未注册时驱动层
+        # 屏障回调不接线（旧路径零变化）
+        self._dispatch_barrier_port = None
 
     def _init_plane_integrations(self) -> None:
         """平面集成组件初始化：watchdog/subagent/overlay/文件变更（__init__ 专用）。"""
