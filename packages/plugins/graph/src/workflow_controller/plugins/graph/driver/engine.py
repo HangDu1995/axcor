@@ -19,7 +19,9 @@
 传播/回滚/验收判定/提示词）在包内纯函数模块；本模块只持步进状态。
 未合并节点回滚走异步确认链：op 只登记操作账并立即返回 operation_id，
 AbandonScope → ScopeAbandoned → 失效计划落账 → RestoreCommitted →
-新工作区就绪的每一步都由 decide 驱动、回执接力。
+新工作区就绪的每一步都由 decide 驱动、回执接力。当前定义换装走
+reload_definition op：工厂侧翻译成载荷、暂停态下纯换装，节点状态与
+运行档案原样保留。
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ import logging
 import shlex
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from workflow_controller.plugin.run_driver import (
@@ -86,7 +89,6 @@ from workflow_controller.plugins.graph.template import render
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
-    from pathlib import Path
 
     from workflow_controller.plugins.graph.driver.dag import DAG
     from workflow_controller.plugins.graph.translator import GraphProgram
@@ -324,6 +326,9 @@ class GraphDriver:
         self._graph_id = graph_id
         self._program = program
         self._dag = program.dag
+        # 主图节点集（构造/换装时冻结）：换装据此判定「删除/改名既有
+        # 节点」并拒绝；运行期动态合并的子图节点不在此列（随生成器重建）
+        self._main_node_ids = frozenset(program.dag.all_ids())
         self._state = state
         self._work_dir = work_dir
         self._yaml_path = yaml_path
@@ -686,16 +691,28 @@ class GraphDriver:
         op: str,
         args: Mapping[str, Any],
     ) -> tuple[dict[str, Any], bool, list[RunAction]]:
+        """应答通道操作：投影对账走 world 面；重载定义换装后补快照与事件。"""
         if op == "reconcile_projection":
             return self.reconcile_projection(world)
-        return self.handle_op(op, args), False, []
+        result = self.handle_op(op, args)
+        if op != "reload_definition":
+            return result, False, []
+        event = EmitEvent(
+            event_type="definition_reloaded",
+            data={
+                "workflow": result.get("workflow"),
+                "added_nodes": list(result.get("added_nodes") or []),
+                "yaml_path": str(self._yaml_path),
+            },
+        )
+        return result, True, [event]
 
         # stop/inject：结局流与核心成员操作面收尾，此处无需反应
 
     # ── 组控反应 ────────────────────────────────────────────────
 
     def handle_op(self, op: str, args: Mapping[str, Any]) -> dict[str, Any]:
-        """驱动自定义操作：reload 重读运行配置，update_model 切换模型，rollback_node/get_operation 服务回滚异步链。"""
+        """驱动自定义操作：reload 重读运行配置，update_model 切换模型，rollback_node/get_operation 服务回滚异步链，reload_definition 换装当前定义。"""
         if op == "reload":
             self.apply_runtime_config(dict(args.get("options") or {}))
             return {"reloaded": True}
@@ -719,6 +736,8 @@ class GraphDriver:
             return self._register_rollback_op(args)
         if op == "get_operation":
             return self._operation_status(str(args.get("operation_id") or ""))
+        if op == "reload_definition":
+            return self._apply_reload_definition(args)
         raise NotImplementedError(f"未知驱动操作 {op}")
 
     def runtime_options(self) -> dict[str, Any]:
@@ -2279,6 +2298,63 @@ class GraphDriver:
             actions,
             scheduler.derive_status_after_rollback(self._state.snapshot()),
         )
+
+    # ── 当前定义换装 ────────────────────────────────────────────
+
+    def _apply_reload_definition(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """换装新程序定义：只换定义侧装配，节点状态/代次/映射档案原样保留。
+
+        受理面：仅暂停态（运行中换装会与在途执行交错出半个现场）；
+        新定义删除/改名既有主图节点时明确拒绝——既有状态无处安放，
+        不静默丢弃。载荷由插件工厂翻译（读文件在工厂侧），此处纯换装。
+        """
+        if not self._group_paused:
+            raise ValueError("运行中的 run 不允许重载定义（仅暂停态受理，请先暂停）")
+        program = args.get("program")
+        if not isinstance(program, translator.GraphProgram):
+            raise ValueError("reload_definition 载荷缺少程序翻译产物")
+        new_ids = set(program.dag.all_ids())
+        removed = sorted(self._main_node_ids - new_ids)
+        if removed:
+            raise ValueError(
+                "新定义缺少既有节点，既有状态无法保留（删除/改名节点不支持原地重载）："
+                + "、".join(removed)
+            )
+        agents_dir_before = self._program.agents_dir
+        yaml_path = args.get("yaml_path")
+        if yaml_path:
+            self._yaml_path = Path(str(yaml_path))
+        agents_base = args.get("agents_dir_base")
+        self._agents_dir_base = Path(str(agents_base)) if agents_base else None
+        self._program = program
+        self._dag = program.dag
+        self._main_node_ids = frozenset(new_ids)
+        self._workspace_config = _workspace_tree_config(program.config, self._work_dir)
+        self._node_timeout = _node_timeout_resolver(program.config)
+        self._dag_needs_members = any(self._node_needs_member(n) for n in self._dag.nodes)
+        if program.agents_dir != agents_dir_before:
+            # agents 资源目录变化：软链预备作废重备（同目录时已备软链继续可用）
+            self._agents_ready = program.agents_dir is None
+            self._agents_prep_inflight = False
+        # 已合并子图拓扑回填：新程序 DAG 不含运行期合并的子图节点，
+        # 按工厂侧预案原样合回（state 侧档案未动，无需重落）
+        for generator_id, prefixed in args.get("subgraph_plans") or ():
+            scheduler.merge_restored_subgraph(self._state, self._dag, generator_id, prefixed)
+        added = sorted(new_ids - set(self._state.snapshot()["nodes"]))
+        for nid in added:
+            self._state.add_node(nid)
+        logger.info(
+            "graph %s definition reloaded: %d nodes (+%d new)",
+            self._graph_id,
+            len(new_ids),
+            len(added),
+        )
+        return {
+            "reloaded": True,
+            "workflow": program.workflow,
+            "added_nodes": added,
+            "node_count": len(new_ids),
+        }
 
     # ── 未合并节点回滚异步状态机 ────────────────────────────────
 

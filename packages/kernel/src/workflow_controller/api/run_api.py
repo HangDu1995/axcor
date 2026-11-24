@@ -435,6 +435,20 @@ class RunAPI:
         except RunNotFoundError as e:
             raise RunApiNotFoundError(e.args[0] if e.args else run_id) from e
 
+    async def reload_run_definition(
+        self, run_id: str, program_path: str | Path | None = None
+    ) -> dict[str, Any]:
+        """重读当前工作流定义并更新现有 run 的任务定义。
+
+        保留节点状态与产物、不新建 run；仅暂停态受理（运行中/终态拒绝）。
+        program_path 缺省重读 run 的原始程序位置（RSI 应用 patch 后的同
+        一文件），显式新路径按新位置重读。
+        """
+        try:
+            return await self._coord.reload_run_definition(run_id, program_path)
+        except RunNotFoundError as e:
+            raise RunApiNotFoundError(e.args[0] if e.args else run_id) from e
+
     # ── 驱动通道与事件 ──────────────────────────────────────────
 
     async def fetch_events(

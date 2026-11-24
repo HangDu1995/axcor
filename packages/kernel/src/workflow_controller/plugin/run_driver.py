@@ -522,3 +522,15 @@ class RunDriverFactory(Protocol):
     ) -> RunDriver:
         """从快照恢复；快照不可解析时抛错、run 标 failed(unrecoverable)。"""
         ...
+
+
+class RunDriverReloader(Protocol):
+    """可选扩展：工厂侧重读当前程序定义（I/O 侧）并翻译为换装载荷。
+
+    载荷不透明（协调器只透传），经 reload_definition 驱动 op 在 run 任务
+    内完成换装；翻译/校验失败抛错，run 保持原定义原状态。
+    """
+
+    def reload_definition(self, run: RunRecord, driver: RunDriver, source: Path) -> Any:
+        """重读工作流源文件并翻译；driver 为协调器在册实例（只读快照可用）。"""
+        ...

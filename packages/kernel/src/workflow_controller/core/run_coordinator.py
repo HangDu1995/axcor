@@ -1192,6 +1192,49 @@ class RunCoordinator:
         await self._close_container_if_idle(run_id)  # 重开即重估：全终态随即收尾
         return await self.get_run(run_id)
 
+    async def reload_run_definition(
+        self, run_id: str, program_path: Path | str | None = None
+    ) -> dict[str, Any]:
+        """重读当前工作流定义并换装到现有 run（不新建 run，仅暂停态受理）。
+
+        翻译先行（工厂侧 I/O，坏定义在此失败、run 零改动）、换装经
+        reload_definition 驱动 op 在 run 任务内完成（与驱动调用同序）、
+        成功后重冻结 run 根程序副本（恢复不随外部文件漂移；拒绝路径
+        不触碰副本）。
+        """
+        run = await self._run_store.get(run_id)
+        if run.kind != RunKind.WORKFLOW:
+            raise ValueError(f"run {run_id} 是 {run.kind} 形态，不支持重载定义")
+        if run.status in TERMINAL_STATUSES:
+            raise ValueError(f"run {run_id} 已终态（{run.status}），重载定义需在暂停态进行")
+        rt = self._runtimes.get(run_id)
+        if rt is None or rt.poisoned:
+            raise RuntimeError(f"run {run_id} 无可用驱动运行时，重载定义需在暂停态进行")
+        if run.status != RunStatus.PAUSED:
+            raise ValueError(f"run {run_id} 运行中（{run.status}），重载定义仅暂停态受理，请先暂停")
+        factory = self._driver_factories.get(run.format)
+        reloader = getattr(factory, "reload_definition", None) if factory is not None else None
+        if not callable(reloader):
+            raise ValueError(f"格式 {run.format} 的驱动工厂不支持重载定义")
+        source = Path(program_path).expanduser() if program_path else Path(run.program_ref)
+        if not source.is_file():
+            raise ValueError(f"工作流源文件不存在：{source}")
+        try:
+            payload = await self._guarded_factory_call(run.format, reloader, run, rt.driver, source)
+        except Exception as e:
+            # 翻译/校验失败统一包装为可读错误（保留原因）；此时零改动，
+            # run 保持原定义原状态
+            raise ValueError(f"工作流定义重读失败：{type(e).__name__}: {e}") from e
+        # 换装成功后才冻结：驱动侧拒绝（如删除既有节点）时 run 根程序
+        # 副本不被改写，恢复源与在册定义不脱节。冻结失败时换装已生效，
+        # 报错由调用方重试同一重载收敛
+        entry = self.run_data_root(run_id) / "program" / source.name
+        payload["yaml_path"] = str(entry)
+        payload["agents_dir_base"] = str(source.parent)
+        result = await self.request_driver_op(run_id, "reload_definition", payload)
+        await asyncio.to_thread(self._freeze_program, run_id, source)
+        return result
+
     async def delete_run(self, run_id: str) -> None:
         """级联删除：停运行面 → 账面单事务 → 物理删 run 根 → 内存驱逐与成员清理通知。
 
