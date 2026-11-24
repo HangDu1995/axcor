@@ -122,6 +122,43 @@ def test_workspace_prepare_precedes_member_birth(tmp_path: Path) -> None:
     assert not pick(actions, StartSession)
 
 
+def test_prepare_carries_node_writes_and_claims_enforce(tmp_path: Path) -> None:
+    """节点 writes 声明随建区动作携带，claims.enforce 进树配置。"""
+    driver = build_driver(
+        tmp_path,
+        [
+            {
+                "id": "a",
+                "task_type": "bash",
+                "command": "true",
+                "writes": ["op/op_kernel/**", "op/build/autogen/**"],
+            }
+        ],
+        traceback={
+            "enabled": True,
+            "claims": {"enforce": True},
+        },
+    )
+    actions = decide(driver)
+
+    prepares = pick(actions, PrepareScopeWorkspace)
+    assert len(prepares) == 1
+    assert prepares[0].writes == ("op/op_kernel/**", "op/build/autogen/**")
+    assert prepares[0].config.claims_enforce is True
+
+
+def test_claims_enforce_defaults_off(tmp_path: Path) -> None:
+    """未声明 claims 配置时强制档默认关闭。"""
+    driver = build_driver(
+        tmp_path,
+        [{"id": "a", "task_type": "bash", "command": "true"}],
+        traceback={"enabled": True},
+    )
+    actions = decide(driver)
+
+    assert pick(actions, PrepareScopeWorkspace)[0].config.claims_enforce is False
+
+
 def test_member_spawned_with_workspace_after_prepared(tmp_path: Path) -> None:
     """建区回执到达后成员才出生：cwd 与环境指向作用域工作区。"""
     driver = build_driver(

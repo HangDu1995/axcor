@@ -16,7 +16,12 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+import pytest
 
 from workflow_controller.core.workspace.integration import (
     ConflictPolicy,
@@ -34,6 +39,7 @@ from workflow_controller.core.workspace.repository import (
 from ._support import make_user_root
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from workflow_controller.core.workspace.repository import RootRefs, ScopeWorkspace
@@ -264,3 +270,187 @@ async def test_writer_local_only_change_is_noop_integration(tmp_path: Path) -> N
     assert await repository.resolve_ref(ROOT_INTEGRATION_REF) == refs.integration_head
     assert (root / "run.log").read_text(encoding="utf-8") == "root-log\n"
     assert not (root / "op" / "build" / "new.out").exists()
+
+
+# ── 路径事件对全覆盖（§8.1 两档判定的验收矩阵）──────────────────────
+
+
+@dataclass(frozen=True)
+class _EventPair:
+    """一个路径事件对场景：基线种子、双方变更与两档期望。"""
+
+    name: str
+    seed: Callable[[Path], None]
+    first: Callable[[Path], None]
+    second: Callable[[Path], None]
+    # 路径出现于双侧变更集即命中（strict 档拒绝）
+    overlap_path: str
+    # 可合并档下该事件对是否干净（真 git 三方合并判定）
+    merge_clean: bool
+    # 可合并档冲突时的主冲突路径（默认取 overlap_path）
+    merge_conflict_path: str = ""
+
+
+def _write(path: Path, text: str) -> None:
+    """写文件（含父目录）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _replace_with_symlink(path: Path, target: str) -> None:
+    """普通文件替换为符号链接。"""
+    path.unlink()
+    path.symlink_to(target)
+
+
+_EVENT_PAIRS: list[_EventPair] = [
+    _EventPair(
+        name="modify_modify_disjoint_hunks",
+        seed=lambda root: _write(root / "design" / "notes.txt", NOTES_BASE),
+        first=lambda ws: _write(ws / "design" / "notes.txt", "w1-UP\nw2-UP\nmid1\nmid2\np1\np2\n"),
+        second=lambda ws: _write(
+            ws / "design" / "notes.txt", "w1\nw2\nmid1\nmid2\np1-LOW\np2-LOW\n"
+        ),
+        overlap_path="design/notes.txt",
+        merge_clean=True,
+    ),
+    _EventPair(
+        name="add_add_same_content",
+        seed=lambda root: None,
+        first=lambda ws: _write(ws / "design" / "new.txt", "same\n"),
+        second=lambda ws: _write(ws / "design" / "new.txt", "same\n"),
+        overlap_path="design/new.txt",
+        merge_clean=True,
+    ),
+    _EventPair(
+        name="add_add_different_content",
+        seed=lambda root: None,
+        first=lambda ws: _write(ws / "design" / "new.txt", "from-first\n"),
+        second=lambda ws: _write(ws / "design" / "new.txt", "from-second\n"),
+        overlap_path="design/new.txt",
+        merge_clean=False,
+    ),
+    _EventPair(
+        name="delete_modify",
+        seed=lambda root: _write(root / "design" / "target.txt", "content\n"),
+        first=lambda ws: (ws / "design" / "target.txt").unlink(),
+        second=lambda ws: _write(ws / "design" / "target.txt", "modified\n"),
+        overlap_path="design/target.txt",
+        merge_clean=False,
+    ),
+    _EventPair(
+        name="delete_delete_rebuild",
+        seed=lambda root: _write(root / "design" / "target.txt", "content\n"),
+        first=lambda ws: _write(ws / "design" / "target.txt", "re-first\n"),
+        second=lambda ws: _write(ws / "design" / "target.txt", "re-second\n"),
+        overlap_path="design/target.txt",
+        merge_clean=False,
+    ),
+    _EventPair(
+        name="rename_crossing",
+        seed=lambda root: _write(root / "design" / "mv.txt", "payload\n"),
+        first=lambda ws: (ws / "design" / "mv.txt").rename(ws / "design" / "moved-a.txt"),
+        second=lambda ws: (ws / "design" / "mv.txt").rename(ws / "design" / "moved-b.txt"),
+        overlap_path="design/mv.txt",
+        merge_clean=False,
+    ),
+    _EventPair(
+        name="dir_file_swap",
+        seed=lambda root: (
+            _write(root / "design" / "pkg" / "x.txt", "x\n"),
+            _write(root / "design" / "pkg" / "y.txt", "y\n"),
+        ),
+        first=lambda ws: (
+            shutil.rmtree(ws / "design" / "pkg"),
+            _write(ws / "design" / "pkg", "file-now\n"),
+        ),
+        second=lambda ws: _write(ws / "design" / "pkg" / "x.txt", "x-mod\n"),
+        overlap_path="design/pkg/x.txt",
+        merge_clean=False,
+    ),
+    _EventPair(
+        name="symlink_file_swap",
+        seed=lambda root: (
+            _write(root / "design" / "anchor.txt", "anchor\n"),
+            _write(root / "design" / "link.txt", "plain\n"),
+        ),
+        first=lambda ws: _replace_with_symlink(ws / "design" / "link.txt", "anchor.txt"),
+        second=lambda ws: _write(ws / "design" / "link.txt", "plain-mod\n"),
+        overlap_path="design/link.txt",
+        merge_clean=False,
+    ),
+    _EventPair(
+        name="type_mode_change",
+        seed=lambda root: (
+            _write(root / "design" / "anchor.txt", "anchor\n"),
+            _write(root / "design" / "bin.sh", "script\n"),
+        ),
+        first=lambda ws: _replace_with_symlink(ws / "design" / "bin.sh", "anchor.txt"),
+        second=lambda ws: os.chmod(ws / "design" / "bin.sh", 0o755),
+        overlap_path="design/bin.sh",
+        merge_clean=False,
+    ),
+]
+
+
+async def _run_event_pair(
+    tmp_path: Path, policy: ConflictPolicy, pair: _EventPair
+) -> IntegrationSuccess | IntegrationConflict:
+    """构造真实 git 事件对：先到者集成成功后，后到者按档位判定。"""
+    root, repository, coordinator, _refs = await _setup(tmp_path, policy=policy)
+    pair.seed(root)
+    await coordinator.commit_pending_state(
+        WorkspaceTarget(path=root, separated_env=True),
+        exclude_pathspecs=WorkspaceManifest().git_line_commit_exclude_specs(),
+        message="event pair seed",
+    )
+    base = await repository.resolve_ref(ROOT_INTEGRATION_REF)
+    first_ws = await repository.create_scope_workspace("node-first", base_commit=base)
+    second_ws = await repository.create_scope_workspace("node-second", base_commit=base)
+    pair.first(first_ws.path)
+    pair.second(second_ws.path)
+    head_first = await _commit_writer(coordinator, repository, first_ws)
+    head_second = await _commit_writer(coordinator, repository, second_ws)
+
+    first = await _integrate(
+        coordinator,
+        repository,
+        root,
+        scope_key="node-first",
+        base=base,
+        writer_head=head_first,
+    )
+    assert isinstance(first, IntegrationSuccess), f"先到者集成应成功：{first!r}"
+    return await _integrate(
+        coordinator,
+        repository,
+        root,
+        scope_key="node-second",
+        base=base,
+        writer_head=head_second,
+    )
+
+
+@pytest.mark.parametrize("pair", _EVENT_PAIRS, ids=lambda pair: pair.name)
+async def test_strict_policy_rejects_every_event_pair(tmp_path: Path, pair: _EventPair) -> None:
+    """严格档：全部路径事件对（含 Git 可自动合并者）一律拒绝。"""
+    outcome = await _run_event_pair(tmp_path, ConflictPolicy.STRICT, pair)
+
+    assert isinstance(outcome, IntegrationConflict)
+    assert pair.overlap_path in outcome.conflict_paths
+    assert outcome.writer_scope_id == "node-second"
+    assert outcome.parent_scope_id == "root"
+
+
+@pytest.mark.parametrize("pair", _EVENT_PAIRS, ids=lambda pair: pair.name)
+async def test_git_merge_policy_judges_by_mergeability(tmp_path: Path, pair: _EventPair) -> None:
+    """可合并档：同一事件集按三方合并结果判定——干净放行、真冲突拒绝。"""
+    outcome = await _run_event_pair(tmp_path, ConflictPolicy.GIT_MERGE, pair)
+
+    if pair.merge_clean:
+        assert isinstance(outcome, IntegrationSuccess), f"可合并事件对被误拒：{outcome!r}"
+        assert pair.overlap_path in outcome.integrated_paths
+    else:
+        assert isinstance(outcome, IntegrationConflict), f"真冲突事件对被误放行：{outcome!r}"
+        primary = pair.merge_conflict_path or pair.overlap_path
+        assert primary in outcome.conflict_paths

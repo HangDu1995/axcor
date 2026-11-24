@@ -47,6 +47,7 @@ __all__ = [
     "RollbackPolicy",
     "WorkspaceManifest",
     "WorkspaceManifestError",
+    "pathspec_matches",
 ]
 
 # 每工作区自建路径的默认声明：构建产物、字节码缓存与日志（任意深度）
@@ -117,7 +118,7 @@ class PathPolicy:
     rollback: RollbackPolicy
 
 
-def _pathspec_matches(pathspec: str, path: str) -> bool:
+def pathspec_matches(pathspec: str, path: str) -> bool:
     """按 glob 语义匹配路径：字面规格按目录前缀，通配按组件匹配。
 
     ``**`` 组件匹配零个及以上路径层，``*``/``?``/``[...]`` 只在单组件
@@ -265,23 +266,23 @@ class WorkspaceManifest:
         身的字符串级互斥见构造校验。
         """
         for pathspec in self.external:
-            if _pathspec_matches(pathspec, path):
+            if pathspec_matches(pathspec, path):
                 return PathPolicy(IntegrationPolicy.SHARED_READONLY, RollbackPolicy.EXTERNAL)
         for pathspec in self.shared_exclusive:
-            if _pathspec_matches(pathspec, path):
+            if pathspec_matches(pathspec, path):
                 return PathPolicy(IntegrationPolicy.SHARED_EXCLUSIVE, RollbackPolicy.EXTERNAL)
         for pathspec in self.shared_readonly:
-            if _pathspec_matches(pathspec, path):
+            if pathspec_matches(pathspec, path):
                 return PathPolicy(IntegrationPolicy.SHARED_READONLY, RollbackPolicy.EXTERNAL)
         for pathspec in self.writer_local:
-            if _pathspec_matches(pathspec, path):
+            if pathspec_matches(pathspec, path):
                 rollback = (
                     RollbackPolicy.REBUILDABLE
-                    if any(_pathspec_matches(key, path) for key in self.rebuild_scripts)
+                    if any(pathspec_matches(key, path) for key in self.rebuild_scripts)
                     else RollbackPolicy.CHECKPOINTED
                 )
                 return PathPolicy(IntegrationPolicy.WRITER_LOCAL, rollback)
         for script_key in self.rebuild_scripts:
-            if _pathspec_matches(script_key, path):
+            if pathspec_matches(script_key, path):
                 return PathPolicy(IntegrationPolicy.WRITER_LOCAL, RollbackPolicy.REBUILDABLE)
         return PathPolicy(IntegrationPolicy.MERGE, RollbackPolicy.CHECKPOINTED)

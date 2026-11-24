@@ -17,6 +17,11 @@
 告警事件类型是开放词表 ``fault.<rule>``（字符串事件类型），payload 为
 ``Alert.to_dict()``。本模块是词表与 payload 编解码的唯一实现，消费侧
 （WatchdogAPI、前端过滤）不依赖检测规则实现。
+
+词表成员按产生源分两类：检测规则（watchdog/core.py 的事件订阅者）与
+run 平面故障（产生源在协调器工作区桥，不经检测规则、走 run 键事件通
+道，payload 为领域事实而非 ``Alert`` 序列化——上层把它们与超时同级
+映射为停止信号）。
 """
 
 from __future__ import annotations
@@ -35,6 +40,10 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 FAULT_TYPE_PREFIX = "fault."
+
+# run 平面故障词目：工作区集成冲突与作用域闸门不可静止
+WORKSPACE_CONFLICT_RULE = "workspace_conflict"
+SCOPE_QUIESCE_FAILED_RULE = "scope_quiesce_failed"
 
 
 def fault_event_type(rule: str) -> str:

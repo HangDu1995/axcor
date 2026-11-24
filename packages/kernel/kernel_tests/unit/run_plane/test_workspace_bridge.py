@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock
 
 from workflow_controller.core.checkpoints import CheckpointStore
 from workflow_controller.core.run_coordinator import RunConfig, RunCoordinator
@@ -42,6 +43,7 @@ from workflow_controller.plugin.workspace import (
     WorkspaceActionFailed,
     WorkspaceTreeConfig,
 )
+from workflow_controller.store.event_store import EventStore
 
 from ._run_plane_stubs import PoolFactsMixin, StubBus, StubPool
 
@@ -57,6 +59,9 @@ class WorkspaceSO(PoolFactsMixin):
     def __init__(self, project_dir: Path) -> None:
         self.pool = StubPool()
         self.default_project_dir = project_dir
+        # run 键事件落库门面（工作区故障与 claims 拒绝事件的断言面）
+        self.event_router = MagicMock()
+        self.event_router.default_store = EventStore(project_dir / "run-events.db")
 
     async def start_session_with_config(self, cfg: Any) -> None:
         raise AssertionError("工作区桥测试不应出生成员")
@@ -97,7 +102,11 @@ class BridgeHarness:
     """run 平面装配：真实协调器 + 探针驱动 + 真实私有仓根目录。"""
 
     def __init__(
-        self, tmp_path: Path, plan: Callable[[ProbeDriver], list[RunAction] | None]
+        self,
+        tmp_path: Path,
+        plan: Callable[[ProbeDriver], list[RunAction] | None],
+        *,
+        coord_kwargs: dict[str, Any] | None = None,
     ) -> None:
         self.store = RunStore(tmp_path / "events.db")
         self.affiliation = SessionRunAffiliationService(self.store)
@@ -112,6 +121,7 @@ class BridgeHarness:
                 "probe@1": SimpleFactory(self.driver),
             },
             affiliation=self.affiliation,
+            **(coord_kwargs or {}),
         )
         self.program = tmp_path / "prog.txt"
         self.program.write_text("probe", encoding="utf-8")
@@ -126,6 +136,11 @@ class BridgeHarness:
                 return run.run_id
             await asyncio.sleep(0.02)
         raise AssertionError("run 未在限期内落终态")
+
+    def run_events(self, run_id: str, event_type: str) -> list[dict[str, Any]]:
+        """读取指定类型的 run 键事件载荷。"""
+        rows = self.so.event_router.default_store.get_run_events_sync(run_id)
+        return [dict(row["data"]) for row in rows if row["event_type"] == event_type]
 
 
 class SimpleFactory:
@@ -456,3 +471,225 @@ async def test_abandon_without_tree_replies_failure(tmp_path: Path) -> None:
     assert len(failures) == 1
     assert failures[0].action == "AbandonScope"
     assert "无工作区树" in failures[0].error
+
+
+async def test_claims_enforce_rejects_overlapping_birth_with_event(tmp_path: Path) -> None:
+    """强制档：出生期 claims 相交拒绝第二个单元并落 claim_rejected 事件。"""
+    work_root = tmp_path / "root"
+    work_root.mkdir()
+    config = WorkspaceTreeConfig(root_dir=str(work_root), claims_enforce=True)
+
+    def plan(driver: ProbeDriver) -> list[RunAction] | None:
+        if _notes_of(driver, WorkspaceActionFailed):
+            return None
+        if not _notes_of(driver, ScopeWorkspacePrepared):
+            return [
+                PrepareScopeWorkspace(
+                    config=config,
+                    scope_key="node-a",
+                    client_op_id="op-1",
+                    writes=("op/src/**",),
+                    context="node=a",
+                )
+            ]
+        return [
+            PrepareScopeWorkspace(
+                config=config,
+                scope_key="node-b",
+                client_op_id="op-2",
+                writes=("op/src/gen/**",),
+                context="node=b",
+            )
+        ]
+
+    h = BridgeHarness(tmp_path, plan)
+    run_id = await h.start_and_finish()
+
+    prepared = _notes_of(h.driver, ScopeWorkspacePrepared)
+    assert [p.scope_id for p in prepared] == ["node-a"]
+    failures = _notes_of(h.driver, WorkspaceActionFailed)
+    assert len(failures) == 1
+    assert "claims 相交" in failures[0].error
+    events = h.run_events(run_id, "workspace.claim_rejected")
+    assert len(events) == 1
+    assert events[0]["scope_key"] == "node-b"
+    assert events[0]["claims"] == ["op/src/gen/**"]
+    assert events[0]["conflicts"] == [{"holder_scope_id": "node-a", "claims": ["op/src/gen/**"]}]
+
+
+async def test_claims_default_registers_and_lands_in_checkpoint(tmp_path: Path) -> None:
+    """默认档：claims 相交只登记不拒绝，声明落 scope_start 检查点行。"""
+    work_root = tmp_path / "root"
+    work_root.mkdir()
+    claims = ("op/src/**",)
+
+    def plan(driver: ProbeDriver) -> list[RunAction] | None:
+        if len(_notes_of(driver, ScopeWorkspacePrepared)) >= 2:
+            return None
+        if _notes_of(driver, ScopeWorkspacePrepared):
+            return [
+                PrepareScopeWorkspace(
+                    config=_tree_config(work_root),
+                    scope_key="node-b",
+                    client_op_id="op-2",
+                    writes=claims,
+                    context="node=b",
+                )
+            ]
+        return [
+            PrepareScopeWorkspace(
+                config=_tree_config(work_root),
+                scope_key="node-a",
+                client_op_id="op-1",
+                writes=claims,
+                context="node=a",
+            )
+        ]
+
+    h = BridgeHarness(tmp_path, plan)
+    await h.start_and_finish()
+
+    assert len(_notes_of(h.driver, ScopeWorkspacePrepared)) == 2
+    assert not _notes_of(h.driver, WorkspaceActionFailed)
+    checkpoints = CheckpointStore(h.store.db_path)
+    for scope_id in ("node-a", "node-b"):
+        rows = await checkpoints.list_for_scope(scope_id)
+        scope_start = next(row for row in rows if row.trigger.value == "scope_start")
+        assert scope_start.claims == claims
+    checkpoints.close()
+
+
+async def test_git_merge_conflict_emits_fault_event(tmp_path: Path) -> None:
+    """可合并档真冲突：拒绝回执之外另落 fault.workspace_conflict 事件。"""
+    work_root = tmp_path / "root"
+    work_root.mkdir()
+    (work_root / "shared.txt").write_text("base\n", encoding="utf-8")
+
+    def plan(driver: ProbeDriver) -> list[RunAction] | None:
+        if _notes_of(driver, ScopeIntegrationRejected):
+            return None
+        prepared = _notes_of(driver, ScopeWorkspacePrepared)
+        if _notes_of(driver, ScopeIntegrated):
+            return [
+                IntegrateScope(
+                    scope_id=prepared[1].scope_id,
+                    client_op_id="op-4",
+                    context="node=b",
+                )
+            ]
+        if len(prepared) == 1:
+            return [
+                PrepareScopeWorkspace(
+                    config=_tree_config(work_root),
+                    scope_key="node-b",
+                    client_op_id="op-2",
+                    context="node=b",
+                )
+            ]
+        if len(prepared) == 2:
+            # 同文件同片段不同改动：三方合并真冲突
+            (Path(prepared[0].workspace_path) / "shared.txt").write_text(
+                "from-a\n", encoding="utf-8"
+            )
+            (Path(prepared[1].workspace_path) / "shared.txt").write_text(
+                "from-b\n", encoding="utf-8"
+            )
+            return [
+                IntegrateScope(
+                    scope_id=prepared[0].scope_id,
+                    client_op_id="op-3",
+                    context="node=a",
+                )
+            ]
+        return [
+            PrepareScopeWorkspace(
+                config=_tree_config(work_root),
+                scope_key="node-a",
+                client_op_id="op-1",
+                context="node=a",
+            )
+        ]
+
+    h = BridgeHarness(tmp_path, plan)
+    run_id = await h.start_and_finish()
+
+    rejected = _notes_of(h.driver, ScopeIntegrationRejected)
+    assert len(rejected) == 1
+    assert rejected[0].conflict_paths == ("shared.txt",)
+    events = h.run_events(run_id, "fault.workspace_conflict")
+    assert len(events) == 1
+    assert events[0]["conflict_paths"] == ["shared.txt"]
+    assert events[0]["scope_id"] == rejected[0].scope_id
+    assert events[0]["parent_scope_id"] == rejected[0].parent_scope_id
+    assert len(events[0]["base_commit"]) == 40
+
+
+async def test_writer_local_change_never_conflicts_at_bridge(tmp_path: Path) -> None:
+    """双基线回归（桥层）：写者只改自建路径、父树无变化时不误报冲突。"""
+    work_root = tmp_path / "root"
+    work_root.mkdir()
+    (work_root / "code.txt").write_text("base\n", encoding="utf-8")
+
+    def plan(driver: ProbeDriver) -> list[RunAction] | None:
+        if _notes_of(driver, ScopeIntegrated):
+            return None
+        prepared = _notes_of(driver, ScopeWorkspacePrepared)
+        if prepared:
+            writer_local = Path(prepared[0].workspace_path) / "run.log"
+            writer_local.write_text("writer-log\n", encoding="utf-8")
+            return [
+                IntegrateScope(
+                    scope_id=prepared[0].scope_id,
+                    client_op_id="op-2",
+                    context="node=a",
+                )
+            ]
+        return [
+            PrepareScopeWorkspace(
+                config=_tree_config(work_root),
+                scope_key="node-a",
+                client_op_id="op-1",
+                context="node=a",
+            )
+        ]
+
+    h = BridgeHarness(tmp_path, plan)
+    run_id = await h.start_and_finish()
+
+    integrated = _notes_of(h.driver, ScopeIntegrated)
+    assert len(integrated) == 1
+    assert integrated[0].integrated_paths == ()
+    assert not _notes_of(h.driver, ScopeIntegrationRejected)
+    assert h.run_events(run_id, "fault.workspace_conflict") == []
+
+
+async def test_quiesce_failure_emits_fault_and_fails_action(tmp_path: Path) -> None:
+    """闸门不可静止：动作按失败回执，另落 fault.scope_quiesce_failed 事件。"""
+    work_root = tmp_path / "root"
+    work_root.mkdir()
+
+    async def never_drains(_scope_id: str) -> None:
+        raise RuntimeError("后台写进程无法排空")
+
+    def plan(driver: ProbeDriver) -> list[RunAction] | None:
+        if _notes_of(driver, WorkspaceActionFailed):
+            return None
+        return [
+            PrepareScopeWorkspace(
+                config=_tree_config(work_root),
+                scope_key="node-a",
+                client_op_id="op-1",
+                context="node=a",
+            )
+        ]
+
+    h = BridgeHarness(tmp_path, plan, coord_kwargs={"workspace_drain_hook": never_drains})
+    run_id = await h.start_and_finish()
+
+    failures = _notes_of(h.driver, WorkspaceActionFailed)
+    assert len(failures) == 1
+    assert "闸门未能静止" in failures[0].error
+    events = h.run_events(run_id, "fault.scope_quiesce_failed")
+    assert len(events) == 1
+    assert events[0]["action"] == "PrepareScopeWorkspace"
+    assert "闸门未能静止" in events[0]["error"]

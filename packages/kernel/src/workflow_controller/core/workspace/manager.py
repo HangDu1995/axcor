@@ -37,6 +37,10 @@ from workflow_controller.core.workspace.actions import (
     ScopeIntegrationRejected,
     ScopeWorkspacePrepared,
 )
+from workflow_controller.core.workspace.claims import (
+    ClaimRejectedError,
+    ClaimsRegistry,
+)
 from workflow_controller.core.workspace.gate import (
     GateState,
     QuiesceOutcome,
@@ -68,7 +72,7 @@ if TYPE_CHECKING:
     )
     from workflow_controller.core.workspace.scope_tree import ScopeRecord, ScopeTree
 
-__all__ = ["WorkspaceManager", "WorkspaceManagerError"]
+__all__ = ["ScopeQuiesceFailedError", "WorkspaceManager", "WorkspaceManagerError"]
 
 # 后台写进程排空钩子：入参为作用域标识
 BackgroundDrainHook = Callable[[str], Awaitable[None]]
@@ -76,6 +80,10 @@ BackgroundDrainHook = Callable[[str], Awaitable[None]]
 
 class WorkspaceManagerError(RuntimeError):
     """工作区编排拒绝：状态、代次或能力不满足时显式失败。"""
+
+
+class ScopeQuiesceFailedError(WorkspaceManagerError):
+    """作用域闸门不可静止：操作未执行，按故障收口。"""
 
 
 class WorkspaceManager:
@@ -90,14 +98,17 @@ class WorkspaceManager:
         manifest: WorkspaceManifest,
         integration_coordinator: IntegrationCoordinator,
         drain_background_writers: BackgroundDrainHook | None = None,
+        claims_enforce: bool = False,
     ) -> None:
-        """装配编排所需的账本、日志、清单、协调器与排空钩子。"""
+        """装配编排所需的账本、日志、清单、协调器、排空钩子与 claims 档位。"""
         self._repository = repository
         self._tree = scope_tree
         self._oplog = oplog
         self._manifest = manifest
         self._coordinator = integration_coordinator
         self._drain_hook = drain_background_writers
+        self._claims = ClaimsRegistry()
+        self._claims_enforce = claims_enforce
         self._gates: dict[str, ScopeGate] = {}
 
     async def initialize_root(self, *, scope_id: str, owner_ref: str | None = None) -> RootRefs:
@@ -131,6 +142,12 @@ class WorkspaceManager:
         if existing is not None and existing.state is not ScopeState.DISCARDED:
             raise WorkspaceManagerError(f"作用域标识已被占用：{request.scope_key}")
         epoch = existing.scope_epoch if existing is not None else INITIAL_EPOCH
+
+        claims = tuple(request.spec.claims)
+        if claims and self._claims_enforce:
+            conflicts = self._claims.conflicts_for(request.scope_key, claims)
+            if conflicts:
+                raise ClaimRejectedError(request.scope_key, claims, conflicts)
 
         async with self._quiesced(parent.scope_id):
             if parent.scope_kind is ScopeKind.ROOT:
@@ -192,6 +209,7 @@ class WorkspaceManager:
                 request.client_op_id,
                 result={"scope_base_commit": workspace.base_commit, "branch": workspace.branch},
             )
+        self._claims.register(request.scope_key, claims)
         return ScopeWorkspacePrepared(
             scope_id=record.scope_id,
             scope_epoch=record.scope_epoch,
@@ -262,6 +280,7 @@ class WorkspaceManager:
             if isinstance(outcome, IntegrationConflict):
                 await self._tree.set_state(record.scope_id, ScopeState.CONFLICTED)
                 await self._oplog.abandon(request.client_op_id)
+                self._claims.release(record.scope_id)
                 return ScopeIntegrationRejected(
                     scope_id=record.scope_id,
                     parent_scope_id=parent.scope_id,
@@ -269,6 +288,7 @@ class WorkspaceManager:
                 )
             await self._oplog.record_new_head(request.client_op_id, outcome.new_head)
             await self._tree.set_state(record.scope_id, ScopeState.INTEGRATED)
+            self._claims.release(record.scope_id)
             await self._oplog.commit(
                 request.client_op_id,
                 result={
@@ -323,6 +343,8 @@ class WorkspaceManager:
         abandoned = await self._tree.abandon_scope(
             request.scope_id, expected_scope_epoch=request.expected_scope_epoch
         )
+        for item in abandoned:
+            self._claims.release(item.scope_id)
         return ScopeAbandoned(
             scope_id=request.scope_id,
             new_scope_epoch=abandoned[0].new_scope_epoch,
@@ -346,6 +368,7 @@ class WorkspaceManager:
                 await self._coordinator.release_worktree(path)
         if record.state is ScopeState.INTEGRATED:
             record = await self._tree.set_state(scope_id, ScopeState.RELEASED)
+        self._claims.release(scope_id)
         return record
 
     async def get_scope(self, scope_id: str) -> ScopeRecord | None:
@@ -400,7 +423,7 @@ class WorkspaceManager:
             if gate.state is not GateState.RUNNING:
                 gate.resume_running()
             await self._tree.set_gate_state(scope_id, ScopeGateState.RUNNING)
-            raise WorkspaceManagerError(
+            raise ScopeQuiesceFailedError(
                 f"作用域闸门未能静止，操作未执行：{scope_id}（{outcome.value}）"
             )
         await self._tree.set_gate_state(scope_id, ScopeGateState.QUIESCED)

@@ -72,6 +72,7 @@ def build_workspace(
     manifest: WorkspaceManifest | None = None,
     conflict_policy: ConflictPolicy = ConflictPolicy.GIT_MERGE,
     tree_id: str = "run-1",
+    claims_enforce: bool = False,
 ) -> tuple[Path, WorkspaceRepository, WorkspaceManager]:
     """装配根目录、私有仓与工作区管理器，不初始化根作用域。"""
     root = tmp_path / "root"
@@ -84,6 +85,7 @@ def build_workspace(
         oplog=SagaOplog(repository.tree_dir),
         manifest=manifest if manifest is not None else WorkspaceManifest(),
         integration_coordinator=IntegrationCoordinator(repository, conflict_policy=conflict_policy),
+        claims_enforce=claims_enforce,
     )
     return root, repository, manager
 
@@ -107,6 +109,7 @@ class FakeOrchestrator:
         *,
         parent_scope_id: str | None = None,
         scope_kind: ScopeKind = ScopeKind.MAIN_WRITER,
+        claims: tuple[str, ...] = (),
     ) -> ScopeWorkspacePrepared:
         """派发建区动作并回传通知。"""
         self._operation_seq += 1
@@ -114,7 +117,7 @@ class FakeOrchestrator:
             PrepareScopeWorkspace(
                 parent_scope_id=parent_scope_id or self.root_scope_id,
                 scope_key=scope_key,
-                spec=ScopeWorkspaceSpec(scope_kind=scope_kind),
+                spec=ScopeWorkspaceSpec(scope_kind=scope_kind, claims=claims),
                 client_op_id=f"fake-prepare-{self._operation_seq}",
             )
         )

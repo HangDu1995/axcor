@@ -65,16 +65,18 @@ class RebuildScriptDecl:
 
 @dataclass(frozen=True)
 class WorkspaceTreeConfig:
-    """一棵作用域树的装配配置：根目录、路径策略与冲突档位。
+    """一棵作用域树的装配配置：根目录、路径策略、冲突档位与 claims 档位。
 
     首个到达宿主的工作区动作携带本配置完成惰性装配，其后动作携带的
     配置不再生效；未给出的策略桶与冲突档位由宿主取默认。
-    retain_after_merge 为真时集成后保留作用域工作区（默认释放）。
+    retain_after_merge 为真时集成后保留作用域工作区（默认释放）；
+    claims_enforce 为真时出生期声明写路径相交即拒绝后出生单元。
     """
 
     root_dir: str
     conflict_policy: str = "git_merge"
     retain_after_merge: bool = False
+    claims_enforce: bool = False
     merge: tuple[str, ...] = ()
     writer_local: tuple[str, ...] = ()
     shared_readonly: tuple[str, ...] = ()
@@ -85,7 +87,10 @@ class WorkspaceTreeConfig:
 
 @dataclass(frozen=True)
 class PrepareScopeWorkspace(RunAction):
-    """建区动作：宿主在父作用域当前头建子工作区并登记账本。"""
+    """建区动作：宿主在父作用域当前头建子工作区并登记账本。
+
+    writes 为节点声明的写路径 glob（claims 软预检登记面），可空。
+    """
 
     config: WorkspaceTreeConfig
     scope_key: str
@@ -93,6 +98,7 @@ class PrepareScopeWorkspace(RunAction):
     parent_scope_id: str | None = None  # None = 本 run 的根作用域
     scope_kind: str = WorkspaceScopeKind.MAIN_WRITER
     owner_ref: str | None = None
+    writes: tuple[str, ...] = ()
     context: str | None = None
 
 

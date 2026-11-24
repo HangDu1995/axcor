@@ -92,7 +92,12 @@ from workflow_controller.core.workspace.actions import (
 from workflow_controller.core.workspace.actions import (
     ScopeWorkspaceSpec as CoreScopeWorkspaceSpec,
 )
+from workflow_controller.core.workspace.claims import (
+    WORKSPACE_CLAIM_REJECTED_EVENT,
+    ClaimRejectedError,
+)
 from workflow_controller.core.workspace.integration import IntegrationCoordinator
+from workflow_controller.core.workspace.manager import ScopeQuiesceFailedError
 from workflow_controller.core.workspace.manifest import (
     DEFAULT_WRITER_LOCAL_PATHSPECS,
     RebuildScript,
@@ -143,6 +148,11 @@ from workflow_controller.plugin.workspace import (
     WorkspaceTreeConfig,
 )
 from workflow_controller.session.events import Event, EventType, SessionOutcome
+from workflow_controller.watchdog.fault import (
+    SCOPE_QUIESCE_FAILED_RULE,
+    WORKSPACE_CONFLICT_RULE,
+    fault_event_type,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
@@ -153,6 +163,7 @@ if TYPE_CHECKING:
         SessionRunAffiliation,
         SessionRunAffiliationService,
     )
+    from workflow_controller.core.workspace.manager import BackgroundDrainHook
     from workflow_controller.core.workspace.scope_tree import ScopeRecord
     from workflow_controller.event.event_bus import EventBus
     from workflow_controller.plugin.run_driver import RunDriver, RunDriverFactory
@@ -825,11 +836,17 @@ class _WorkspaceTree:
     """
 
     def __init__(
-        self, config: WorkspaceTreeConfig, run_id: str, checkpoints: CheckpointStore
+        self,
+        config: WorkspaceTreeConfig,
+        run_id: str,
+        checkpoints: CheckpointStore,
+        *,
+        drain_background_writers: BackgroundDrainHook | None = None,
     ) -> None:
         """按动作携带的配置装配私有仓、清单、协调器、管理器与检查点账本。
 
-        冲突档位词面校验失败即抛错（经执行桥转失败通知），不静默取默认。
+        冲突档位词面校验失败即抛错（经执行桥转失败通知），不静默取默认；
+        drain_background_writers 为可注入的后台写进程排空回调。
         """
         repository = WorkspaceRepository(Path(config.root_dir), tree_id=run_id)
         self.manager = WorkspaceManager(
@@ -840,6 +857,8 @@ class _WorkspaceTree:
             integration_coordinator=IntegrationCoordinator(
                 repository, conflict_policy=ConflictPolicy(config.conflict_policy)
             ),
+            drain_background_writers=drain_background_writers,
+            claims_enforce=config.claims_enforce,
         )
         self.checkpoints = checkpoints
         self.retain_after_merge = config.retain_after_merge
@@ -867,10 +886,13 @@ class RunCoordinator:
         driver_factories: Mapping[str, RunDriverFactory],
         affiliation: SessionRunAffiliationService,
         decide_timeout_s: float = DECIDE_TIMEOUT_S,
+        workspace_drain_hook: BackgroundDrainHook | None = None,
     ) -> None:
         self._orch = orchestrator
         self._run_store = run_store
         self._bus = bus
+        # 工作区闸门的可注入后台写进程排空回调（后台写者清单接线前默认无）
+        self._workspace_drain_hook = workspace_drain_hook
         # 冻结映射：工厂集在插件装载后不可变（无热重载），重名注册已在
         # 组合根聚合时 raise——boot 期 fail-fast，而非首次 start_run
         self._driver_factories: dict[str, RunDriverFactory] = dict(driver_factories)
@@ -2191,7 +2213,10 @@ class RunCoordinator:
             tree = self._workspace_trees.get(rt.run_id)
             if tree is None:
                 tree = _WorkspaceTree(
-                    action.config, rt.run_id, CheckpointStore(self._run_store.db_path)
+                    action.config,
+                    rt.run_id,
+                    CheckpointStore(self._run_store.db_path),
+                    drain_background_writers=self._workspace_drain_hook,
                 )
                 await tree.initialize()
                 self._workspace_trees[rt.run_id] = tree
@@ -2199,6 +2224,7 @@ class RunCoordinator:
             scope_kind = _WORKSPACE_SCOPE_KINDS.get(action.scope_kind)
             if scope_kind is None:
                 raise ValueError(f"未知作用域种类：{action.scope_kind!r}")
+            claims = tuple(action.writes)
             prepared = await tree.manager.prepare_scope_workspace(
                 CorePrepareScopeWorkspace(
                     parent_scope_id=(
@@ -2210,6 +2236,7 @@ class RunCoordinator:
                     spec=CoreScopeWorkspaceSpec(
                         scope_kind=scope_kind,
                         owner_ref=action.owner_ref,
+                        claims=claims,
                     ),
                     client_op_id=action.client_op_id,
                 )
@@ -2225,17 +2252,10 @@ class RunCoordinator:
                 workspace_branch=_workspace_branch_of(scope),
                 integration_commit=prepared.integration_base_commit,
                 orchestration_state_ref=orchestration_ref,
+                claims=claims,
             )
         except Exception as e:
-            self._notify(
-                rt.run_id,
-                WorkspaceActionFailed(
-                    action="PrepareScopeWorkspace",
-                    client_op_id=action.client_op_id,
-                    error=f"{type(e).__name__}: {e}",
-                    context=action.context,
-                ),
-            )
+            await self._reply_workspace_failure(rt, action, error=e)
             return
         self._notify(
             rt.run_id,
@@ -2248,6 +2268,59 @@ class RunCoordinator:
                 context=action.context,
             ),
         )
+
+    async def _reply_workspace_failure(
+        self,
+        rt: RunRuntime,
+        action: PrepareScopeWorkspace | CommitScopeTerminal | IntegrateScope | AbandonScope,
+        *,
+        error: BaseException,
+    ) -> None:
+        """动作失败统一回执：run 平面故障先落事件，再回投失败通知。"""
+        if isinstance(error, ClaimRejectedError):
+            await self._emit_run_event_best_effort(
+                rt,
+                WORKSPACE_CLAIM_REJECTED_EVENT,
+                {
+                    "scope_key": error.scope_key,
+                    "claims": list(error.claims),
+                    "conflicts": [
+                        {"holder_scope_id": holder, "claims": list(overlapped)}
+                        for holder, overlapped in error.conflicts
+                    ],
+                },
+                context=action.context,
+            )
+        elif isinstance(error, ScopeQuiesceFailedError):
+            await self._emit_run_event_best_effort(
+                rt,
+                fault_event_type(SCOPE_QUIESCE_FAILED_RULE),
+                {"action": type(action).__name__, "error": str(error)},
+                context=action.context,
+            )
+        self._notify(
+            rt.run_id,
+            WorkspaceActionFailed(
+                action=type(action).__name__,
+                client_op_id=action.client_op_id,
+                error=f"{type(error).__name__}: {error}",
+                context=action.context,
+            ),
+        )
+
+    async def _emit_run_event_best_effort(
+        self,
+        rt: RunRuntime,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        context: str | None = None,
+    ) -> None:
+        """run 键事件尽力落库：失败只记日志，不吞掉原动作的失败回执。"""
+        try:
+            await self._host.emit_run_event(rt.run_id, event_type, data, context=context)
+        except Exception:
+            logger.warning("run %s 事件 %s 落库失败", rt.run_id, event_type, exc_info=True)
 
     async def _execute_workspace_terminal(
         self, rt: RunRuntime, action: CommitScopeTerminal
@@ -2286,15 +2359,7 @@ class RunCoordinator:
                 orchestration_state_ref=orchestration_ref,
             )
         except Exception as e:
-            self._notify(
-                rt.run_id,
-                WorkspaceActionFailed(
-                    action="CommitScopeTerminal",
-                    client_op_id=action.client_op_id,
-                    error=f"{type(e).__name__}: {e}",
-                    context=action.context,
-                ),
-            )
+            await self._reply_workspace_failure(rt, action, error=e)
             return
         self._notify(
             rt.run_id,
@@ -2329,15 +2394,7 @@ class RunCoordinator:
                 )
             )
         except Exception as e:
-            self._notify(
-                rt.run_id,
-                WorkspaceActionFailed(
-                    action="IntegrateScope",
-                    client_op_id=action.client_op_id,
-                    error=f"{type(e).__name__}: {e}",
-                    context=action.context,
-                ),
-            )
+            await self._reply_workspace_failure(rt, action, error=e)
             return
         if isinstance(outcome, CoreScopeIntegrated):
             if not tree.retain_after_merge:
@@ -2361,6 +2418,19 @@ class RunCoordinator:
             )
             return
         conflict = outcome.conflict
+        await self._emit_run_event_best_effort(
+            rt,
+            fault_event_type(WORKSPACE_CONFLICT_RULE),
+            {
+                "scope_id": conflict.writer_scope_id,
+                "parent_scope_id": conflict.parent_scope_id,
+                "conflict_paths": list(conflict.conflict_paths),
+                "base_commit": conflict.base_commit,
+                "writer_head": conflict.writer_head,
+                "parent_head": conflict.parent_head,
+            },
+            context=action.context,
+        )
         self._notify(
             rt.run_id,
             ScopeIntegrationRejected(
@@ -2395,6 +2465,7 @@ class RunCoordinator:
         workspace_branch: str | None,
         integration_commit: str | None,
         orchestration_state_ref: str,
+        claims: tuple[str, ...] = (),
     ) -> str:
         """落一行生命周期检查点（文件提交与编排引用都已先在），返回标识。"""
         checkpoint_id = f"{scope.scope_id}:{trigger.value}:e{scope.scope_epoch}"
@@ -2411,6 +2482,7 @@ class RunCoordinator:
                 workspace_commit=workspace_commit,
                 workspace_branch=workspace_branch,
                 integration_commit=integration_commit,
+                claims=claims,
                 orchestration_state_ref=orchestration_state_ref,
                 created_at=datetime.now(tz=UTC).isoformat(),
             )
@@ -2440,15 +2512,7 @@ class RunCoordinator:
                 )
             )
         except Exception as e:
-            self._notify(
-                rt.run_id,
-                WorkspaceActionFailed(
-                    action="AbandonScope",
-                    client_op_id=action.client_op_id,
-                    error=f"{type(e).__name__}: {e}",
-                    context=action.context,
-                ),
-            )
+            await self._reply_workspace_failure(rt, action, error=e)
             return
         self._notify(
             rt.run_id,

@@ -28,6 +28,12 @@ from workflow_controller.core.workspace.actions import (
     ScopeWorkspacePrepared,
     ScopeWorkspaceSpec,
 )
+from workflow_controller.core.workspace.claims import (
+    WORKSPACE_CLAIM_REJECTED_EVENT,
+    ClaimRejectedError,
+    ClaimsRegistry,
+    claims_overlap,
+)
 from workflow_controller.core.workspace.gate import (
     DEFAULT_BACKGROUND_DRAIN_TIMEOUT_S,
     GateState,
@@ -45,6 +51,7 @@ from workflow_controller.core.workspace.integration import (
     WorkspaceTarget,
 )
 from workflow_controller.core.workspace.manager import (
+    ScopeQuiesceFailedError,
     WorkspaceManager,
     WorkspaceManagerError,
 )
@@ -100,10 +107,13 @@ __all__ = [
     "OPLOG_FILENAME",
     "ROOT_INTEGRATION_REF",
     "ROOT_SEED_REF",
+    "WORKSPACE_CLAIM_REJECTED_EVENT",
     "AbandonScope",
     "AbandonedScope",
     "CheckpointKind",
     "CheckpointRecorded",
+    "ClaimRejectedError",
+    "ClaimsRegistry",
     "CommitFacts",
     "ConflictPolicy",
     "GateState",
@@ -136,6 +146,7 @@ __all__ = [
     "ScopeIntegrated",
     "ScopeIntegrationRejected",
     "ScopeKind",
+    "ScopeQuiesceFailedError",
     "ScopeRecord",
     "ScopeRestored",
     "ScopeState",
@@ -151,5 +162,7 @@ __all__ = [
     "WorkspaceRepository",
     "WorkspaceRepositoryError",
     "WorkspaceTarget",
+    "claims_overlap",
     "operation_marker",
+    "pathspec_matches",
 ]

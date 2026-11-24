@@ -114,6 +114,7 @@ def _workspace_tree_config(
     if traceback_cfg.get("mode", "workspace") != "workspace":
         return None
     workspace_cfg = traceback_cfg.get("workspace") or {}
+    claims_cfg = traceback_cfg.get("claims") or {}
     manifest_cfg = workspace_cfg.get("manifest") or {}
     rebuild_decls: dict[str, RebuildScriptDecl] = {}
     for pathspec, decl in (manifest_cfg.get("rebuild_scripts") or {}).items():
@@ -126,6 +127,7 @@ def _workspace_tree_config(
         root_dir=str(work_dir),
         conflict_policy=str(workspace_cfg.get("conflict_policy", "git_merge")),
         retain_after_merge=bool(workspace_cfg.get("retain_after_merge", False)),
+        claims_enforce=bool(claims_cfg.get("enforce", False)),
         merge=tuple(str(p) for p in manifest_cfg.get("merge") or ()),
         writer_local=tuple(str(p) for p in manifest_cfg.get("writer_local") or ()),
         shared_readonly=tuple(str(p) for p in manifest_cfg.get("shared_readonly") or ()),
@@ -133,6 +135,14 @@ def _workspace_tree_config(
         external=tuple(str(p) for p in manifest_cfg.get("external") or ()),
         rebuild_scripts=rebuild_decls,
     )
+
+
+def _node_writes(node: Mapping[str, Any]) -> tuple[str, ...]:
+    """节点声明的写路径 glob（claims 软预检登记面）。"""
+    writes = node.get("writes")
+    if not isinstance(writes, list):
+        return ()
+    return tuple(str(item) for item in writes if str(item))
 
 
 # 运行配置项键集：构造入参与驱动快照 options 共用，防两处键漂移
@@ -1239,7 +1249,8 @@ class GraphDriver:
         if act is None or act.phase != _PHASE_WORKSPACE:
             return
         self._state.clear_node_workspace(act.node_id)
-        self._emit_prepare_scope(act, actions)
+        node = self._dag_node(act.node_id) or {}
+        self._emit_prepare_scope(act, actions, writes=_node_writes(node))
 
     def _on_scope_terminal_committed(
         self, note: ScopeTerminalCommitted, actions: list[RunAction]
@@ -1636,12 +1647,12 @@ class GraphDriver:
             if self._start_merged_generator(node, node_id, ctx, attempt, actions):
                 return actions
             if node.get("generator_type") == "bash":
-                if self._await_node_workspace(node_id, attempt, actions):
+                if self._await_node_workspace(node, node_id, attempt, actions):
                     return actions
                 return self._spawn_bash_node(node, node_id, ctx, attempt, actions)
 
         if task_type == "bash":
-            if self._await_node_workspace(node_id, attempt, actions):
+            if self._await_node_workspace(node, node_id, attempt, actions):
                 return actions
             return self._spawn_bash_node(node, node_id, ctx, attempt, actions)
 
@@ -1649,13 +1660,14 @@ class GraphDriver:
         reused = self._reuse_member_node(node, node_id, existing_sid, attempt, world, actions)
         if reused is not None:
             return reused
-        if self._await_node_workspace(node_id, attempt, actions):
+        if self._await_node_workspace(node, node_id, attempt, actions):
             return actions
         self._spawn_member_node(node, node_id, ctx, attempt, actions)
         return actions
 
     def _await_node_workspace(
         self,
+        node: dict[str, Any],
         node_id: str,
         attempt: int,
         actions: list[RunAction],
@@ -1686,10 +1698,12 @@ class GraphDriver:
                 )
             )
             return True
-        self._emit_prepare_scope(act, actions)
+        self._emit_prepare_scope(act, actions, writes=_node_writes(node))
         return True
 
-    def _emit_prepare_scope(self, act: NodeActivity, actions: list[RunAction]) -> None:
+    def _emit_prepare_scope(
+        self, act: NodeActivity, actions: list[RunAction], *, writes: tuple[str, ...] = ()
+    ) -> None:
         """发建区动作：键序号驱动内单调递增，保证不重号。"""
         self._workspace_seq += 1
         actions.append(
@@ -1699,6 +1713,7 @@ class GraphDriver:
                 client_op_id=f"prepare-{self._workspace_seq}",
                 scope_kind=WorkspaceScopeKind.MAIN_WRITER,
                 owner_ref=act.node_id,
+                writes=writes,
                 context=f"node={act.node_id}",
             )
         )

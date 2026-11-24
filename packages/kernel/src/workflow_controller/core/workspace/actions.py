@@ -48,11 +48,12 @@ __all__ = [
 
 @dataclass(frozen=True)
 class ScopeWorkspaceSpec:
-    """建区请求的作用域规格：种类、属主与可选的继承绑定。"""
+    """建区请求的作用域规格：种类、属主、声明写路径与可选继承绑定。"""
 
     scope_kind: ScopeKind
     owner_ref: str | None = None
     inherit_from: InheritBinding | None = None
+    claims: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
