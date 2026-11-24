@@ -29,12 +29,19 @@ from workflow_controller.plugin.run_driver import (
     StartSession,
 )
 from workflow_controller.plugin.workspace import (
+    AbandonScope,
+    CommitScopeTerminal,
+    IntegrateScope,
     PrepareScopeWorkspace,
+    ScopeAbandoned,
+    ScopeIntegrated,
+    ScopeIntegrationRejected,
+    ScopeTerminalCommitted,
     ScopeWorkspacePrepared,
     WorkspaceActionFailed,
 )
 
-from .test_engine import build_driver, decide, pick
+from .test_engine import build_driver, decide, pick, proc_exit
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -48,13 +55,52 @@ _TRACEBACK_CFG = {
 def prepared_note(context: str, path: str = "/tmp/ws") -> ScopeWorkspacePrepared:
     """建区回执通知构造。"""
     return ScopeWorkspacePrepared(
-        scope_id="run-1-root/child",
+        scope_id="a-w1",
         scope_epoch=1,
         base_commit="b" * 40,
         integration_base_commit="i" * 40,
         workspace_path=path,
         context=context,
     )
+
+
+def terminal_note(context: str) -> ScopeTerminalCommitted:
+    """终态提交回执通知构造。"""
+    return ScopeTerminalCommitted(
+        scope_id="a-w1",
+        commit="t" * 40,
+        checkpoint_id="a-w1:terminal:e1",
+        context=context,
+    )
+
+
+def integrated_note(context: str) -> ScopeIntegrated:
+    """集成成功回执通知构造。"""
+    return ScopeIntegrated(
+        scope_id="a-w1",
+        parent_scope_id="run-1-root",
+        new_parent_head="h" * 40,
+        integrated_paths=("out.txt",),
+        context=context,
+    )
+
+
+def rejected_note(context: str) -> ScopeIntegrationRejected:
+    """集成冲突回执通知构造。"""
+    return ScopeIntegrationRejected(
+        scope_id="a-w1",
+        parent_scope_id="run-1-root",
+        conflict_paths=("out.txt",),
+        base_commit="b" * 40,
+        writer_head="w" * 40,
+        parent_head="p" * 40,
+        context=context,
+    )
+
+
+def abandoned_note(context: str) -> ScopeAbandoned:
+    """废弃完成回执通知构造。"""
+    return ScopeAbandoned(scope_id="a-w1", new_scope_epoch=2, context=context)
 
 
 def test_workspace_prepare_precedes_member_birth(tmp_path: Path) -> None:
@@ -184,3 +230,95 @@ def test_late_workspace_note_after_activation_ignored(tmp_path: Path) -> None:
         (RunSessionInfo(session_id="s1", context="node=a", state="running"),),
     )
     assert len(pick(actions, StartSession)) == 0
+
+
+def _verify_bash_node(command: str = "true", **acc_extra: object) -> dict:
+    """script 验收的 bash 节点清单项。"""
+    return {
+        "id": "a",
+        "task_type": "bash",
+        "command": command,
+        "acceptance": {"enabled": True, "type": "script", "script": "true", **acc_extra},
+    }
+
+
+def test_terminal_commit_precedes_verifier_and_integration_gates_pass(tmp_path: Path) -> None:
+    """executor 完成先过闸门落终态，验收通过进待集成，集成回执到达才 passed。"""
+    driver = build_driver(tmp_path, [_verify_bash_node()], traceback=_TRACEBACK_CFG)
+    decide(driver)  # 建区
+    decide(driver, (prepared_note("node=a", "/tmp/ws-a"),))  # type: ignore[arg-type]
+    info = driver.state.snapshot()["nodes"]["a"]
+    assert info["workspace_scope_id"] == "a-w1"  # 映射进节点档案
+    assert info["workspace_path"] == "/tmp/ws-a"
+
+    actions = decide(driver, (proc_exit("node=a", 0),))
+    terminals = pick(actions, CommitScopeTerminal)
+    assert len(terminals) == 1
+    assert terminals[0].scope_id == "a-w1"
+    assert not pick(actions, StartProcess)  # 终态回执前验收不出生
+
+    actions = decide(driver, (terminal_note("node=a"),))  # type: ignore[arg-type]
+    verifies = pick(actions, StartProcess)
+    assert len(verifies) == 1
+    assert verifies[0].context == "node=a/verify"
+    assert verifies[0].cwd == "/tmp/ws-a"  # verifier 与 executor 共用节点工作区
+
+    actions = decide(driver, (proc_exit("node=a/verify", 0),))
+    integrates = pick(actions, IntegrateScope)
+    assert len(integrates) == 1
+    assert integrates[0].scope_id == "a-w1"
+    assert driver.state.status("a") == "running"  # 验收通过 ≠ 集成完成
+
+    decide(driver, (integrated_note("node=a"),))  # type: ignore[arg-type]
+    assert driver.state.status("a") == "passed"
+
+
+def test_integration_rejected_fails_node(tmp_path: Path) -> None:
+    """集成冲突回执走验收失败路径：节点落失败并携带冲突路径。"""
+    driver = build_driver(tmp_path, [_verify_bash_node()], traceback=_TRACEBACK_CFG)
+    decide(driver)
+    decide(driver, (prepared_note("node=a"),))  # type: ignore[arg-type]
+    decide(driver, (proc_exit("node=a", 0),))
+    decide(driver, (terminal_note("node=a"),))  # type: ignore[arg-type]
+    decide(driver, (proc_exit("node=a/verify", 0),))
+
+    decide(driver, (rejected_note("node=a"),))  # type: ignore[arg-type]
+
+    assert driver.state.status("a") == "failed"
+    reason = driver.state.snapshot()["nodes"]["a"].get("failure_reason") or ""
+    assert "集成冲突" in reason
+    assert "out.txt" in reason
+
+
+def test_retry_abandons_stale_scope_before_rebuild(tmp_path: Path) -> None:
+    """验收失败重试先废弃旧作用域再建新：回执到达前不建区、档案随之清理。"""
+    driver = build_driver(
+        tmp_path,
+        [_verify_bash_node(max_retries=1)],
+        traceback=_TRACEBACK_CFG,
+    )
+    decide(driver)  # prepare a-w1
+    decide(driver, (prepared_note("node=a"),))  # type: ignore[arg-type]
+    decide(driver, (proc_exit("node=a", 0),))
+    decide(driver, (terminal_note("node=a"),))  # type: ignore[arg-type]
+
+    actions = decide(driver, (proc_exit("node=a/verify", 1),))  # 验收失败 → retry + 重排
+    assert driver.state.snapshot()["nodes"]["a"]["attempts"] == 2  # 重试已重排新 attempt
+    abandons = pick(actions, AbandonScope)
+    assert len(abandons) == 1
+    assert abandons[0].scope_id == "a-w1"
+    assert abandons[0].expected_scope_epoch == 1
+    assert not pick(actions, PrepareScopeWorkspace)  # 废弃回执前不建新
+
+    actions = decide(driver, (abandoned_note("node=a"),))  # type: ignore[arg-type]
+    prepares = pick(actions, PrepareScopeWorkspace)
+    assert len(prepares) == 1
+    assert prepares[0].scope_key == "a-w4"  # 新作用域键（序号不回卷）
+    assert driver.state.snapshot()["nodes"]["a"]["workspace_scope_id"] is None
+
+    # 第二次执行走完同样链路，重试预算耗尽后失败收口
+    decide(driver, (prepared_note("node=a", "/tmp/ws-a2"),))  # type: ignore[arg-type]
+    decide(driver, (proc_exit("node=a", 0),))
+    decide(driver, (terminal_note("node=a"),))  # type: ignore[arg-type]
+    decide(driver, (proc_exit("node=a/verify", 1),))
+    assert driver.state.status("a") == "failed"

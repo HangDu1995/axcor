@@ -283,6 +283,29 @@ class WorkspaceManager:
                 integrated_paths=outcome.integrated_paths,
             )
 
+    async def commit_scope_terminal(self, scope_id: str) -> tuple[str, str]:
+        """闸门内提交作用域未提交状态为终态执行态，返回提交与分支。
+
+        单步 git 提交自身原子，崩溃间隙只产生孤儿提交、无账可错位，
+        不入操作日志；检查点行由调用方在其后落账。
+        """
+        record = await self._require_scope(scope_id)
+        if record.scope_kind is ScopeKind.ROOT:
+            raise WorkspaceManagerError("根作用域无终态执行态提交")
+        if record.state is not ScopeState.ACTIVE:
+            raise WorkspaceManagerError(
+                f"作用域非活动态不能提交终态：{scope_id}（{record.state.value}）"
+            )
+        writer_path, branch = self._require_workspace(record)
+        writer_target = WorkspaceTarget(path=writer_path, separated_env=False)
+        async with self._quiesced(scope_id):
+            commit = await self._coordinator.commit_pending_state(
+                writer_target,
+                exclude_pathspecs=self._manifest.git_scope_commit_exclude_specs(),
+                message=f"scope {scope_id} terminal state",
+            )
+        return commit, branch
+
     async def abandon_scope(self, request: AbandonScope) -> ScopeAbandoned:
         """废弃作用域及后代：先移除各自工作区，再账面各自换代一次。"""
         target = await self._require_scope(request.scope_id)

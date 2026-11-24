@@ -40,12 +40,19 @@ import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 
+from workflow_controller.core.checkpoints import (
+    BarrierQuality,
+    CheckpointStore,
+    CheckpointTrigger,
+    ScopeCheckpoint,
+)
 from workflow_controller.core.run_export import RunExportService
 from workflow_controller.core.run_host import KILL_GRACE_S as KILL_GRACE_S
 from workflow_controller.core.run_host import STOP_DRAIN_TIMEOUT_S as STOP_DRAIN_TIMEOUT_S
@@ -74,7 +81,13 @@ from workflow_controller.core.workspace.actions import (
     AbandonScope as CoreAbandonScope,
 )
 from workflow_controller.core.workspace.actions import (
+    IntegrateScope as CoreIntegrateScope,
+)
+from workflow_controller.core.workspace.actions import (
     PrepareScopeWorkspace as CorePrepareScopeWorkspace,
+)
+from workflow_controller.core.workspace.actions import (
+    ScopeIntegrated as CoreScopeIntegrated,
 )
 from workflow_controller.core.workspace.actions import (
     ScopeWorkspaceSpec as CoreScopeWorkspaceSpec,
@@ -117,9 +130,13 @@ from workflow_controller.plugin.run_driver import (
 )
 from workflow_controller.plugin.workspace import (
     AbandonScope,
+    CommitScopeTerminal,
     IntegrateScope,
     PrepareScopeWorkspace,
     ScopeAbandoned,
+    ScopeIntegrated,
+    ScopeIntegrationRejected,
+    ScopeTerminalCommitted,
     ScopeWorkspacePrepared,
     WorkspaceActionFailed,
     WorkspaceScopeKind,
@@ -136,6 +153,7 @@ if TYPE_CHECKING:
         SessionRunAffiliation,
         SessionRunAffiliationService,
     )
+    from workflow_controller.core.workspace.scope_tree import ScopeRecord
     from workflow_controller.event.event_bus import EventBus
     from workflow_controller.plugin.run_driver import RunDriver, RunDriverFactory
 
@@ -791,15 +809,25 @@ def _tree_manifest(config: WorkspaceTreeConfig) -> WorkspaceManifest:
     )
 
 
+def _workspace_branch_of(scope: ScopeRecord) -> str | None:
+    """从工作区引用（路径|分支）解出分支名供检查点行落账。"""
+    if not scope.workspace_ref:
+        return None
+    return scope.workspace_ref.rpartition("|")[2] or None
+
+
 class _WorkspaceTree:
     """单 run 的工作区树运行时：装配好的管理器与根作用域标识。
 
     树随首个工作区动作惰性建立；重开或崩溃后的既有仓不在此重建，
-    相应恢复对账属回滚能力接线，当前一律显式失败。
+    相应恢复对账属回滚能力接线，当前一律显式失败。检查点账本与
+    run 记账库同库（表经统一迁移铺设），随树装配接线。
     """
 
-    def __init__(self, config: WorkspaceTreeConfig, run_id: str) -> None:
-        """按动作携带的配置装配私有仓、清单、协调器与管理器。
+    def __init__(
+        self, config: WorkspaceTreeConfig, run_id: str, checkpoints: CheckpointStore
+    ) -> None:
+        """按动作携带的配置装配私有仓、清单、协调器、管理器与检查点账本。
 
         冲突档位词面校验失败即抛错（经执行桥转失败通知），不静默取默认。
         """
@@ -813,6 +841,8 @@ class _WorkspaceTree:
                 repository, conflict_policy=ConflictPolicy(config.conflict_policy)
             ),
         )
+        self.checkpoints = checkpoints
+        self.retain_after_merge = config.retain_after_merge
         self.root_scope_id = f"{run_id}-root"
 
     async def initialize(self) -> None:
@@ -1706,7 +1736,9 @@ class RunCoordinator:
             self._tasks.pop(run_id, None)
             # 旧任务迟到回调不得清掉同一 run 新任务的停止受理标记。
             self._stop_marked.discard(run_id)
-        self._workspace_trees.pop(run_id, None)
+        tree = self._workspace_trees.pop(run_id, None)
+        if tree is not None:
+            tree.checkpoints.close()  # 释放检查点账本连接（磁盘产物留给 GC）
         if not task.cancelled() and task.exception() is not None:
             logger.error("run %s 任务异常结束", run_id, exc_info=task.exception())
 
@@ -2133,20 +2165,14 @@ class RunCoordinator:
 
     async def _dispatch_workspace_action(self, rt: RunRuntime, action: RunAction) -> bool:
         """工作区类动作派发：经每 run 工作区树执行，结果以通知回投。"""
-        if isinstance(action, IntegrateScope):
-            # 集成定序尚未接线：显式回执未实现，不静默丢弃
-            self._notify(
-                rt.run_id,
-                WorkspaceActionFailed(
-                    action="IntegrateScope",
-                    client_op_id=action.client_op_id,
-                    error="集成动作尚未接入",
-                    context=action.context,
-                ),
-            )
-            return True
         if isinstance(action, PrepareScopeWorkspace):
             await self._execute_workspace_prepare(rt, action)
+            return True
+        if isinstance(action, CommitScopeTerminal):
+            await self._execute_workspace_terminal(rt, action)
+            return True
+        if isinstance(action, IntegrateScope):
+            await self._execute_workspace_integrate(rt, action)
             return True
         if isinstance(action, AbandonScope):
             await self._execute_workspace_abandon(rt, action)
@@ -2156,13 +2182,20 @@ class RunCoordinator:
     async def _execute_workspace_prepare(
         self, rt: RunRuntime, action: PrepareScopeWorkspace
     ) -> None:
-        """执行建区：首动作惰性建树（基线导入 + 根作用域），再建子工作区。"""
+        """执行建区：首动作惰性建树（基线导入 + 根作用域），再建子工作区。
+
+        持久化顺序：编排状态版本先落 → 建区文件提交（闸门内）→ scope_start
+        检查点行 → 建区回执发布；任一步失败按动作失败回执，不发布半成品。
+        """
         try:
             tree = self._workspace_trees.get(rt.run_id)
             if tree is None:
-                tree = _WorkspaceTree(action.config, rt.run_id)
+                tree = _WorkspaceTree(
+                    action.config, rt.run_id, CheckpointStore(self._run_store.db_path)
+                )
                 await tree.initialize()
                 self._workspace_trees[rt.run_id] = tree
+            orchestration_ref = await self._persist_orchestration_ref(rt)
             scope_kind = _WORKSPACE_SCOPE_KINDS.get(action.scope_kind)
             if scope_kind is None:
                 raise ValueError(f"未知作用域种类：{action.scope_kind!r}")
@@ -2180,6 +2213,18 @@ class RunCoordinator:
                     ),
                     client_op_id=action.client_op_id,
                 )
+            )
+            scope = await tree.manager.get_scope(prepared.scope_id)
+            if scope is None:
+                raise RuntimeError(f"建区后作用域账本缺行：{prepared.scope_id}")
+            await self._record_workspace_checkpoint(
+                tree,
+                scope=scope,
+                trigger=CheckpointTrigger.SCOPE_START,
+                workspace_commit=prepared.base_commit,
+                workspace_branch=_workspace_branch_of(scope),
+                integration_commit=prepared.integration_base_commit,
+                orchestration_state_ref=orchestration_ref,
             )
         except Exception as e:
             self._notify(
@@ -2203,6 +2248,174 @@ class RunCoordinator:
                 context=action.context,
             ),
         )
+
+    async def _execute_workspace_terminal(
+        self, rt: RunRuntime, action: CommitScopeTerminal
+    ) -> None:
+        """执行终态提交：闸门内提交执行态并落 terminal 检查点后回执。
+
+        持久化顺序与建区同构：编排状态版本 → 文件终态提交 → 检查点行 →
+        发布；回执到达前编排层不得启动验收单元。
+        """
+        tree = self._workspace_trees.get(rt.run_id)
+        if tree is None:
+            self._notify(
+                rt.run_id,
+                WorkspaceActionFailed(
+                    action="CommitScopeTerminal",
+                    client_op_id=action.client_op_id,
+                    error=f"run {rt.run_id} 无工作区树",
+                    context=action.context,
+                ),
+            )
+            return
+        try:
+            orchestration_ref = await self._persist_orchestration_ref(rt)
+            commit, branch = await tree.manager.commit_scope_terminal(action.scope_id)
+            scope = await tree.manager.get_scope(action.scope_id)
+            if scope is None:
+                raise RuntimeError(f"终态提交后作用域账本缺行：{action.scope_id}")
+            integration_head = await tree.manager.current_integration_head()
+            checkpoint_id = await self._record_workspace_checkpoint(
+                tree,
+                scope=scope,
+                trigger=CheckpointTrigger.TERMINAL,
+                workspace_commit=commit,
+                workspace_branch=branch,
+                integration_commit=integration_head,
+                orchestration_state_ref=orchestration_ref,
+            )
+        except Exception as e:
+            self._notify(
+                rt.run_id,
+                WorkspaceActionFailed(
+                    action="CommitScopeTerminal",
+                    client_op_id=action.client_op_id,
+                    error=f"{type(e).__name__}: {e}",
+                    context=action.context,
+                ),
+            )
+            return
+        self._notify(
+            rt.run_id,
+            ScopeTerminalCommitted(
+                scope_id=action.scope_id,
+                commit=commit,
+                checkpoint_id=checkpoint_id,
+                context=action.context,
+            ),
+        )
+
+    async def _execute_workspace_integrate(self, rt: RunRuntime, action: IntegrateScope) -> None:
+        """执行集成：父闸门内串行集成，成功默认释放工作区，冲突显式拒绝。"""
+        tree = self._workspace_trees.get(rt.run_id)
+        if tree is None:
+            self._notify(
+                rt.run_id,
+                WorkspaceActionFailed(
+                    action="IntegrateScope",
+                    client_op_id=action.client_op_id,
+                    error=f"run {rt.run_id} 无工作区树",
+                    context=action.context,
+                ),
+            )
+            return
+        try:
+            outcome = await tree.manager.integrate_scope(
+                CoreIntegrateScope(
+                    scope_id=action.scope_id,
+                    receipt=action.receipt,
+                    client_op_id=action.client_op_id,
+                )
+            )
+        except Exception as e:
+            self._notify(
+                rt.run_id,
+                WorkspaceActionFailed(
+                    action="IntegrateScope",
+                    client_op_id=action.client_op_id,
+                    error=f"{type(e).__name__}: {e}",
+                    context=action.context,
+                ),
+            )
+            return
+        if isinstance(outcome, CoreScopeIntegrated):
+            if not tree.retain_after_merge:
+                try:
+                    await tree.manager.release_scope(action.scope_id)
+                except Exception:
+                    logger.warning(
+                        "作用域 %s 集成后释放失败，工作区暂时保留",
+                        action.scope_id,
+                        exc_info=True,
+                    )
+            self._notify(
+                rt.run_id,
+                ScopeIntegrated(
+                    scope_id=outcome.scope_id,
+                    parent_scope_id=outcome.parent_scope_id,
+                    new_parent_head=outcome.new_parent_head,
+                    integrated_paths=outcome.integrated_paths,
+                    context=action.context,
+                ),
+            )
+            return
+        conflict = outcome.conflict
+        self._notify(
+            rt.run_id,
+            ScopeIntegrationRejected(
+                scope_id=conflict.writer_scope_id,
+                parent_scope_id=conflict.parent_scope_id,
+                conflict_paths=conflict.conflict_paths,
+                base_commit=conflict.base_commit,
+                writer_head=conflict.writer_head,
+                parent_head=conflict.parent_head,
+                context=action.context,
+            ),
+        )
+
+    async def _persist_orchestration_ref(self, rt: RunRuntime) -> str:
+        """先落编排状态快照再取其版本引用（检查点持久化顺序的第一步）。"""
+        blob = await self._call_driver(rt, "snapshot")
+        await self._run_store.save_driver_state(rt.run_id, dict(blob))
+        seq = await self._run_store.append_driver_snapshot(rt.run_id, dict(blob))
+        if seq is None:  # 内容未变：最新历史行即当前版本
+            seq = await self._run_store.latest_driver_snapshot_id(rt.run_id)
+        if seq is None:
+            raise RuntimeError("编排状态快照版本缺失：检查点前置持久化失败")
+        return f"driver-snapshot:{seq}"
+
+    async def _record_workspace_checkpoint(
+        self,
+        tree: _WorkspaceTree,
+        *,
+        scope: ScopeRecord,
+        trigger: CheckpointTrigger,
+        workspace_commit: str,
+        workspace_branch: str | None,
+        integration_commit: str | None,
+        orchestration_state_ref: str,
+    ) -> str:
+        """落一行生命周期检查点（文件提交与编排引用都已先在），返回标识。"""
+        checkpoint_id = f"{scope.scope_id}:{trigger.value}:e{scope.scope_epoch}"
+        await tree.checkpoints.record(
+            ScopeCheckpoint(
+                checkpoint_id=checkpoint_id,
+                scope_id=scope.scope_id,
+                scope_kind=scope.scope_kind,
+                parent_scope_id=scope.parent_scope_id,
+                scope_epoch=scope.scope_epoch,
+                root_epoch=scope.root_epoch,
+                trigger=trigger,
+                barrier_quality=BarrierQuality.PRECISE,
+                workspace_commit=workspace_commit,
+                workspace_branch=workspace_branch,
+                integration_commit=integration_commit,
+                orchestration_state_ref=orchestration_state_ref,
+                created_at=datetime.now(tz=UTC).isoformat(),
+            )
+        )
+        return checkpoint_id
 
     async def _execute_workspace_abandon(self, rt: RunRuntime, action: AbandonScope) -> None:
         """执行废弃：移除作用域及后代工作区并各自换代。"""

@@ -59,8 +59,15 @@ from workflow_controller.plugin.run_driver import (
     TimerFired,
 )
 from workflow_controller.plugin.workspace import (
+    AbandonScope,
+    CommitScopeTerminal,
+    IntegrateScope,
     PrepareScopeWorkspace,
     RebuildScriptDecl,
+    ScopeAbandoned,
+    ScopeIntegrated,
+    ScopeIntegrationRejected,
+    ScopeTerminalCommitted,
     ScopeWorkspacePrepared,
     WorkspaceActionFailed,
     WorkspaceScopeKind,
@@ -118,6 +125,7 @@ def _workspace_tree_config(
     return WorkspaceTreeConfig(
         root_dir=str(work_dir),
         conflict_policy=str(workspace_cfg.get("conflict_policy", "git_merge")),
+        retain_after_merge=bool(workspace_cfg.get("retain_after_merge", False)),
         merge=tuple(str(p) for p in manifest_cfg.get("merge") or ()),
         writer_local=tuple(str(p) for p in manifest_cfg.get("writer_local") or ()),
         shared_readonly=tuple(str(p) for p in manifest_cfg.get("shared_readonly") or ()),
@@ -151,7 +159,8 @@ def pick_runner_options(src: Mapping[str, Any]) -> dict[str, Any]:
     return {k: src[k] for k in RUNNER_OPTION_KEYS if src.get(k) is not None}
 
 
-# 节点活动阶段：建区等待 → 执行（bash 进程 / agent 成员）→ 子图读取 → 报告落盘 → 验收
+# 节点活动阶段：建区等待 → 执行（bash 进程 / agent 成员）→ 终态提交等待 →
+# 子图读取 → 报告落盘 → 验收 → 集成等待
 _PHASE_WORKSPACE = "workspace"
 _PHASE_EXEC_PROC = "exec_proc"
 _PHASE_SPAWN = "spawn"
@@ -159,6 +168,7 @@ _PHASE_RUNNING = "running"
 _PHASE_CONTINUE = "continue"
 _PHASE_STOPPING = "stopping"
 _PHASE_PAUSED_WAIT = "paused_wait"
+_PHASE_TERMINAL = "terminal"
 _PHASE_SUB_READ = "sub_read"
 _PHASE_REPORT = "report"
 _PHASE_VERIFY_PROC = "verify_proc"
@@ -169,6 +179,7 @@ _PHASE_VERIFY_STOPPING = "verify_stopping"
 _PHASE_VERIFY_PAUSED_WAIT = "verify_paused_wait"
 _PHASE_VERDICT_SPAWN = "verdict_spawn"
 _PHASE_VERDICT_RUNNING = "verdict_running"
+_PHASE_INTEGRATION = "integration"
 
 _VERIFY_PHASES = frozenset(
     {
@@ -217,6 +228,8 @@ class NodeActivity:
     workspace_path: str | None = None
     workspace_scope_id: str | None = None
     workspace_scope_epoch: int = 0
+    # 验收通过但集成未回执期间暂存的通过档案字段
+    pass_verify: dict[str, Any] | None = None
 
 
 def _resume_reconcile_target(
@@ -732,6 +745,14 @@ class GraphDriver:
             self._on_timer(note, actions)
         elif isinstance(note, ScopeWorkspacePrepared):
             self._on_workspace_prepared(note, actions)
+        elif isinstance(note, ScopeAbandoned):
+            self._on_workspace_abandoned(note, actions)
+        elif isinstance(note, ScopeTerminalCommitted):
+            self._on_scope_terminal_committed(note, actions)
+        elif isinstance(note, ScopeIntegrated):
+            self._on_scope_integrated(note, actions)
+        elif isinstance(note, ScopeIntegrationRejected):
+            self._on_scope_integration_rejected(note, actions)
         elif isinstance(note, WorkspaceActionFailed):
             self._on_workspace_failed(note, actions)
         elif isinstance(note, SessionControlApplied):
@@ -1184,13 +1205,16 @@ class GraphDriver:
     def _on_workspace_prepared(
         self, note: ScopeWorkspacePrepared, actions: list[RunAction]
     ) -> None:
-        """建区回执：记录工作区映射，补发该节点被挂起的执行出生。"""
+        """建区回执：记录工作区映射（活动与节点档案），补发被挂起的执行出生。"""
         act = self._activity_by_context(note.context)
         if act is None or act.phase != _PHASE_WORKSPACE:
             return
         act.workspace_path = note.workspace_path
         act.workspace_scope_id = note.scope_id
         act.workspace_scope_epoch = note.scope_epoch
+        self._state.set_node_workspace(
+            act.node_id, note.scope_id, note.scope_epoch, note.workspace_path
+        )
         node = self._dag_node(act.node_id)
         if node is None:
             self._drop_activity(act)
@@ -1209,13 +1233,69 @@ class GraphDriver:
         else:
             self._spawn_bash_node(node, act.node_id, ctx, act.attempt, actions)
 
-    def _on_workspace_failed(self, note: WorkspaceActionFailed, actions: list[RunAction]) -> None:
-        """工作区动作失败回执：按执行错误收口，不降级共享目录继续跑。"""
+    def _on_workspace_abandoned(self, note: ScopeAbandoned, actions: list[RunAction]) -> None:
+        """废弃回执：清节点档案的旧作用域映射，补发建区（重试的新作用域）。"""
         act = self._activity_by_context(note.context)
         if act is None or act.phase != _PHASE_WORKSPACE:
             return
-        act.executor_error = f"节点工作区建立失败: {note.error}"
-        self._after_executor(act, actions)
+        self._state.clear_node_workspace(act.node_id)
+        self._emit_prepare_scope(act, actions)
+
+    def _on_scope_terminal_committed(
+        self, note: ScopeTerminalCommitted, actions: list[RunAction]
+    ) -> None:
+        """终态提交回执：执行态已静止落账，继续执行收口后的推进。"""
+        act = self._activity_by_context(note.context)
+        if act is None or act.phase != _PHASE_TERMINAL:
+            return
+        node = self._dag_node(act.node_id)
+        if node is None:
+            self._drop_activity(act)
+            return
+        self._advance_after_executor(act, node, actions)
+
+    def _on_scope_integrated(self, note: ScopeIntegrated, actions: list[RunAction]) -> None:
+        """集成成功回执：节点此刻才落 passed，下游随调度解锁。"""
+        act = self._activity_by_context(note.context)
+        if act is None or act.phase != _PHASE_INTEGRATION:
+            return
+        verify = act.pass_verify
+        act.pass_verify = None
+        self._finish_node(act, "passed", actions, verify=verify)
+
+    def _on_scope_integration_rejected(
+        self, note: ScopeIntegrationRejected, actions: list[RunAction]
+    ) -> None:
+        """集成冲突回执：节点未通过，按验收失败路径处理（重试先废弃旧作用域）。"""
+        act = self._activity_by_context(note.context)
+        if act is None or act.phase != _PHASE_INTEGRATION:
+            return
+        paths = ", ".join(note.conflict_paths)
+        reason = f"集成冲突: {paths}" if paths else "集成冲突"
+        acc = (self._dag_node(act.node_id) or {}).get("acceptance") or {}
+        self._apply_verify_failure(
+            act, acc, self._verify_extra_fields(act, reason), reason, actions
+        )
+
+    def _on_workspace_failed(self, note: WorkspaceActionFailed, actions: list[RunAction]) -> None:
+        """工作区动作失败回执：按所处相位收口，不降级共享目录继续跑。"""
+        act = self._activity_by_context(note.context)
+        if act is None:
+            return
+        if act.phase == _PHASE_WORKSPACE:
+            verb = "建立" if note.action == "PrepareScopeWorkspace" else "废弃"
+            act.executor_error = f"节点工作区{verb}失败: {note.error}"
+            self._after_executor(act, actions)
+            return
+        if act.phase == _PHASE_TERMINAL:
+            self._conclude_verify(act, False, f"节点终态提交失败: {note.error}", actions)
+            return
+        if act.phase == _PHASE_INTEGRATION:
+            reason = f"节点集成失败: {note.error}"
+            acc = (self._dag_node(act.node_id) or {}).get("acceptance") or {}
+            self._apply_verify_failure(
+                act, acc, self._verify_extra_fields(act, reason), reason, actions
+            )
 
     def _on_member_control(
         self,
@@ -1580,7 +1660,11 @@ class GraphDriver:
         attempt: int,
         actions: list[RunAction],
     ) -> bool:
-        """开启工作区隔离且本代未建区时先发建区动作，回执到达后再出生执行。"""
+        """开启工作区隔离且本代无在用工作区时先补工作区动作。
+
+        节点档案残留旧作用域（重试/回滚重排）时先废弃再建新，避免旧
+        作用域留 ACTIVE 无人回收；无残留直接建区。回执到达后再出生执行。
+        """
         if self._workspace_config is None:
             return False
         act = self._nodes.get(node_id)
@@ -1590,18 +1674,34 @@ class GraphDriver:
             act = NodeActivity(node_id=node_id, phase=_PHASE_WORKSPACE, attempt=attempt)
             self._nodes[node_id] = act
         act.phase = _PHASE_WORKSPACE
+        stale = self._state.node_workspace(node_id)
+        if stale is not None:
+            self._workspace_seq += 1
+            actions.append(
+                AbandonScope(
+                    scope_id=stale[0],
+                    expected_scope_epoch=stale[1],
+                    client_op_id=f"abandon-{self._workspace_seq}",
+                    context=f"node={node_id}",
+                )
+            )
+            return True
+        self._emit_prepare_scope(act, actions)
+        return True
+
+    def _emit_prepare_scope(self, act: NodeActivity, actions: list[RunAction]) -> None:
+        """发建区动作：键序号驱动内单调递增，保证不重号。"""
         self._workspace_seq += 1
         actions.append(
             PrepareScopeWorkspace(
                 config=self._workspace_config,
-                scope_key=f"{node_id}-w{self._workspace_seq}",
+                scope_key=f"{act.node_id}-w{self._workspace_seq}",
                 client_op_id=f"prepare-{self._workspace_seq}",
                 scope_kind=WorkspaceScopeKind.MAIN_WRITER,
-                owner_ref=node_id,
-                context=f"node={node_id}",
+                owner_ref=act.node_id,
+                context=f"node={act.node_id}",
             )
         )
-        return True
 
     def _start_merged_generator(
         self,
@@ -1762,7 +1862,7 @@ class GraphDriver:
         return actions
 
     def _after_executor(self, act: NodeActivity, actions: list[RunAction]) -> None:
-        """执行阶段收口：generator 先读子图，report 启用先落盘，再进验收。"""
+        """执行阶段收口：隔离时先过闸门落终态执行态，再按节点形态推进。"""
         node = self._dag_node(act.node_id)
         if node is None:
             self._drop_activity(act)
@@ -1770,6 +1870,29 @@ class GraphDriver:
         if act.phase == _PHASE_SUB_READ:
             self._merge_or_verify(act, actions)
             return
+        if (
+            self._workspace_config is not None
+            and act.workspace_scope_id is not None
+            and act.executor_error is None
+        ):
+            # 执行态先静止落账（闸门内提交 + terminal 检查点），回执到达
+            # 才允许验收单元出生——否则验收可能读到仍在变化的文件
+            act.phase = _PHASE_TERMINAL
+            self._workspace_seq += 1
+            actions.append(
+                CommitScopeTerminal(
+                    scope_id=act.workspace_scope_id,
+                    client_op_id=f"terminal-{self._workspace_seq}",
+                    context=f"node={act.node_id}",
+                )
+            )
+            return
+        self._advance_after_executor(act, node, actions)
+
+    def _advance_after_executor(
+        self, act: NodeActivity, node: dict[str, Any], actions: list[RunAction]
+    ) -> None:
+        """执行收口后的推进：generator 读子图、report 落盘或直接进验收。"""
         if node.get("task_type") == "generator" and not act.executor_error:
             act.phase = _PHASE_SUB_READ
             ctx = {
@@ -1816,7 +1939,7 @@ class GraphDriver:
             return
         if not acc.get("enabled", False):
             self._merge_subgraph(act)
-            self._finish_node(act, "passed", actions)
+            self._pass_node(act, actions)
             return
         ctx = {
             **self._program.variables,
@@ -1917,18 +2040,40 @@ class GraphDriver:
         reason: str,
         actions: list[RunAction],
     ) -> None:
-        """验收结论落账：通过合并子图，失败按 retry/continue/rollback/fail 去向。"""
+        """验收结论落账：通过合并子图并走集成定序，失败按 retry/continue/rollback/fail 去向。"""
         node = self._dag_node(act.node_id)
         acc = node.get("acceptance") or {}
         verify_extra = self._verify_extra_fields(act, reason)
         self._state.clear_verify_session_id(act.node_id)
         if passed:
             self._merge_subgraph(act)
-            self._finish_node(act, "passed", actions, verify=verify_extra)
             self._last_verify_reason.pop(act.node_id, None)
+            self._pass_node(act, actions, verify=verify_extra)
             return
         # 验收失败：failure_reason 只记执行阶段的错误，验收失败原因归 verify_reason
         self._apply_verify_failure(act, acc, verify_extra, reason, actions)
+
+    def _pass_node(
+        self,
+        act: NodeActivity,
+        actions: list[RunAction],
+        verify: dict[str, Any] | None = None,
+    ) -> None:
+        """验收通过收口：隔离时先进待集成相位发集成动作，回执到达才落 passed。"""
+        if self._workspace_config is not None and act.workspace_scope_id is not None:
+            act.phase = _PHASE_INTEGRATION
+            act.pass_verify = verify
+            self._workspace_seq += 1
+            actions.append(
+                IntegrateScope(
+                    scope_id=act.workspace_scope_id,
+                    client_op_id=f"integrate-{self._workspace_seq}",
+                    receipt=f"{act.node_id}/attempt-{act.attempt}/verify-passed",
+                    context=f"node={act.node_id}",
+                )
+            )
+            return
+        self._finish_node(act, "passed", actions, verify=verify)
 
     def _apply_verify_failure(
         self,
@@ -2097,9 +2242,12 @@ class GraphDriver:
         return env
 
     def _node_workspace(self, node_id: str) -> str | None:
-        """节点当前的作用域工作区路径（未开启或未建成为 None）。"""
+        """节点当前的作用域工作区路径：活动优先，回退节点档案（恢复后续跑）。"""
         act = self._nodes.get(node_id)
-        return act.workspace_path if act is not None else None
+        if act is not None and act.workspace_path is not None:
+            return act.workspace_path
+        mapping = self._state.node_workspace(node_id)
+        return mapping[2] if mapping is not None else None
 
     def _member_spec(
         self,

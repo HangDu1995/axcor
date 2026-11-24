@@ -33,10 +33,14 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AbandonScope",
+    "CommitScopeTerminal",
     "IntegrateScope",
     "PrepareScopeWorkspace",
     "RebuildScriptDecl",
     "ScopeAbandoned",
+    "ScopeIntegrated",
+    "ScopeIntegrationRejected",
+    "ScopeTerminalCommitted",
     "ScopeWorkspacePrepared",
     "WorkspaceActionFailed",
     "WorkspaceScopeKind",
@@ -65,10 +69,12 @@ class WorkspaceTreeConfig:
 
     首个到达宿主的工作区动作携带本配置完成惰性装配，其后动作携带的
     配置不再生效；未给出的策略桶与冲突档位由宿主取默认。
+    retain_after_merge 为真时集成后保留作用域工作区（默认释放）。
     """
 
     root_dir: str
     conflict_policy: str = "git_merge"
+    retain_after_merge: bool = False
     merge: tuple[str, ...] = ()
     writer_local: tuple[str, ...] = ()
     shared_readonly: tuple[str, ...] = ()
@@ -102,11 +108,20 @@ class AbandonScope(RunAction):
 
 @dataclass(frozen=True)
 class IntegrateScope(RunAction):
-    """集成动作：定序接线前宿主对执行明确回执未实现。"""
+    """集成动作：宿主在父作用域闸门内串行集成，冲突显式拒绝回执。"""
 
     scope_id: str
     client_op_id: str
     receipt: str | None = None
+    context: str | None = None
+
+
+@dataclass(frozen=True)
+class CommitScopeTerminal(RunAction):
+    """终态提交动作：宿主在闸门内提交作用域执行态并落 terminal 检查点。"""
+
+    scope_id: str
+    client_op_id: str
     context: str | None = None
 
 
@@ -129,6 +144,40 @@ class ScopeAbandoned(RunNotification):
     scope_id: str
     new_scope_epoch: int
     abandoned_descendants: tuple[tuple[str, int], ...] = ()
+    context: str | None = None
+
+
+@dataclass(frozen=True)
+class ScopeTerminalCommitted(RunNotification):
+    """终态提交完成通知：执行态提交与 terminal 检查点已落账。"""
+
+    scope_id: str
+    commit: str
+    checkpoint_id: str
+    context: str | None = None
+
+
+@dataclass(frozen=True)
+class ScopeIntegrated(RunNotification):
+    """集成成功通知：父线新头与写者进入父树的路径清单。"""
+
+    scope_id: str
+    parent_scope_id: str
+    new_parent_head: str
+    integrated_paths: tuple[str, ...] = ()
+    context: str | None = None
+
+
+@dataclass(frozen=True)
+class ScopeIntegrationRejected(RunNotification):
+    """集成拒绝通知：冲突路径与双侧提交，节点按验收失败处理。"""
+
+    scope_id: str
+    parent_scope_id: str
+    conflict_paths: tuple[str, ...] = ()
+    base_commit: str = ""
+    writer_head: str = ""
+    parent_head: str = ""
     context: str | None = None
 
 

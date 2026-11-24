@@ -610,6 +610,10 @@ class RunStore:
         """边界快照追加历史：内容哈希去重，未变不入行；返回新行 id 或 None。"""
         return await asyncio.to_thread(self._append_driver_snapshot_locked, run_id, blob)
 
+    async def latest_driver_snapshot_id(self, run_id: str) -> int | None:
+        """该 run 最新历史快照行 id（从未追加过为 None）。"""
+        return await asyncio.to_thread(self._latest_driver_snapshot_id_locked, run_id)
+
     async def list_driver_snapshots(self, run_id: str) -> list[dict]:
         """快照历史（(run_id, seq) 有序，导出与回放的数据面）。"""
         return await asyncio.to_thread(self._list_driver_snapshots_locked, run_id)
@@ -1115,6 +1119,15 @@ class RunStore:
                 (run_id, (max_seq or 0) + 1, text, digest),
             )
             return int(cur.lastrowid)
+
+    def _latest_driver_snapshot_id_locked(self, run_id: str) -> int | None:
+        """同步面：最新历史快照行 id。"""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM run_driver_snapshots WHERE run_id = ? ORDER BY seq DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        return int(row["id"]) if row is not None else None
 
     def _list_driver_snapshots_locked(self, run_id: str) -> list[dict]:
         """同步面：快照历史按 seq 有序读出。"""

@@ -24,15 +24,20 @@ import asyncio
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from workflow_controller.core.checkpoints import CheckpointStore
 from workflow_controller.core.run_coordinator import RunConfig, RunCoordinator
 from workflow_controller.core.runs import RunStore
 from workflow_controller.core.session_run_affiliation import SessionRunAffiliationService
 from workflow_controller.plugin.run_driver import FinishOutcome, FinishRun, RunAction
 from workflow_controller.plugin.workspace import (
     AbandonScope,
+    CommitScopeTerminal,
     IntegrateScope,
     PrepareScopeWorkspace,
     ScopeAbandoned,
+    ScopeIntegrated,
+    ScopeIntegrationRejected,
+    ScopeTerminalCommitted,
     ScopeWorkspacePrepared,
     WorkspaceActionFailed,
     WorkspaceTreeConfig,
@@ -280,21 +285,154 @@ async def test_abandon_removes_workspace_and_bumps_epoch(tmp_path: Path) -> None
     assert not Path(prepared[0].workspace_path).exists()
 
 
-async def test_integrate_replies_not_implemented(tmp_path: Path) -> None:
-    """集成动作在接线前显式回执未实现。"""
+async def test_integrate_merges_writer_output_and_releases(tmp_path: Path) -> None:
+    """集成动作把写者产出并入根检出，成功后默认释放作用域工作区。"""
+    work_root = tmp_path / "root"
+    work_root.mkdir()
+    (work_root / "base.md").write_text("base\n", encoding="utf-8")
 
     def plan(driver: ProbeDriver) -> list[RunAction] | None:
-        if _notes_of(driver, WorkspaceActionFailed):
+        if _notes_of(driver, ScopeIntegrated):
             return None
-        return [IntegrateScope(scope_id="node-a", client_op_id="op-1")]
+        prepared = _notes_of(driver, ScopeWorkspacePrepared)
+        if prepared:
+            (Path(prepared[0].workspace_path) / "out.txt").write_text(
+                "writer-a\n", encoding="utf-8"
+            )
+            return [
+                IntegrateScope(
+                    scope_id=prepared[0].scope_id,
+                    client_op_id="op-2",
+                    context="node=a",
+                )
+            ]
+        return [
+            PrepareScopeWorkspace(
+                config=_tree_config(work_root),
+                scope_key="node-a",
+                client_op_id="op-1",
+                context="node=a",
+            )
+        ]
 
     h = BridgeHarness(tmp_path, plan)
     await h.start_and_finish()
 
-    failures = _notes_of(h.driver, WorkspaceActionFailed)
-    assert len(failures) == 1
-    assert failures[0].action == "IntegrateScope"
-    assert "尚未接入" in failures[0].error
+    integrated = _notes_of(h.driver, ScopeIntegrated)
+    assert len(integrated) == 1
+    assert integrated[0].integrated_paths == ("out.txt",)
+    assert len(integrated[0].new_parent_head) == 40
+    assert (work_root / "out.txt").read_text(encoding="utf-8") == "writer-a\n"
+    prepared = _notes_of(h.driver, ScopeWorkspacePrepared)
+    assert not Path(prepared[0].workspace_path).exists()  # 默认释放
+    assert not _notes_of(h.driver, WorkspaceActionFailed)
+
+
+async def test_integration_conflict_replies_rejection(tmp_path: Path) -> None:
+    """同基线双写者改同一路径：先集成者胜，后到者按档位拒绝并携带冲突载荷。"""
+    work_root = tmp_path / "root"
+    work_root.mkdir()
+    config = WorkspaceTreeConfig(root_dir=str(work_root), conflict_policy="strict")
+
+    def plan(driver: ProbeDriver) -> list[RunAction] | None:
+        if _notes_of(driver, ScopeIntegrationRejected):
+            return None
+        prepared = _notes_of(driver, ScopeWorkspacePrepared)
+        if _notes_of(driver, ScopeIntegrated):
+            return [
+                IntegrateScope(
+                    scope_id=prepared[1].scope_id,
+                    client_op_id="op-4",
+                    context="node=b",
+                )
+            ]
+        if len(prepared) == 1:
+            return [
+                PrepareScopeWorkspace(
+                    config=config,
+                    scope_key="node-b",
+                    client_op_id="op-2",
+                    context="node=b",
+                )
+            ]
+        if len(prepared) == 2:
+            # 双方建区完毕（同一集成头基线）再各自写入同一路径
+            for note, content in zip(prepared, ("from-a\n", "from-b\n"), strict=True):
+                (Path(note.workspace_path) / "out.txt").write_text(content, encoding="utf-8")
+            return [
+                IntegrateScope(
+                    scope_id=prepared[0].scope_id,
+                    client_op_id="op-3",
+                    context="node=a",
+                )
+            ]
+        return [
+            PrepareScopeWorkspace(
+                config=config,
+                scope_key="node-a",
+                client_op_id="op-1",
+                context="node=a",
+            )
+        ]
+
+    h = BridgeHarness(tmp_path, plan)
+    await h.start_and_finish()
+
+    rejected = _notes_of(h.driver, ScopeIntegrationRejected)
+    assert len(rejected) == 1
+    assert rejected[0].scope_id == "node-b"
+    assert rejected[0].conflict_paths == ("out.txt",)
+    assert len(rejected[0].base_commit) == 40
+    assert (work_root / "out.txt").read_text(encoding="utf-8") == "from-a\n"
+    assert not _notes_of(h.driver, WorkspaceActionFailed)
+
+
+async def test_terminal_commit_records_checkpoints(tmp_path: Path) -> None:
+    """终态提交动作回执提交与检查点；scope_start/terminal 行先有文件引用再有编排引用。"""
+    work_root = tmp_path / "root"
+    work_root.mkdir()
+
+    def plan(driver: ProbeDriver) -> list[RunAction] | None:
+        if _notes_of(driver, ScopeTerminalCommitted):
+            return None
+        prepared = _notes_of(driver, ScopeWorkspacePrepared)
+        if prepared:
+            (Path(prepared[0].workspace_path) / "work.txt").write_text("done\n", encoding="utf-8")
+            return [
+                CommitScopeTerminal(
+                    scope_id=prepared[0].scope_id,
+                    client_op_id="op-2",
+                    context="node=a",
+                )
+            ]
+        return [
+            PrepareScopeWorkspace(
+                config=_tree_config(work_root),
+                scope_key="node-a",
+                client_op_id="op-1",
+                context="node=a",
+            )
+        ]
+
+    h = BridgeHarness(tmp_path, plan)
+    await h.start_and_finish()
+
+    committed = _notes_of(h.driver, ScopeTerminalCommitted)
+    assert len(committed) == 1
+    assert len(committed[0].commit) == 40
+    checkpoints = CheckpointStore(h.store.db_path)
+    rows = await checkpoints.list_for_scope("node-a")
+    checkpoints.close()
+    by_trigger = {row.trigger.value: row for row in rows}
+    assert set(by_trigger) == {"scope_start", "terminal"}
+    for row in rows:
+        assert len(row.workspace_commit) == 40
+        assert row.orchestration_state_ref
+        assert row.orchestration_state_ref.startswith("driver-snapshot:")
+        assert row.barrier_quality.value == "precise"
+    assert by_trigger["scope_start"].integration_commit
+    # 终态提交只落账不释放：工作区保留给随后的验收与集成
+    assert Path(_notes_of(h.driver, ScopeWorkspacePrepared)[0].workspace_path).is_dir()
 
 
 async def test_abandon_without_tree_replies_failure(tmp_path: Path) -> None:
