@@ -381,6 +381,37 @@ class TestCheckpointRoundtrip:
         assert await store.list_for_scope("missing") == []
         assert await store.get("missing") is None
 
+    async def test_list_for_tree_anchors_on_root(self, store: CheckpointStore) -> None:
+        """树查询以根锚定：根行与直接子作用域行命中，他树行排除。"""
+        await store.record(
+            _checkpoint(
+                checkpoint_id="cp-root",
+                scope_id="run-1-root",
+                parent_scope_id=None,
+                created_at="2026-11-24T10:00:00+00:00",
+            )
+        )
+        await store.record(
+            _checkpoint(
+                checkpoint_id="cp-child",
+                scope_id="node-a",
+                parent_scope_id="run-1-root",
+                created_at="2026-11-24T10:00:01+00:00",
+            )
+        )
+        await store.record(
+            _checkpoint(
+                checkpoint_id="cp-other-tree",
+                scope_id="node-x",
+                parent_scope_id="run-2-root",
+                created_at="2026-11-24T10:00:02+00:00",
+            )
+        )
+
+        listed = await store.list_for_tree("run-1-root")
+        assert [item.checkpoint_id for item in listed] == ["cp-root", "cp-child"]
+        assert await store.list_for_tree("run-9-root") == []
+
     async def test_attach_child_session_backfills_and_is_idempotent(
         self, store: CheckpointStore
     ) -> None:

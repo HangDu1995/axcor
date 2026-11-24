@@ -52,6 +52,7 @@ from workflow_controller.core.checkpoints import (
     CheckpointStore,
     CheckpointTrigger,
     ScopeCheckpoint,
+    checkpoint_to_dict,
 )
 from workflow_controller.core.run_export import RunExportService
 from workflow_controller.core.run_host import KILL_GRACE_S as KILL_GRACE_S
@@ -138,6 +139,7 @@ from workflow_controller.plugin.workspace import (
     CommitScopeTerminal,
     IntegrateScope,
     PrepareScopeWorkspace,
+    RestoreCommitted,
     ScopeAbandoned,
     ScopeIntegrated,
     ScopeIntegrationRejected,
@@ -1226,6 +1228,47 @@ class RunCoordinator:
         rt = self._runtimes.get(run_id)
         return [self._run_session_info(row, rt) for row in rows]
 
+    async def list_run_scopes(self, run_id: str) -> list[dict[str, Any]]:
+        """run 的作用域账面查询（工作区树运行时在位时；不在位为空）。"""
+        await self._run_store.get(run_id)
+        tree = self._workspace_trees.get(run_id)
+        if tree is None:
+            return []
+        return [
+            {
+                "scope_id": record.scope_id,
+                "parent_scope_id": record.parent_scope_id,
+                "scope_kind": record.scope_kind.value,
+                "owner_ref": record.owner_ref,
+                "workspace_ref": record.workspace_ref,
+                "workspace_path": (record.workspace_ref.rpartition("|")[0] or record.workspace_ref)
+                if record.workspace_ref
+                else None,
+                "scope_base_commit": record.scope_base_commit,
+                "integration_base_commit": record.integration_base_commit,
+                "scope_epoch": record.scope_epoch,
+                "root_epoch": record.root_epoch,
+                "gate_state": record.gate_state.value,
+                "state": record.state.value,
+                "created_at": record.created_at,
+            }
+            for record in await tree.manager.list_scopes()
+        ]
+
+    async def list_run_checkpoints(
+        self, run_id: str, *, scope_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """run 的检查点查询（树根锚定本 run 的行；可按作用域过滤）。"""
+        await self._run_store.get(run_id)
+        store = CheckpointStore(self._run_store.db_path)
+        try:
+            rows = await store.list_for_tree(f"{run_id}-root")
+        finally:
+            store.close()
+        if scope_id is not None:
+            rows = [row for row in rows if row.scope_id == scope_id]
+        return [checkpoint_to_dict(row) for row in rows]
+
     # ── 成员 session 管理（成员始终为 session）─────────────────────
 
     async def pause_run_session(self, run_id: str, session_id: str) -> None:
@@ -2199,7 +2242,9 @@ class RunCoordinator:
         if isinstance(action, AbandonScope):
             await self._execute_workspace_abandon(rt, action)
             return True
-        return False
+        # 恢复确认（RestoreCommitted）：编排层失效计划持久化确认，核心重建
+        # 闸门接线前为纯确认、无独立回执——紧随的建区动作回执即生效信号
+        return isinstance(action, RestoreCommitted)
 
     async def _execute_workspace_prepare(
         self, rt: RunRuntime, action: PrepareScopeWorkspace

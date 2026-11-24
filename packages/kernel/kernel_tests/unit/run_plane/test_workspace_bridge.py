@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from workflow_controller.core.checkpoints import CheckpointStore
 from workflow_controller.core.run_coordinator import RunConfig, RunCoordinator
 from workflow_controller.core.runs import RunStore
@@ -35,6 +37,7 @@ from workflow_controller.plugin.workspace import (
     CommitScopeTerminal,
     IntegrateScope,
     PrepareScopeWorkspace,
+    RestoreCommitted,
     ScopeAbandoned,
     ScopeIntegrated,
     ScopeIntegrationRejected,
@@ -98,6 +101,22 @@ class ProbeDriver:
         return {"schema_version": 1, "state": {}, "pending_timers": []}
 
 
+class OpProbeDriver(ProbeDriver):
+    """支持 handle_op 的探针：留档所见 op 并按既定表应答。"""
+
+    def __init__(self, plan: Callable[[ProbeDriver], list[RunAction] | None]) -> None:
+        super().__init__(plan)
+        self.ops: list[tuple[str, dict[str, Any]]] = []
+
+    def handle_op(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
+        self.ops.append((op, dict(args)))
+        if op == "get_operation":
+            if args.get("operation_id") != "co-9":
+                raise LookupError(f"操作不存在：{args.get('operation_id')}")
+            return {"operation_id": "co-9", "phase": "succeeded"}
+        return {"operation_id": args.get("client_op_id"), "phase": "pending"}
+
+
 class BridgeHarness:
     """run 平面装配：真实协调器 + 探针驱动 + 真实私有仓根目录。"""
 
@@ -107,12 +126,13 @@ class BridgeHarness:
         plan: Callable[[ProbeDriver], list[RunAction] | None],
         *,
         coord_kwargs: dict[str, Any] | None = None,
+        driver: ProbeDriver | None = None,
     ) -> None:
         self.store = RunStore(tmp_path / "events.db")
         self.affiliation = SessionRunAffiliationService(self.store)
         self.bus = StubBus()
         self.so = WorkspaceSO(tmp_path)
-        self.driver = ProbeDriver(plan)
+        self.driver = driver if driver is not None else ProbeDriver(plan)
         self.coord = RunCoordinator(
             orchestrator=self.so,
             run_store=self.store,
@@ -126,14 +146,19 @@ class BridgeHarness:
         self.program = tmp_path / "prog.txt"
         self.program.write_text("probe", encoding="utf-8")
 
+    async def start(self) -> str:
+        """启动 run（不等待终态，供运行中查询与 op 通道用例）。"""
+        run = await self.coord.start_run(RunConfig(format="probe@1"), self.program)
+        return run.run_id
+
     async def start_and_finish(self, timeout_s: float = 60.0) -> str:
         """启动 run 并等待终态，返回 run_id。"""
-        run = await self.coord.start_run(RunConfig(format="probe@1"), self.program)
+        run_id = await self.start()
         deadline = asyncio.get_running_loop().time() + timeout_s
         while asyncio.get_running_loop().time() < deadline:
-            record = await self.store.get(run.run_id)
+            record = await self.store.get(run_id)
             if record.finished_at is not None:
-                return run.run_id
+                return run_id
             await asyncio.sleep(0.02)
         raise AssertionError("run 未在限期内落终态")
 
@@ -693,3 +718,147 @@ async def test_quiesce_failure_emits_fault_and_fails_action(tmp_path: Path) -> N
     assert len(events) == 1
     assert events[0]["action"] == "PrepareScopeWorkspace"
     assert "闸门未能静止" in events[0]["error"]
+
+
+async def test_restore_committed_action_accepted(tmp_path: Path) -> None:
+    """恢复确认动作被宿主接受（核心重建闸门接线前为纯确认，无回执）。"""
+    work_root = tmp_path / "root"
+    work_root.mkdir()
+    emitted = {"done": False}
+
+    def plan(driver: ProbeDriver) -> list[RunAction] | None:
+        if emitted["done"]:
+            return None
+        emitted["done"] = True
+        return [
+            RestoreCommitted(
+                scope_id="node-a",
+                client_op_id="co-1",
+                context="node=a",
+            )
+        ]
+
+    h = BridgeHarness(tmp_path, plan)
+    await h.start_and_finish()  # 派发不被拒即接受；run 正常收口
+
+    assert emitted["done"]
+    assert not _notes_of(h.driver, WorkspaceActionFailed)
+
+
+async def test_run_api_lists_scopes_and_checkpoints(tmp_path: Path) -> None:
+    """CoreAPI 作用域/检查点查询：树在位返回账面行，检查点按树根锚定。"""
+    from workflow_controller.api.run_api import RunAPI
+
+    work_root = tmp_path / "root"
+    work_root.mkdir()
+    (work_root / "design").mkdir()
+    (work_root / "design" / "base.md").write_text("base\n", encoding="utf-8")
+    gate = {"finish": False}
+
+    def plan(driver: ProbeDriver) -> list[RunAction] | None:
+        if gate["finish"]:
+            return None
+        prepared = _notes_of(driver, ScopeWorkspacePrepared)
+        if not prepared:
+            return [
+                PrepareScopeWorkspace(
+                    config=_tree_config(work_root),
+                    scope_key="node-a",
+                    client_op_id="op-1",
+                    context="node=a",
+                )
+            ]
+        if not _notes_of(driver, ScopeTerminalCommitted):
+            (Path(prepared[0].workspace_path) / "work.txt").write_text("done\n", encoding="utf-8")
+            return [
+                CommitScopeTerminal(
+                    scope_id=prepared[0].scope_id,
+                    client_op_id="op-2",
+                    context="node=a",
+                )
+            ]
+        return []  # 保持运行供查询
+
+    h = BridgeHarness(tmp_path, plan)
+    run_id = await h.start()
+    api = RunAPI(h.coord)
+    deadline = asyncio.get_running_loop().time() + 30.0
+    while asyncio.get_running_loop().time() < deadline:
+        checkpoints = await api.list_run_checkpoints(run_id)
+        if len(checkpoints) >= 2:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("检查点未在限期内落账")
+
+    scopes = {s["scope_id"]: s for s in await api.list_run_scopes(run_id)}
+    assert f"{run_id}-root" in scopes
+    node_scope = scopes["node-a"]
+    assert node_scope["scope_kind"] == "main_writer"
+    assert node_scope["scope_epoch"] == 1
+    assert node_scope["state"] == "active"
+    assert Path(node_scope["workspace_path"]).is_dir()
+
+    by_trigger = {row["trigger"]: row for row in checkpoints}
+    assert set(by_trigger) == {"scope_start", "terminal"}
+    for row in checkpoints:
+        assert row["scope_id"] == "node-a"
+        assert row["orchestration_state_ref"].startswith("driver-snapshot:")
+        assert len(row["workspace_commit"]) == 40
+    filtered = await api.list_run_checkpoints(run_id, scope_id="node-a")
+    assert {row["checkpoint_id"] for row in filtered} == {
+        row["checkpoint_id"] for row in checkpoints
+    }
+    assert await api.list_run_checkpoints(run_id, scope_id="nobody") == []
+
+    gate["finish"] = True
+    await h.coord.stop_run(run_id)
+
+
+async def test_run_api_rollback_op_channel_and_operation_lookup(tmp_path: Path) -> None:
+    """request_run_rollback 经驱动 op 转发；get_run_operation 查询与错误翻译。"""
+    from workflow_controller.api.run_api import (
+        RunAPI,
+        RunApiInvalidStateError,
+        RunApiNotFoundError,
+    )
+
+    work_root = tmp_path / "root"
+    work_root.mkdir()
+
+    def plan(driver: ProbeDriver) -> list[RunAction] | None:
+        return []  # 保持运行供 op 通道用例
+
+    probe = OpProbeDriver(plan)
+    h = BridgeHarness(tmp_path, plan, driver=probe)
+    run_id = await h.start()
+    api = RunAPI(h.coord)
+
+    result = await api.request_run_rollback(
+        run_id,
+        node_id="a",
+        client_op_id="co-9",
+        expected_epoch=1,
+    )
+    assert result == {"operation_id": "co-9", "phase": "pending"}
+    assert probe.ops[0][0] == "rollback_node"
+    assert probe.ops[0][1]["node_id"] == "a"
+
+    op = await api.get_run_operation(run_id, "co-9")
+    assert op["phase"] == "succeeded"
+    with pytest.raises(RunApiNotFoundError):
+        await api.get_run_operation(run_id, "missing")
+
+    # 显式给出的检查点不在 run 账上：明确拒绝
+    with pytest.raises(ValueError, match="检查点不存在"):
+        await api.request_run_rollback(
+            run_id,
+            node_id="a",
+            client_op_id="co-10",
+            expected_epoch=1,
+            checkpoint_id="nope",
+        )
+
+    await h.coord.stop_run(run_id)
+    with pytest.raises(RunApiInvalidStateError):
+        await api.get_run_operation(run_id, "co-9")

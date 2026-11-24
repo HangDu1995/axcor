@@ -29,7 +29,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Mapping
 
 # 节点终态集：依赖满足判定的基准（stopped 不在其中——暂停语义，续跑可恢复）
 _TERMINAL = {"passed", "failed", "skipped"}
@@ -397,6 +397,31 @@ class GraphState:
                     "to_gen": to_gen,
                 }
             )
+        self._checkpoint()
+
+    # ── 回滚操作账（异步确认链的状态源，随快照持久化）──────────
+
+    def operations(self) -> dict[str, dict[str, Any]]:
+        """全部回滚操作记录（深拷贝；变更经 upsert_operation 回写）。"""
+        with self._lock:
+            return copy.deepcopy(self._data.get("operations") or {})
+
+    def operation(self, operation_id: str) -> dict[str, Any] | None:
+        """按标识取单条操作记录（深拷贝）；不存在返回 None。"""
+        record = (self._data.get("operations") or {}).get(operation_id)
+        return copy.deepcopy(record) if record is not None else None
+
+    def operation_by_client(self, client_op_id: str) -> dict[str, Any] | None:
+        """按客户端幂等键取操作记录（同键冲突请求在受理入口拒绝）。"""
+        for record in (self._data.get("operations") or {}).values():
+            if record.get("client_op_id") == client_op_id:
+                return copy.deepcopy(record)
+        return None
+
+    def upsert_operation(self, record: Mapping[str, Any]) -> None:
+        """写入/覆盖一条操作记录（按 operation_id 幂等）。"""
+        with self._lock:
+            self._data.setdefault("operations", {})[str(record["operation_id"])] = dict(record)
         self._checkpoint()
 
     # ── Queries ───────────────────────────────────────────────────

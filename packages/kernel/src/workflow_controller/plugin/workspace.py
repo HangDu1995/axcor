@@ -37,6 +37,7 @@ __all__ = [
     "IntegrateScope",
     "PrepareScopeWorkspace",
     "RebuildScriptDecl",
+    "RestoreCommitted",
     "ScopeAbandoned",
     "ScopeIntegrated",
     "ScopeIntegrationRejected",
@@ -125,6 +126,19 @@ class IntegrateScope(RunAction):
 @dataclass(frozen=True)
 class CommitScopeTerminal(RunAction):
     """终态提交动作：宿主在闸门内提交作用域执行态并落 terminal 检查点。"""
+
+    scope_id: str
+    client_op_id: str
+    context: str | None = None
+
+
+@dataclass(frozen=True)
+class RestoreCommitted(RunAction):
+    """失效计划已持久化确认：核心此后方可重建工作区。
+
+    无独立回执通知——紧随的建区/绑定动作回执即确认（核心重建闸门接线
+    前本动作为纯确认，宿主接受即生效）。
+    """
 
     scope_id: str
     client_op_id: str

@@ -253,6 +253,13 @@ class ScopeTree:
             pending.extend(reversed(self._children.get(current.scope_id, [])))
         return collected
 
+    async def list_all_scopes(self) -> list[ScopeRecord]:
+        """根起深度优先列出全部作用域（根在前）；空树返回空。"""
+        if self._root_scope_id is None:
+            return []
+        root_id = self._root_scope_id
+        return [self._scopes[root_id], *await self.list_descendants(root_id)]
+
     async def activate_scope(
         self, scope_id: str, *, workspace_ref: str, scope_base_commit: str
     ) -> ScopeRecord:

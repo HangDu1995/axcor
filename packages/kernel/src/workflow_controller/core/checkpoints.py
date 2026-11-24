@@ -31,6 +31,7 @@ __all__ = [
     "CheckpointTrigger",
     "DispatchAnchor",
     "ScopeCheckpoint",
+    "checkpoint_to_dict",
 ]
 
 import asyncio
@@ -39,7 +40,7 @@ import sqlite3
 import threading
 from dataclasses import asdict, dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from workflow_controller.core.workspace.scope_tree import ScopeKind
 
@@ -196,6 +197,13 @@ class CheckpointStore:
         """作用域名下全部检查点（按创建时刻序）。"""
         return await asyncio.to_thread(self._list_for_scope_locked, scope_id)
 
+    async def list_for_tree(self, root_scope_id: str) -> list[ScopeCheckpoint]:
+        """一棵作用域树的全部检查点（根与直接子作用域，按创建时刻序）。
+
+        更深层级（子代理挂主写者下）随派发屏障接线扩展为递归收集。
+        """
+        return await asyncio.to_thread(self._list_for_tree_locked, root_scope_id)
+
     async def attach_child_session(
         self,
         checkpoint_id: str,
@@ -270,6 +278,17 @@ class CheckpointStore:
             ).fetchall()
         return [_row_to_checkpoint(row) for row in rows]
 
+    def _list_for_tree_locked(self, root_scope_id: str) -> list[ScopeCheckpoint]:
+        """同步面：树内（根与直接子作用域）按创建时刻序读全部行。"""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {_CHECKPOINT_COLUMNS} FROM scope_checkpoints"
+                " WHERE scope_id = ? OR parent_scope_id = ?"
+                " ORDER BY created_at, checkpoint_id",
+                (root_scope_id, root_scope_id),
+            ).fetchall()
+        return [_row_to_checkpoint(row) for row in rows]
+
     def _attach_child_session_locked(
         self,
         checkpoint_id: str,
@@ -336,6 +355,35 @@ class CheckpointStore:
                 f"{self.db_path}：scope_checkpoints 表未建——"
                 "检查点账本须经 run 记录库的统一迁移建表后使用"
             )
+
+
+def checkpoint_to_dict(checkpoint: ScopeCheckpoint) -> dict[str, Any]:
+    """检查点行的对外形状（查询面序列化）。"""
+    return {
+        "checkpoint_id": checkpoint.checkpoint_id,
+        "scope_id": checkpoint.scope_id,
+        "scope_kind": checkpoint.scope_kind.value,
+        "parent_scope_id": checkpoint.parent_scope_id,
+        "scope_epoch": checkpoint.scope_epoch,
+        "root_epoch": checkpoint.root_epoch,
+        "trigger": checkpoint.trigger.value,
+        "barrier_quality": checkpoint.barrier_quality.value,
+        "workspace_commit": checkpoint.workspace_commit,
+        "workspace_branch": checkpoint.workspace_branch,
+        "integration_commit": checkpoint.integration_commit,
+        "dispatch_anchor": asdict(checkpoint.dispatch_anchor)
+        if checkpoint.dispatch_anchor is not None
+        else None,
+        "child_session_map": dict(checkpoint.child_session_map)
+        if checkpoint.child_session_map is not None
+        else None,
+        "claims": list(checkpoint.claims),
+        "orchestration_state_ref": checkpoint.orchestration_state_ref,
+        "created_at": checkpoint.created_at,
+        "file_count": checkpoint.file_count,
+        "byte_size": checkpoint.byte_size,
+        "status": checkpoint.status,
+    }
 
 
 def _validate_for_record(checkpoint: ScopeCheckpoint) -> None:

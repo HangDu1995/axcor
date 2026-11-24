@@ -519,6 +519,7 @@ def _state_payload(graph_id: str, blob: Mapping[str, Any]) -> dict[str, Any]:
         "rollbacks": state.get("rollbacks", {}),
         "rollback_edges": state.get("rollback_edges", []),
         "retired_instances": state.get("retired_instances", {}),
+        "operations": state.get("operations", {}),
     }
 
 

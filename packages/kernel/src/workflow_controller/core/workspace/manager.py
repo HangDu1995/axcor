@@ -375,6 +375,10 @@ class WorkspaceManager:
         """查询作用域账本行。"""
         return await self._tree.get_scope(scope_id)
 
+    async def list_scopes(self) -> list[ScopeRecord]:
+        """全部作用域账本行（根起深度优先）。"""
+        return await self._tree.list_all_scopes()
+
     async def current_integration_head(self) -> str | None:
         """当前集成线头；引用缺失返回 None。"""
         return await self._repository.resolve_ref(ROOT_INTEGRATION_REF)

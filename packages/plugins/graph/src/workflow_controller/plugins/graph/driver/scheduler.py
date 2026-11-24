@@ -121,14 +121,87 @@ class RollbackPlan:
     """回滚执行计划：reset 集、需停的运行节点与待废弃的旧子图。"""
 
     target: str
-    failed_node: str
-    failed_gen: int
+    trigger_node: str
+    trigger_gen: int
+    reason: str
     new_gen: int
     reset_nodes: set[str]
     stop_nodes: set[str]
     parent_gen_node: str | None
     old_parent_gen: int
     discard_subgraphs: dict[str, list[str]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RollbackReason:
+    """回滚触发源：触发节点（回滚边与预算的记账主体）与原因文案。"""
+
+    trigger_node: str
+    text: str
+
+
+def plan_restore(
+    state: GraphState,
+    dag: DAG,
+    target: str,
+    reason: RollbackReason,
+    expected_gen: int,
+) -> RollbackPlan | None:
+    """通用回滚计划：reset 集/新代/废弃子图/回滚边/预算一次算清。
+
+    expected_gen 是触发节点当前应处的代次，不匹配即陈旧请求返回 None
+    （先行的他者回滚会改变代次，据此丢弃以免重复生成新代、记录错误的
+    回滚边并归档从未执行过的实例）。手动回滚、超时后 stopped 节点等不
+    满足验收失败前提的触发都走这里；reset 集 = descendants(target) ∪
+    {target, 触发节点}。
+
+    子图内回滚（target 是子图节点）：父 generator 也 reset 进新回滚代，
+    但编排完成不重新 run、状态立即置回 passed；主图下游一起 reset，
+    子图重跑通过后这些下游要重新运行。
+    """
+    nodes = state.snapshot()["nodes"]
+    if target not in nodes or reason.trigger_node not in nodes:
+        logger.warning(
+            "rollback: discard restore plan for missing node (target=%s trigger=%s)",
+            target,
+            reason.trigger_node,
+        )
+        return None
+    if state.gen(reason.trigger_node) != expected_gen:
+        logger.warning(
+            "rollback: discard stale restore request for %s (expected gen %s, now %s)",
+            reason.trigger_node,
+            expected_gen,
+            state.gen(reason.trigger_node),
+        )
+        return None
+    new_gen = state.max_gen() + 1
+    reset_nodes = dag.descendants(target) | {target, reason.trigger_node}
+    parent_gen_node = state.subgraph_parent(target)
+    old_parent_gen = 0
+    if parent_gen_node:
+        old_parent_gen = state.gen(parent_gen_node)
+        reset_nodes.add(parent_gen_node)
+    stop_nodes = {
+        nid for nid in reset_nodes if (nodes.get(nid, {}) or {}).get("status") == "running"
+    }
+    discard_subgraphs = {
+        nid: old_ids
+        for nid in reset_nodes
+        if nid != parent_gen_node and (old_ids := state.subgraph_node_ids(nid))
+    }
+    return RollbackPlan(
+        target=target,
+        trigger_node=reason.trigger_node,
+        trigger_gen=expected_gen,
+        reason=reason.text,
+        new_gen=new_gen,
+        reset_nodes=reset_nodes,
+        stop_nodes=stop_nodes,
+        parent_gen_node=parent_gen_node,
+        old_parent_gen=old_parent_gen,
+        discard_subgraphs=discard_subgraphs,
+    )
 
 
 def plan_rollback(
@@ -138,15 +211,10 @@ def plan_rollback(
     failed_node: str,
     failed_gen: int,
 ) -> RollbackPlan | None:
-    """回滚决策：reset 集/新代/废弃子图一次算清；陈旧结果返回 None。
+    """验收失败自动回滚入口：失败前提核验后委托通用计划计算。
 
-    陈旧判定——先应用的回滚可能已把失败节点 reset 到新代/pending，此时
-    本结果是陈旧的，丢弃以免重复生成新代、记录错误的回滚边并归档一个
-    从未执行过的实例。
-
-    子图内回滚（target 是子图节点）：gen-sub（父 generator）也 reset 进
-    新回滚栏，但编排完成不重新 run、状态保持 passed；主图下游一起 reset，
-    子图重跑通过后这些下游要重新运行。
+    前提是 failed_node 仍处 failed 且代次匹配——先应用的回滚可能已把它
+    reset 到新代/pending，此时结果是陈旧的。
     """
     if state.status(failed_node) != "failed" or state.gen(failed_node) != failed_gen:
         logger.warning(
@@ -157,34 +225,12 @@ def plan_rollback(
             state.gen(failed_node),
         )
         return None
-    new_gen = state.max_gen() + 1
-    reset_nodes = dag.descendants(target) | {target, failed_node}
-    parent_gen_node = state.subgraph_parent(target)
-    old_parent_gen = 0
-    if parent_gen_node:
-        old_parent_gen = state.gen(parent_gen_node)
-        reset_nodes.add(parent_gen_node)
-    snap = state.snapshot()
-    stop_nodes = {
-        nid
-        for nid in reset_nodes - {failed_node}
-        if (snap["nodes"].get(nid, {}) or {}).get("status") == "running"
-    }
-    discard_subgraphs = {
-        nid: old_ids
-        for nid in reset_nodes
-        if nid != parent_gen_node and (old_ids := state.subgraph_node_ids(nid))
-    }
-    return RollbackPlan(
-        target=target,
-        failed_node=failed_node,
-        failed_gen=failed_gen,
-        new_gen=new_gen,
-        reset_nodes=reset_nodes,
-        stop_nodes=stop_nodes,
-        parent_gen_node=parent_gen_node,
-        old_parent_gen=old_parent_gen,
-        discard_subgraphs=discard_subgraphs,
+    return plan_restore(
+        state,
+        dag,
+        target,
+        RollbackReason(trigger_node=failed_node, text="验收失败回滚"),
+        failed_gen,
     )
 
 
@@ -209,12 +255,12 @@ def apply_rollback(state: GraphState, dag: DAG, plan: RollbackPlan) -> None:
         )
     else:
         state.add_rollback_edge(
-            plan.failed_node,
-            plan.failed_gen,
+            plan.trigger_node,
+            plan.trigger_gen,
             plan.target,
             plan.new_gen,
         )
-    state.increment_rollback(plan.failed_node, plan.target)
+    state.increment_rollback(plan.trigger_node, plan.target)
 
 
 @dataclass

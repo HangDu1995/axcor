@@ -367,6 +367,74 @@ class RunAPI:
         except RunNotFoundError as e:
             raise RunApiNotFoundError(e.args[0] if e.args else run_id) from e
 
+    # ── 回滚查询与异步请求面 ────────────────────────────────────
+
+    async def list_run_scopes(self, run_id: str) -> list[dict[str, Any]]:
+        """run 的作用域查询（工作区树运行时在位时；不在位为空列表）。"""
+        try:
+            return await self._coord.list_run_scopes(run_id)
+        except RunNotFoundError as e:
+            raise RunApiNotFoundError(e.args[0] if e.args else run_id) from e
+
+    async def list_run_checkpoints(
+        self, run_id: str, *, scope_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """run 的检查点查询（scope_checkpoints 行；可按作用域过滤）。"""
+        try:
+            return await self._coord.list_run_checkpoints(run_id, scope_id=scope_id)
+        except RunNotFoundError as e:
+            raise RunApiNotFoundError(e.args[0] if e.args else run_id) from e
+
+    async def get_run_operation(self, run_id: str, operation_id: str) -> dict[str, Any]:
+        """异步操作状态查询（经驱动 get_operation op；run 无运行时为状态错误）。"""
+        try:
+            return await self._coord.request_driver_op(
+                run_id, "get_operation", {"operation_id": operation_id}
+            )
+        except RunNotFoundError as e:
+            raise RunApiNotFoundError(e.args[0] if e.args else run_id) from e
+        except LookupError as e:
+            raise RunApiNotFoundError(str(e)) from e
+        except RuntimeError as e:
+            raise RunApiInvalidStateError(str(e)) from e
+
+    async def request_run_rollback(
+        self,
+        run_id: str,
+        *,
+        node_id: str,
+        client_op_id: str,
+        expected_epoch: int,
+        scope_id: str | None = None,
+        checkpoint_id: str | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """未合并节点回滚请求（异步）：转发驱动 rollback_node op，返回 operation_id。
+
+        显式给出的 checkpoint_id 先对 run 的检查点账本核验存在（无有效
+        检查点明确拒绝）；其余前置（traceback 开关、已集成目标、代次）
+        由驱动在受理时校验。
+        """
+        if checkpoint_id:
+            rows = await self.list_run_checkpoints(run_id)
+            if not any(row["checkpoint_id"] == checkpoint_id for row in rows):
+                raise ValueError(f"检查点不存在于该 run：{checkpoint_id}")
+        args: dict[str, Any] = {
+            "node_id": node_id,
+            "client_op_id": client_op_id,
+            "expected_epoch": expected_epoch,
+        }
+        if scope_id is not None:
+            args["scope_id"] = scope_id
+        if checkpoint_id is not None:
+            args["checkpoint_id"] = checkpoint_id
+        if reason:
+            args["reason"] = reason
+        try:
+            return await self._coord.request_driver_op(run_id, "rollback_node", args)
+        except RunNotFoundError as e:
+            raise RunApiNotFoundError(e.args[0] if e.args else run_id) from e
+
     # ── 驱动通道与事件 ──────────────────────────────────────────
 
     async def fetch_events(
