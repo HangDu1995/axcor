@@ -166,17 +166,13 @@ def test_subagent_replay_flag_reaches_restore_action(tmp_path: Path) -> None:
 
 
 def test_subagent_rollback_registration_rejections(tmp_path: Path) -> None:
-    """受理拒绝面：未开启/缺检查点/已集成/非执行中/代次与作用域不符/键冲突。"""
+    """受理拒绝面：未开启/缺检查点/非执行中/代次与作用域不符/键冲突。"""
     driver = _running_member_driver(tmp_path)
     with pytest.raises(ValueError, match="未开启"):
         bare = build_driver(tmp_path, [_member_node()])
         bare.handle_op("rollback_subagent", _op_args())
     with pytest.raises(ValueError, match="组检查点"):
         driver.handle_op("rollback_subagent", _op_args(checkpoint_id=""))
-    with pytest.raises(ValueError, match="已合并回滚未实现"):
-        passed = _running_member_driver(tmp_path)
-        passed.state.set_node_status("a", "passed")
-        passed.handle_op("rollback_subagent", _op_args())
     with pytest.raises(ValueError, match="执行中节点"):
         stopped = _running_member_driver(tmp_path)
         stopped.state.set_node_status("a", "stopped")
@@ -190,6 +186,20 @@ def test_subagent_rollback_registration_rejections(tmp_path: Path) -> None:
         driver.handle_op("rollback_subagent", _op_args(checkpoint_id="other"))
     with pytest.raises(ValueError, match="节点不存在"):
         driver.handle_op("rollback_subagent", _op_args(node_id="zz"))
+
+
+def test_subagent_rollback_on_passed_propagates_to_integrated_chain(tmp_path: Path) -> None:
+    """命中已集成到根的传播：登记为已合并回滚链（须携带旧根代次）。"""
+    passed = _running_member_driver(tmp_path)
+    passed.state.set_node_status("a", "passed")
+    with pytest.raises(ValueError, match="expected_root_epoch"):
+        passed.handle_op("rollback_subagent", _op_args())
+    result = passed.handle_op(
+        "rollback_subagent", _op_args(expected_root_epoch=1, client_op_id="co-8")
+    )
+    assert result["kind"] == "rollback_integrated"
+    assert result["phase"] == "pending"
+    assert "子代理回滚传播" in result["reason"]
 
 
 def test_subagent_chain_action_failures_fail_operation(tmp_path: Path) -> None:

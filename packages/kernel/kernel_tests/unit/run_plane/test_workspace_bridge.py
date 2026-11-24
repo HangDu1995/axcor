@@ -36,8 +36,10 @@ from workflow_controller.plugin.workspace import (
     AbandonScope,
     CommitScopeTerminal,
     IntegrateScope,
+    IntegrationLineRetracted,
     PrepareScopeWorkspace,
     RestoreCommitted,
+    RetractIntegrationLine,
     ScopeAbandoned,
     ScopeIntegrated,
     ScopeIntegrationRejected,
@@ -862,3 +864,112 @@ async def test_run_api_rollback_op_channel_and_operation_lookup(tmp_path: Path) 
     await h.coord.stop_run(run_id)
     with pytest.raises(RunApiInvalidStateError):
         await api.get_run_operation(run_id, "co-9")
+
+
+def _retraction_plan(
+    work_root: Path,
+    *,
+    bogus_first: bool = False,
+):
+    """双写者集成后回退 node-a 的动作计划（可先注入一次未登记目标的拒绝）。"""
+
+    def plan(driver: ProbeDriver) -> list[RunAction] | None:
+        if _notes_of(driver, IntegrationLineRetracted):
+            return None
+        failures = _notes_of(driver, WorkspaceActionFailed)
+        if failures:
+            return [
+                RetractIntegrationLine(
+                    checkpoint_id="node-a:scope_start:e1",
+                    target_scope_id="node-a",
+                    expected_root_epoch=1,
+                    client_op_id="op-retract-2",
+                    context="node=a",
+                )
+            ]
+        integrated = _notes_of(driver, ScopeIntegrated)
+        if len(integrated) >= 2:
+            checkpoint = "node-a:scope_start:missing" if bogus_first else "node-a:scope_start:e1"
+            return [
+                RetractIntegrationLine(
+                    checkpoint_id=checkpoint,
+                    target_scope_id="node-a",
+                    expected_root_epoch=1,
+                    client_op_id="op-retract-1",
+                    context="node=a",
+                )
+            ]
+        terminals = _notes_of(driver, ScopeTerminalCommitted)
+        if len(terminals) >= 2:
+            return [
+                IntegrateScope(scope_id="node-a", client_op_id="op-i1", context="node=a"),
+                IntegrateScope(scope_id="node-b", client_op_id="op-i2", context="node=b"),
+            ]
+        prepared = _notes_of(driver, ScopeWorkspacePrepared)
+        if len(prepared) >= 2:
+            for note in prepared:
+                (Path(note.workspace_path) / f"{note.scope_id}.md").write_text(
+                    f"from-{note.scope_id}\n", encoding="utf-8"
+                )
+            return [
+                CommitScopeTerminal(scope_id="node-a", client_op_id="op-t1", context="node=a"),
+                CommitScopeTerminal(scope_id="node-b", client_op_id="op-t2", context="node=b"),
+            ]
+        return [
+            PrepareScopeWorkspace(
+                config=_tree_config(work_root),
+                scope_key="node-a",
+                client_op_id="op-p1",
+                context="node=a",
+            ),
+            PrepareScopeWorkspace(
+                config=_tree_config(work_root),
+                scope_key="node-b",
+                client_op_id="op-p2",
+                context="node=b",
+            ),
+        ]
+
+    return plan
+
+
+async def test_integration_retract_retreats_line_and_preserves_sibling(tmp_path: Path) -> None:
+    """已合并回滚经桥执行：线回退到目标基线、同基线兄弟保留、根代次 +1。"""
+    work_root = tmp_path / "root"
+    work_root.mkdir()
+    (work_root / "base.md").write_text("base\n", encoding="utf-8")
+
+    h = BridgeHarness(tmp_path, _retraction_plan(work_root))
+    run_id = await h.start_and_finish()
+
+    retracted = _notes_of(h.driver, IntegrationLineRetracted)
+    assert len(retracted) == 1
+    assert retracted[0].new_root_epoch == 2
+    assert {scope for scope, _epoch in retracted[0].invalidated} == {"node-a"}
+    assert retracted[0].preserved == ("node-b",)
+    # 根检出：目标产出撤回、保留者产出在盘
+    assert not (work_root / "node-a.md").exists()
+    assert (work_root / "node-b.md").read_text(encoding="utf-8") == "from-node-b\n"
+    assert not _notes_of(h.driver, WorkspaceActionFailed)
+    # 私有仓在场、集成线引用即新头
+    repo_dir = work_root / ".workflow-controller" / "scopes" / run_id / "repo.git"
+    assert repo_dir.is_dir()
+
+
+async def test_integration_retract_missing_checkpoint_rejected_zero_change(tmp_path: Path) -> None:
+    """回退目标未在检查点账登记：明确拒绝且零改动（根代次与线未被触碰）。"""
+    work_root = tmp_path / "root"
+    work_root.mkdir()
+    (work_root / "base.md").write_text("base\n", encoding="utf-8")
+
+    h = BridgeHarness(tmp_path, _retraction_plan(work_root, bogus_first=True))
+    await h.start_and_finish()
+
+    failures = _notes_of(h.driver, WorkspaceActionFailed)
+    assert len(failures) == 1
+    assert failures[0].action == "RetractIntegrationLine"
+    assert "未在账本登记" in failures[0].error
+    # 拒绝零改动的判据：同根代次的合法回退随后成功（代次仍为 1）
+    retracted = _notes_of(h.driver, IntegrationLineRetracted)
+    assert len(retracted) == 1
+    assert retracted[0].invalidated and retracted[0].new_root_epoch == 2

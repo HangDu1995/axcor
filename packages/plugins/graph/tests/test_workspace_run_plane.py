@@ -19,9 +19,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+import time
 from typing import TYPE_CHECKING
 
+import pytest
 import yaml
 
 from .run_plane_helpers import GraphRunPlaneEnv, await_run_status
@@ -106,3 +109,72 @@ async def test_parallel_nodes_isolate_then_integrate_into_root(tmp_path: Path) -
         by_scope.setdefault(row["scope_id"], set()).add(row["trigger"])
     assert len(by_scope) == 2
     assert all(triggers == {"scope_start", "terminal"} for triggers in by_scope.values())
+
+
+async def test_crash_recovery_rebuilds_workspace_tree_and_resumes(tmp_path: Path) -> None:
+    """崩溃后重开：树运行时经深度恢复重建（检查点行 + 私有仓事实）后续跑。
+
+    n1 已集成（账面重建保留）、n2 崩溃时在跑（重排走欠账清理：旧作用域
+    废弃、新工作区重跑）；集成线与根检出原样，根代次不变。
+    """
+    env = GraphRunPlaneEnv(tmp_path)
+    yaml_path = _write_traceback_workflow(
+        env.tmp,
+        [
+            {
+                "id": "n1",
+                "task_type": "bash",
+                "command": "echo one > n1.txt",
+                "acceptance": {"enabled": True, "type": "script", "script": "true"},
+            },
+            {
+                "id": "n2",
+                "task_type": "bash",
+                "command": "sleep 300",
+                "acceptance": {"enabled": False},
+            },
+        ],
+    )
+    run_id = await env.start_graph_run(yaml_path=yaml_path)
+
+    deadline = time.monotonic() + 20.0
+    while True:
+        n1 = env.node_info(run_id, "n1")
+        n2 = env.node_info(run_id, "n2")
+        if n1["status"] == "passed" and n2["status"] == "running":
+            break
+        if time.monotonic() > deadline:
+            pytest.fail("崩溃前现场未就绪")
+        await asyncio.sleep(0.05)
+    old_scopes = {s["scope_id"]: s for s in await env.coord.list_run_scopes(run_id)}
+    old_n1 = next(s["scope_id"] for s in old_scopes.values() if s["owner_ref"] == "n1")
+    old_n2 = next(s["scope_id"] for s in old_scopes.values() if s["owner_ref"] == "n2")
+
+    # 模拟 kill -9：弃置环境（无 stop 收尾），同库重装配后 boot 恢复
+    rebooted = GraphRunPlaneEnv(tmp_path)
+    await rebooted.recover()
+
+    # 恢复后 n2 重排：旧作用域经欠账清理废弃、新作用域建区重跑
+    deadline = time.monotonic() + 30.0
+    while True:
+        scopes = {s["scope_id"]: s for s in await rebooted.coord.list_run_scopes(run_id)}
+        new_n2 = [s for sid, s in scopes.items() if s["owner_ref"] == "n2" and sid != old_n2]
+        if new_n2 and scopes[old_n2]["state"] == "discarded":
+            break
+        if time.monotonic() > deadline:
+            pytest.fail("恢复后未完成旧作用域废弃与新工作区重建")
+        await asyncio.sleep(0.05)
+
+    # 账面重建断言：n1 已集成的行保留、根代次不变、n2 旧作用域换代废弃
+    assert scopes[old_n1]["state"] in ("integrated", "released")
+    assert (
+        scopes[old_n1]["integration_base_commit"] == old_scopes[old_n1]["integration_base_commit"]
+    )
+    assert scopes[f"{run_id}-root"]["root_epoch"] == 1
+    assert scopes[old_n2]["scope_epoch"] == 2
+    assert new_n2[0]["state"] == "active"
+
+    await rebooted.coord.stop_run(run_id)
+    # 集成线与根检出经恢复原样：n1 产出仍在
+    work_root = tmp_path / "wd"
+    assert (work_root / "n1.txt").read_text(encoding="utf-8").strip() == "one"

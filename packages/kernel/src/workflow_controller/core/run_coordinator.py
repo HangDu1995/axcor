@@ -119,6 +119,10 @@ from workflow_controller.core.workspace.manifest import (
     RebuildScript,
 )
 from workflow_controller.core.workspace.oplog import SagaOplog
+from workflow_controller.core.workspace.recovery import (
+    WorkspaceRecoveryReport,
+    rebuild_workspace_tree,
+)
 from workflow_controller.driver.hooks import BarrierDeny, BarrierOutcome, BarrierProceed
 from workflow_controller.plugin.dispatch_barrier import (
     COMPAT_LATE_BARRIER,
@@ -161,10 +165,13 @@ from workflow_controller.plugin.workspace import (
     AbandonScope,
     CommitScopeTerminal,
     IntegrateScope,
+    IntegrationLineRetracted,
     PrepareScopeWorkspace,
+    RebuildScriptDecl,
     RestoreCommitted,
     RestoreScope,
     RestoreSessionBound,
+    RetractIntegrationLine,
     ScopeAbandoned,
     ScopeIntegrated,
     ScopeIntegrationRejected,
@@ -866,6 +873,68 @@ def _workspace_branch_of(scope: ScopeRecord) -> str | None:
     return scope.workspace_ref.rpartition("|")[2] or None
 
 
+# 树配置的持久化文件名（住仓树目录；崩溃后非建区动作也能按它重建树）
+_TREE_CONFIG_FILENAME = "tree-config.json"
+
+
+def _persist_tree_config(tree_dir: Path, config: WorkspaceTreeConfig) -> None:
+    """树配置落盘：重开/崩溃后无配置动作（废弃/恢复/回退）的重建依据。"""
+    payload = {
+        "root_dir": config.root_dir,
+        "conflict_policy": config.conflict_policy,
+        "retain_after_merge": config.retain_after_merge,
+        "claims_enforce": config.claims_enforce,
+        "on_no_dispatch_barrier": config.on_no_dispatch_barrier,
+        "background_drain_timeout_s": config.background_drain_timeout_s,
+        "merge": list(config.merge),
+        "writer_local": list(config.writer_local),
+        "shared_readonly": list(config.shared_readonly),
+        "shared_exclusive": list(config.shared_exclusive),
+        "external": list(config.external),
+        "rebuild_scripts": {
+            pathspec: {"cmd": decl.cmd, "verify": decl.verify}
+            for pathspec, decl in config.rebuild_scripts.items()
+        },
+    }
+    tree_dir.mkdir(parents=True, exist_ok=True)
+    (tree_dir / _TREE_CONFIG_FILENAME).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _load_tree_config(work_dir: str | None, run_id: str) -> WorkspaceTreeConfig | None:
+    """读回持久化的树配置；工作目录缺失或未落盘返回 None。"""
+    if not work_dir:
+        return None
+    path = Path(work_dir) / ".workflow-controller" / "scopes" / run_id / _TREE_CONFIG_FILENAME
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return WorkspaceTreeConfig(
+            root_dir=str(payload["root_dir"]),
+            conflict_policy=str(payload.get("conflict_policy", "git_merge")),
+            retain_after_merge=bool(payload.get("retain_after_merge", False)),
+            claims_enforce=bool(payload.get("claims_enforce", False)),
+            on_no_dispatch_barrier=str(payload.get("on_no_dispatch_barrier", "fail")),
+            background_drain_timeout_s=float(payload.get("background_drain_timeout_s", 60.0)),
+            merge=tuple(str(p) for p in payload.get("merge", ())),
+            writer_local=tuple(str(p) for p in payload.get("writer_local", ())),
+            shared_readonly=tuple(str(p) for p in payload.get("shared_readonly", ())),
+            shared_exclusive=tuple(str(p) for p in payload.get("shared_exclusive", ())),
+            external=tuple(str(p) for p in payload.get("external", ())),
+            rebuild_scripts={
+                str(pathspec): RebuildScriptDecl(
+                    cmd=str(decl.get("cmd", "")), verify=str(decl.get("verify", ""))
+                )
+                for pathspec, decl in dict(payload.get("rebuild_scripts", {})).items()
+            },
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        logger.warning("树配置读回失败：%s", path, exc_info=True)
+        return None
+
+
 @dataclass
 class _PendingSubagentRestore:
     """子代理回滚链的待绑定恢复：数据就绪，会话在确认后创建。"""
@@ -885,9 +954,10 @@ def _default_transcript_locator(native_session_id: str, workspace_path: str) -> 
 class _WorkspaceTree:
     """单 run 的工作区树运行时：装配好的管理器与根作用域标识。
 
-    树随首个工作区动作惰性建立；重开或崩溃后的既有仓不在此重建，
-    相应恢复对账属回滚能力接线，当前一律显式失败。检查点账本与
-    run 记账库同库（表经统一迁移铺设），随树装配接线。
+    树随首个工作区动作惰性建立；重开或崩溃后的既有仓经深度恢复重建
+    账本（作用域/两层代次/状态按检查点行与私有仓事实推断、操作日志
+    三态核对），对不上账显式失败。检查点账本与 run 记账库同库（表经
+    统一迁移铺设），随树装配接线。
     """
 
     def __init__(
@@ -905,15 +975,22 @@ class _WorkspaceTree:
         """
         repository = WorkspaceRepository(Path(config.root_dir), tree_id=run_id)
         self.tree_dir = repository.tree_dir
+        self.repository = repository
         self.replay_ledger = DispatchReplayLedger(repository.tree_dir / "dispatch")
+        scope_tree = ScopeTree()
+        oplog = SagaOplog(repository.tree_dir)
+        integration = IntegrationCoordinator(
+            repository, conflict_policy=ConflictPolicy(config.conflict_policy)
+        )
+        self.scope_tree = scope_tree
+        self.oplog = oplog
+        self.integration = integration
         self.manager = WorkspaceManager(
             repository=repository,
-            scope_tree=ScopeTree(),
-            oplog=SagaOplog(repository.tree_dir),
+            scope_tree=scope_tree,
+            oplog=oplog,
             manifest=_tree_manifest(config),
-            integration_coordinator=IntegrationCoordinator(
-                repository, conflict_policy=ConflictPolicy(config.conflict_policy)
-            ),
+            integration_coordinator=integration,
             drain_background_writers=drain_background_writers,
             claims_enforce=config.claims_enforce,
         )
@@ -923,12 +1000,33 @@ class _WorkspaceTree:
         self.on_no_dispatch_barrier = config.on_no_dispatch_barrier
         self.barrier_wait_timeout_s = config.background_drain_timeout_s
         self.root_scope_id = f"{run_id}-root"
+        self._config = config
         self._child_seq = 0
         # 子代理回滚链的待绑定恢复数据（scope_id → 恢复事实与已绑定会话）
         self.pending_restores: dict[str, _PendingSubagentRestore] = {}
+        # 深度恢复结论（仅经恢复路径建立时非空，供日志与观测）
+        self.recovery_report: WorkspaceRecoveryReport | None = None
 
     async def initialize(self) -> None:
-        """导入基线并建根作用域；私有仓已存在时显式失败。"""
+        """建立根作用域并持久化树配置；私有仓已存在时走深度恢复重建账本。"""
+        if self.repository.repo_dir.exists():
+            self.recovery_report = await rebuild_workspace_tree(
+                repository=self.repository,
+                scope_tree=self.scope_tree,
+                integration=self.integration,
+                manager=self.manager,
+                checkpoints=self.checkpoints,
+                oplog=self.oplog,
+                root_scope_id=self.root_scope_id,
+            )
+            if self.recovery_report.degraded:
+                logger.warning(
+                    "工作区树 %s 深度恢复降级项：%s",
+                    self.root_scope_id,
+                    "；".join(self.recovery_report.degraded),
+                )
+            return
+        _persist_tree_config(self.repository.tree_dir, self._config)
         await self.manager.initialize_root(scope_id=self.root_scope_id)
 
     def next_child_identity(self, parent_scope_id: str) -> tuple[str, str]:
@@ -2606,10 +2704,40 @@ class RunCoordinator:
         if isinstance(action, RestoreScope):
             await self._execute_workspace_restore(rt, action)
             return True
+        if isinstance(action, RetractIntegrationLine):
+            await self._execute_integration_retract(rt, action)
+            return True
         if isinstance(action, RestoreCommitted):
             await self._execute_restore_commit(rt, action)
             return True
         return False
+
+    async def _ensure_workspace_tree(
+        self, rt: RunRuntime, config: WorkspaceTreeConfig | None = None
+    ) -> _WorkspaceTree | None:
+        """取本 run 的工作区树；缺席时按持久化配置（或建区携带的配置）重建。
+
+        建区动作携带完整配置，可全新初始化；其余动作（废弃/恢复/回退）
+        不携带配置，只能依据仓树目录里持久化的配置经深度恢复重建——
+        两者都不可得时返回 None（按无树失败回执）。
+        """
+        tree = self._workspace_trees.get(rt.run_id)
+        if tree is not None:
+            return tree
+        if config is None:
+            run = await self._run_store.get(rt.run_id)
+            config = _load_tree_config(run.work_dir, rt.run_id)
+            if config is None:
+                return None
+        tree = _WorkspaceTree(
+            config,
+            rt.run_id,
+            CheckpointStore(self._run_store.db_path),
+            drain_background_writers=self._workspace_drain_hook,
+        )
+        await tree.initialize()
+        self._workspace_trees[rt.run_id] = tree
+        return tree
 
     async def _execute_workspace_prepare(
         self, rt: RunRuntime, action: PrepareScopeWorkspace
@@ -2620,16 +2748,7 @@ class RunCoordinator:
         检查点行 → 建区回执发布；任一步失败按动作失败回执，不发布半成品。
         """
         try:
-            tree = self._workspace_trees.get(rt.run_id)
-            if tree is None:
-                tree = _WorkspaceTree(
-                    action.config,
-                    rt.run_id,
-                    CheckpointStore(self._run_store.db_path),
-                    drain_background_writers=self._workspace_drain_hook,
-                )
-                await tree.initialize()
-                self._workspace_trees[rt.run_id] = tree
+            tree = await self._ensure_workspace_tree(rt, action.config)
             orchestration_ref = await self._persist_orchestration_ref(rt)
             scope_kind = _WORKSPACE_SCOPE_KINDS.get(action.scope_kind)
             if scope_kind is None:
@@ -2688,6 +2807,7 @@ class RunCoordinator:
             | IntegrateScope
             | AbandonScope
             | RestoreScope
+            | RetractIntegrationLine
             | RestoreCommitted
         ),
         *,
@@ -2747,7 +2867,7 @@ class RunCoordinator:
         持久化顺序与建区同构：编排状态版本 → 文件终态提交 → 检查点行 →
         发布；回执到达前编排层不得启动验收单元。
         """
-        tree = self._workspace_trees.get(rt.run_id)
+        tree = await self._ensure_workspace_tree(rt)
         if tree is None:
             self._notify(
                 rt.run_id,
@@ -2790,7 +2910,7 @@ class RunCoordinator:
 
     async def _execute_workspace_integrate(self, rt: RunRuntime, action: IntegrateScope) -> None:
         """执行集成：父闸门内串行集成，成功默认释放工作区，冲突显式拒绝。"""
-        tree = self._workspace_trees.get(rt.run_id)
+        tree = await self._ensure_workspace_tree(rt)
         if tree is None:
             self._notify(
                 rt.run_id,
@@ -2908,7 +3028,7 @@ class RunCoordinator:
 
     async def _execute_workspace_abandon(self, rt: RunRuntime, action: AbandonScope) -> None:
         """执行废弃：移除作用域及后代工作区并各自换代。"""
-        tree = self._workspace_trees.get(rt.run_id)
+        tree = await self._ensure_workspace_tree(rt)
         if tree is None:
             self._notify(
                 rt.run_id,
@@ -2948,7 +3068,7 @@ class RunCoordinator:
         新 session——编排层持久化失效状态（RestoreCommitted）之后才创建
         绑定。检查点须为该父作用域的组检查点行（before_child + 组行）。
         """
-        tree = self._workspace_trees.get(rt.run_id)
+        tree = await self._ensure_workspace_tree(rt)
         if tree is None:
             self._notify(
                 rt.run_id,
@@ -3019,6 +3139,60 @@ class RunCoordinator:
                 new_scope_epoch=restored.new_scope_epoch,
                 checkpoint_id=action.checkpoint_id,
                 abandoned_descendants=restored.abandoned_descendants,
+                context=action.context,
+            ),
+        )
+
+    async def _execute_integration_retract(
+        self, rt: RunRuntime, action: RetractIntegrationLine
+    ) -> None:
+        """执行集成线回退：目标检查点先校验登记，先校验后 reset 回退。
+
+        检查点须为目标作用域的 scope_start 行（建区时的集成头即回退
+        目标提交）；回退结果以失效/保留划分回投，编排层据此重排失效
+        集并保留保留者。
+        """
+        tree = await self._ensure_workspace_tree(rt)
+        if tree is None:
+            self._notify(
+                rt.run_id,
+                WorkspaceActionFailed(
+                    action="RetractIntegrationLine",
+                    client_op_id=action.client_op_id,
+                    error=f"run {rt.run_id} 无工作区树",
+                    context=action.context,
+                ),
+            )
+            return
+        try:
+            checkpoint = await tree.checkpoints.get(action.checkpoint_id)
+            if checkpoint is None:
+                raise ValueError(f"回退目标检查点未在账本登记：{action.checkpoint_id}")
+            if checkpoint.trigger is not CheckpointTrigger.SCOPE_START:
+                raise ValueError(f"回退目标须为 scope_start 检查点：{action.checkpoint_id}")
+            if checkpoint.scope_id != action.target_scope_id:
+                raise ValueError(
+                    f"检查点不属于回退目标作用域：{action.checkpoint_id}（{checkpoint.scope_id}）"
+                )
+            if not checkpoint.integration_commit:
+                raise ValueError(f"检查点缺少集成提交引用：{action.checkpoint_id}")
+            result = await tree.manager.retract_integration_line(
+                target_scope_id=action.target_scope_id,
+                target_commit=checkpoint.integration_commit,
+                expected_root_epoch=action.expected_root_epoch,
+                client_op_id=action.client_op_id,
+            )
+        except Exception as e:
+            await self._reply_workspace_failure(rt, action, error=e)
+            return
+        self._notify(
+            rt.run_id,
+            IntegrationLineRetracted(
+                new_root_head=result.new_root_head,
+                new_root_epoch=result.new_root_epoch,
+                target_commit=result.target_commit,
+                invalidated=result.invalidated,
+                preserved=result.preserved,
                 context=action.context,
             ),
         )

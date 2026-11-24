@@ -17,11 +17,12 @@
 节点执行建模为阶段机：成员出生/等待、进程执行、产物读取与终态裁决全部
 经 run 平面动作派发，执行结果以通知回投推进阶段迁移。决策数学（就绪/
 传播/回滚/验收判定/提示词）在包内纯函数模块；本模块只持步进状态。
-未合并节点回滚走异步确认链：op 只登记操作账并立即返回 operation_id，
-AbandonScope → ScopeAbandoned → 失效计划落账 → RestoreCommitted →
-新工作区就绪的每一步都由 decide 驱动、回执接力。当前定义换装走
-reload_definition op：工厂侧翻译成载荷、暂停态下纯换装，节点状态与
-运行档案原样保留。
+回滚走异步确认链且按 kind 隔离三条：未合并链（AbandonScope → 失效计
+划 → 重建）、子代理链（RestoreScope → 绑定恢复会话）、已合并链
+（RetractIntegrationLine 集成线回退 → 谱系失效集重排、保留者不重跑），
+op 只登记操作账并立即返回 operation_id，每一步都由 decide 驱动、回执
+接力。当前定义换装走 reload_definition op：工厂侧翻译成载荷、暂停态
+下纯换装，节点状态与运行档案原样保留。
 """
 
 from __future__ import annotations
@@ -75,11 +76,13 @@ from workflow_controller.plugin.workspace import (
     AbandonScope,
     CommitScopeTerminal,
     IntegrateScope,
+    IntegrationLineRetracted,
     PrepareScopeWorkspace,
     RebuildScriptDecl,
     RestoreCommitted,
     RestoreScope,
     RestoreSessionBound,
+    RetractIntegrationLine,
     ScopeAbandoned,
     ScopeIntegrated,
     ScopeIntegrationRejected,
@@ -285,12 +288,14 @@ _TIMER_VERIFY_SCRIPT = "verify_script"
 _TIMER_VERDICT = "verdict"
 
 # 回滚操作阶段：登记 → 废弃中（等 ScopeAbandoned）→ 重建中（等新工作区）→ 终态；
-# 子代理链：登记 → 恢复中（等 ScopeRestored）→ 绑定中（等 RestoreSessionBound）
+# 子代理链：登记 → 恢复中（等 ScopeRestored）→ 绑定中（等 RestoreSessionBound）；
+# 已合并链：登记 → 回退中（等 IntegrationLineRetracted）→ 重建中（等新工作区）
 _OP_PENDING = "pending"
 _OP_ABANDONING = "abandoning"
 _OP_REBUILDING = "rebuilding"
 _OP_RESTORING = "restoring"
 _OP_BINDING = "binding"
+_OP_RETRACTING = "retracting"
 _OP_SUCCEEDED = "succeeded"
 _OP_FAILED = "failed"
 
@@ -371,8 +376,7 @@ class GraphDriver:
         self._main_node_ids = frozenset(program.dag.all_ids())
         self._state = state
         self._work_dir = work_dir
-        self._yaml_path = yaml_path
-        # 原始入参变量（翻译产物不可逆推，恢复按原入参重翻译）
+        self._yaml_path = yaml_path  # 原始入参变量（翻译产物不可逆推，恢复按原入参重翻译）
         self._input_variables = dict(input_variables or {})
         # 相对 agents 资源的解析基准（快照往返；直连 run 为原始程序目录）
         self._agents_dir_base = agents_dir_base
@@ -599,6 +603,7 @@ class GraphDriver:
         """显式重开检查整图；普通崩溃仅恢复被中断的 running 节点。"""
         self._demote_abandoning_restore_ops()
         self._demote_restoring_subagent_ops()
+        self._demote_retracting_restore_ops()
         # 在途绑定确认是否送达未知：恢复后重发（宿主侧幂等）
         self._binding_confirmed.clear()
         if not running:
@@ -724,6 +729,7 @@ class GraphDriver:
             "applied_reopen_at": self._applied_reopen_at,
             # 未设置项不落键：键集即「已显式配置」的事实
             "options": {k: v for k, v in self.runtime_options().items() if v is not None},
+            "workspace_seq": self._workspace_seq,
             "state": {
                 "nodes": snap.get("nodes", {}),
                 "rollbacks": snap.get("rollbacks", {}),
@@ -733,6 +739,10 @@ class GraphDriver:
             },
             "pending_timers": [],
         }
+
+    def resume_workspace_seq(self, value: int) -> None:
+        """恢复快照里的建区序号：重开后的动作号/作用域键不与既有账撞号。"""
+        self._workspace_seq = max(self._workspace_seq, int(value))
 
     def bind_checkpoint(self, emit: Callable[[PersistDriverState], None]) -> None:
         """通过宿主动作端口同步提交节点状态，不直接接触存储。"""
@@ -885,6 +895,8 @@ class GraphDriver:
             self._on_workspace_abandoned(note, actions)
         elif isinstance(note, ScopeRestored):
             self._on_scope_restored(note, actions)
+        elif isinstance(note, IntegrationLineRetracted):
+            self._on_integration_retracted(note, actions)
         elif isinstance(note, RestoreSessionBound):
             self._on_restore_session_bound(note)
         elif isinstance(note, ScopeTerminalCommitted):
@@ -2429,9 +2441,10 @@ class GraphDriver:
         """回滚 op 受理：只登记操作账并立即返回 operation_id，不做任何 I/O。
 
         幂等键为 client_op_id：重复请求返回原 operation_id 与当前状态；
-        同键不同目标/检查点返回冲突错误。traceback 未开启、显式命中已
-        集成目标（已合并回滚未实现）、目标无在册作用域（无有效检查点）、
-        expected_epoch 或 scope_id 不符均明确拒绝。
+        同键不同目标/检查点返回冲突错误。traceback 未开启、目标无在册
+        作用域（无有效检查点）、expected_epoch 或 scope_id 不符均明确
+        拒绝；目标已集成（passed）走已合并回滚链（集成线回退，须另携
+        带旧根代次 expected_root_epoch）。
         """
         if self._workspace_config is None:
             raise ValueError("traceback workspace 未开启，拒绝文件回滚")
@@ -2442,15 +2455,26 @@ class GraphDriver:
             raise ValueError("client_op_id 不能为空")
         if self._dag_node(node_id) is None:
             raise ValueError(f"节点不存在：{node_id}")
+        # 幂等重放先于一切在册性校验：链完成后目标已换映射/代次，仍须返回原记录
         existing = self._state.operation_by_client(client_op_id)
         if existing is not None:
-            if existing.get("node_id") != node_id or existing.get("checkpoint_id") != checkpoint_id:
+            stored_checkpoint = existing.get("checkpoint_id") or ""
+            if existing.get("node_id") != node_id or (
+                checkpoint_id and checkpoint_id != stored_checkpoint
+            ):
                 raise ValueError(
                     f"client_op_id 冲突：{client_op_id} 已绑定 {existing.get('node_id')} 的回滚请求"
                 )
             return self._operation_view(existing)
         if self._state.status(node_id) == "passed":
-            raise ValueError(f"目标已集成（passed）：{node_id}，已合并回滚未实现")
+            return self._register_integrated_rollback_op(
+                client_op_id=client_op_id,
+                node_id=node_id,
+                checkpoint_id=checkpoint_id,
+                expected_epoch=args.get("expected_epoch"),
+                expected_root_epoch=args.get("expected_root_epoch"),
+                reason=str(args.get("reason") or "") or "已合并回滚",
+            )
         mapping = self._state.node_workspace(node_id)
         if mapping is None:
             raise ValueError(f"目标无有效检查点（节点无在册作用域）：{node_id}")
@@ -2489,6 +2513,73 @@ class GraphDriver:
         )
         return self._operation_view(record)
 
+    def _register_integrated_rollback_op(
+        self,
+        *,
+        client_op_id: str,
+        node_id: str,
+        checkpoint_id: str,
+        expected_epoch: Any,
+        expected_root_epoch: Any,
+        reason: str,
+    ) -> dict[str, Any]:
+        """已合并回滚 op 受理：集成线回退链登记（目标须 passed）。
+
+        回退目标取节点当前作用域的 scope_start 检查点（建区时的集成
+        头）；显式给出的 checkpoint_id 须为同一作用域的 scope_start 行。
+        子代理回滚命中已集成目标时同样经此传播（组检查点撤回已不可
+        行，回退整节点的集成为等价传播面）。
+        """
+        mapping = self._state.node_workspace(node_id)
+        if mapping is None:
+            raise ValueError(f"目标无有效检查点（节点无在册作用域）：{node_id}")
+        if not isinstance(expected_epoch, int) or isinstance(expected_epoch, bool):
+            raise ValueError("expected_epoch 需为整数")
+        if expected_epoch != mapping[1]:
+            raise ValueError(f"expected_epoch 不匹配：当前作用域代次 {mapping[1]}")
+        default_checkpoint = f"{mapping[0]}:scope_start:e{mapping[1]}"
+        if checkpoint_id:
+            if not checkpoint_id.startswith(f"{mapping[0]}:scope_start:"):
+                raise ValueError(
+                    f"已合并回滚目标须为节点作用域的 scope_start 检查点：{checkpoint_id}"
+                )
+        else:
+            checkpoint_id = default_checkpoint
+        if not isinstance(expected_root_epoch, int) or isinstance(expected_root_epoch, bool):
+            raise ValueError("已合并回滚须携带旧根代次 expected_root_epoch（整数）")
+        if expected_root_epoch < 1:
+            raise ValueError("expected_root_epoch 不得小于 1")
+        scope_id = mapping[0]
+        now = datetime.now(tz=UTC).isoformat()
+        record: dict[str, Any] = {
+            "operation_id": client_op_id,
+            "client_op_id": client_op_id,
+            "kind": "rollback_integrated",
+            "node_id": node_id,
+            "scope_id": scope_id,
+            "scope_epoch": expected_epoch,
+            "checkpoint_id": checkpoint_id,
+            "expected_gen": self._state.gen(node_id),
+            "expected_root_epoch": expected_root_epoch,
+            "reason": reason,
+            "phase": _OP_PENDING,
+            "error": "",
+            "new_gen": 0,
+            "new_root_epoch": 0,
+            "created_at": now,
+            "updated_at": now,
+        }
+        self._state.upsert_operation(record)
+        logger.info(
+            "integrated rollback op %s registered for node %s (scope %s e%s, root e%s)",
+            client_op_id,
+            node_id,
+            scope_id,
+            expected_epoch,
+            expected_root_epoch,
+        )
+        return self._operation_view(record)
+
     def _operation_status(self, operation_id: str) -> dict[str, Any]:
         """操作状态查询（经 get_operation op）；不存在显式报错。"""
         record = self._state.operation(operation_id)
@@ -2509,6 +2600,7 @@ class GraphDriver:
             "phase": record.get("phase", ""),
             "error": record.get("error") or None,
             "new_gen": int(record.get("new_gen", 0) or 0),
+            "new_root_epoch": int(record.get("new_root_epoch", 0) or 0),
             "reason": record.get("reason", ""),
             "created_at": record.get("created_at"),
             "updated_at": record.get("updated_at"),
@@ -2518,36 +2610,94 @@ class GraphDriver:
         """推进回滚操作链：登记态请求经在册性核验后发出废弃动作。
 
         映射或代次已被他者改变（重试清欠账、并发回滚）时操作置失败，
-        不静默吞。
+        不静默吞。已合并链在登记态发集成线回退动作。
         """
         for record in self._state.operations().values():
-            if record.get("phase") != _OP_PENDING or record.get("kind") != "rollback_node":
+            if record.get("phase") != _OP_PENDING:
                 continue
-            node_id = record["node_id"]
-            mapping = self._state.node_workspace(node_id)
-            if (
-                mapping is None
-                or mapping[0] != record["scope_id"]
-                or mapping[1] != record["scope_epoch"]
-            ):
-                self._fail_operation(record, "目标作用域映射已变化（重试或其他回滚先行）")
-                continue
-            if self._state.gen(node_id) != record["expected_gen"]:
-                self._fail_operation(record, "目标节点代次已变化（其他回滚先行）")
-                continue
+            kind = record.get("kind")
+            if kind == "rollback_node":
+                self._advance_unmerged_restore_op(record, actions)
+            elif kind == "rollback_integrated":
+                self._advance_integrated_restore_op(record, actions)
+
+    def _advance_unmerged_restore_op(
+        self, record: dict[str, Any], actions: list[RunAction]
+    ) -> None:
+        """未合并链的登记态推进：核验映射与代次后发废弃动作。"""
+        node_id = record["node_id"]
+        mapping = self._state.node_workspace(node_id)
+        if (
+            mapping is None
+            or mapping[0] != record["scope_id"]
+            or mapping[1] != record["scope_epoch"]
+        ):
+            self._fail_operation(record, "目标作用域映射已变化（重试或其他回滚先行）")
+            return
+        if self._state.gen(node_id) != record["expected_gen"]:
+            self._fail_operation(record, "目标节点代次已变化（其他回滚先行）")
+            return
+        self._workspace_seq += 1
+        record["phase"] = _OP_ABANDONING
+        record["abandon_op_id"] = f"rb-abandon-{self._workspace_seq}"
+        record["updated_at"] = datetime.now(tz=UTC).isoformat()
+        self._state.upsert_operation(record)
+        actions.append(
+            AbandonScope(
+                scope_id=mapping[0],
+                expected_scope_epoch=mapping[1],
+                client_op_id=record["abandon_op_id"],
+                context=f"node={node_id}",
+            )
+        )
+
+    def _advance_integrated_restore_op(
+        self, record: dict[str, Any], actions: list[RunAction]
+    ) -> None:
+        """已合并链的登记态推进：核验映射与代次后发集成线回退动作。
+
+        回退动作的操作号在记录内保持稳定——崩溃退回登记态重发时命中
+        核心侧同操作号的幂等缓存，不产生第二次回退。
+        """
+        node_id = record["node_id"]
+        mapping = self._state.node_workspace(node_id)
+        if (
+            mapping is None
+            or mapping[0] != record["scope_id"]
+            or mapping[1] != record["scope_epoch"]
+        ):
+            self._fail_operation(record, "目标作用域映射已变化（重试或其他回滚先行）")
+            return
+        if self._state.gen(node_id) != record["expected_gen"]:
+            self._fail_operation(record, "目标节点代次已变化（其他回滚先行）")
+            return
+        if not record.get("retract_op_id"):
             self._workspace_seq += 1
-            record["phase"] = _OP_ABANDONING
-            record["abandon_op_id"] = f"rb-abandon-{self._workspace_seq}"
+            record["retract_op_id"] = f"rb-retract-{self._workspace_seq}"
+        record["phase"] = _OP_RETRACTING
+        record["updated_at"] = datetime.now(tz=UTC).isoformat()
+        self._state.upsert_operation(record)
+        actions.append(
+            RetractIntegrationLine(
+                checkpoint_id=record["checkpoint_id"],
+                target_scope_id=record["scope_id"],
+                expected_root_epoch=int(record["expected_root_epoch"]),
+                client_op_id=record["retract_op_id"],
+                context=f"node={node_id}",
+            )
+        )
+
+    def _demote_retracting_restore_ops(self) -> None:
+        """恢复时把回退中相位退回登记态：重发按稳定操作号幂等——核心
+        侧已收口则返回原结果，未生效则照常执行。"""
+        for record in self._state.operations().values():
+            if record.get("kind") != "rollback_integrated":
+                continue
+            if record.get("phase") != _OP_RETRACTING:
+                continue
+            record["phase"] = _OP_PENDING
             record["updated_at"] = datetime.now(tz=UTC).isoformat()
             self._state.upsert_operation(record)
-            actions.append(
-                AbandonScope(
-                    scope_id=mapping[0],
-                    expected_scope_epoch=mapping[1],
-                    client_op_id=record["abandon_op_id"],
-                    context=f"node={node_id}",
-                )
-            )
 
     def _demote_abandoning_restore_ops(self) -> None:
         """恢复时把在途废弃相位退回登记态：崩溃窗内废弃是否已执行未知，
@@ -2669,6 +2819,105 @@ class GraphDriver:
                 record.get("new_gen"),
             )
 
+    def _on_integration_retracted(
+        self, note: IntegrationLineRetracted, actions: list[RunAction]
+    ) -> None:
+        """集成线回退回执：失效集落账重排、保留者不动，链进重建相。
+
+        失效节点按核心谱系划分解析（作用域 → 节点映射），reset 集即
+        失效节点集合而非 DAG 后代闭包——谱系不含目标的写者保持 passed
+        不重跑。
+        """
+        for record in self._state.operations().values():
+            if record.get("kind") != "rollback_integrated" or record.get("phase") != _OP_RETRACTING:
+                continue
+            if note.context != f"node={record['node_id']}":
+                continue
+            if note.new_root_epoch != int(record.get("expected_root_epoch", 0)) + 1:
+                self._fail_operation(record, f"集成线回退回执根代次异常：{note.new_root_epoch}")
+                return
+            invalidated_scopes = {scope_id for scope_id, _epoch in note.invalidated}
+            invalidated_nodes = {
+                node_id
+                for node_id, info in self._state.snapshot()["nodes"].items()
+                if (mapping := self._state.node_workspace(node_id))
+                and mapping[0] in invalidated_scopes
+            }
+            if record["node_id"] not in invalidated_nodes:
+                self._fail_operation(record, "回退回执的失效集不含目标作用域（谱系对不上账）")
+                return
+            plan = scheduler.plan_integrated_restore(
+                self._state,
+                self._dag,
+                record["node_id"],
+                scheduler.RollbackReason(
+                    trigger_node=record["node_id"],
+                    text=record.get("reason") or "已合并回滚",
+                ),
+                int(record["expected_gen"]),
+                invalidated_nodes,
+            )
+            if plan is None:
+                self._fail_operation(record, "回滚计划陈旧：目标代次已变化")
+                return
+            self._apply_integrated_restore_plan(record, plan, note, actions)
+            return
+
+    def _apply_integrated_restore_plan(
+        self,
+        record: dict[str, Any],
+        plan: scheduler.RollbackPlan,
+        note: IntegrationLineRetracted,
+        actions: list[RunAction],
+    ) -> None:
+        """已合并回滚失效计划落账：失效节点重排新代、保留者零变化。
+
+        失效作用域已由核心废弃（scope epoch+1、工作区移除），档案映射
+        全清防重排起步的欠账清理再次废弃；保留节点不动（passed 保持、
+        映射与检查点原样）。
+        """
+        snapshot = self._state.snapshot()
+        stop_sids = [
+            sid
+            for nid in plan.stop_nodes
+            if (sid := snapshot["nodes"].get(nid, {}).get("workflow_controller_session_id"))
+        ]
+        if stop_sids:
+            actions.append(AwaitSessions(ids=tuple(stop_sids), timeout_s=0))
+        scheduler.apply_rollback(self._state, self._dag, plan)
+        for nid in plan.reset_nodes:
+            reset_act = self._nodes.pop(nid, None)
+            if reset_act is not None:
+                self._cancel_timer(reset_act, actions)
+            self._last_verify_reason.pop(nid, None)
+            self._state.clear_node_workspace(nid)
+        self._emit_graph_event(
+            actions,
+            "node_rollback",
+            node_id=plan.target,
+            rollback_to=plan.target,
+            reason=plan.reason,
+            invalidated=[scope for scope, _epoch in note.invalidated],
+            preserved=list(note.preserved),
+            new_root_epoch=note.new_root_epoch,
+        )
+        actions.append(
+            RestoreCommitted(
+                scope_id=record["scope_id"],
+                client_op_id=record["operation_id"],
+                context=f"node={plan.target}",
+            )
+        )
+        record["phase"] = _OP_REBUILDING
+        record["new_gen"] = plan.new_gen
+        record["new_root_epoch"] = note.new_root_epoch
+        record["updated_at"] = datetime.now(tz=UTC).isoformat()
+        self._state.upsert_operation(record)
+        self._set_graph_status(
+            actions,
+            scheduler.derive_status_after_rollback(self._state.snapshot()),
+        )
+
     def _fail_restore_op_on_action_failure(self, note: WorkspaceActionFailed) -> None:
         """回滚链上的动作失败置操作失败：按链内动作号/节点精确对账。"""
         node_id = ""
@@ -2695,6 +2944,12 @@ class GraphDriver:
             ):
                 self._fail_operation(record, f"组检查点恢复失败: {note.error}")
             elif (
+                phase == _OP_RETRACTING
+                and note.action == "RetractIntegrationLine"
+                and note.client_op_id == record.get("retract_op_id")
+            ):
+                self._fail_operation(record, f"集成线回退失败: {note.error}")
+            elif (
                 phase == _OP_BINDING
                 and note.action == "RestoreCommitted"
                 and note.client_op_id == record.get("operation_id")
@@ -2707,7 +2962,7 @@ class GraphDriver:
         """子代理回滚 op 受理：只登记操作账并立即返回 operation_id。
 
         回滚目标为派发组检查点（组恢复点行）；已集成到根（节点 passed）
-        的传播按已合并回滚处理，S4c 前明确拒绝。replay_dispatch 的「单
+        的传播按已合并回滚链受理（集成线回退）。replay_dispatch 的「单
         task、无其他副作用」校验在宿主侧（组副作用台账），受理面只透传。
         """
         if self._workspace_config is None:
@@ -2723,14 +2978,24 @@ class GraphDriver:
             raise ValueError(f"节点不存在：{node_id}")
         existing = self._state.operation_by_client(client_op_id)
         if existing is not None:
-            if existing.get("kind") != "rollback_subagent" or (
-                existing.get("node_id") != node_id or existing.get("checkpoint_id") != checkpoint_id
+            if existing.get("node_id") != node_id or (
+                checkpoint_id and checkpoint_id != (existing.get("checkpoint_id") or "")
             ):
                 raise ValueError(f"client_op_id 冲突：{client_op_id} 已绑定其他回滚请求")
             return self._operation_view(existing)
         if self._state.status(node_id) == "passed":
-            raise ValueError(
-                f"目标已集成（passed）：{node_id}，子代理修改已合并到根，已合并回滚未实现"
+            # 已集成到根：组检查点撤回已不可行，按集成线回退传播（回退
+            # 目标为节点建区基线，撤回整节点的集成即等价传播面）
+            return self._register_integrated_rollback_op(
+                client_op_id=client_op_id,
+                node_id=node_id,
+                checkpoint_id="",
+                expected_epoch=args.get("expected_epoch"),
+                expected_root_epoch=args.get("expected_root_epoch"),
+                reason=(
+                    f"子代理回滚传播（原组检查点 {checkpoint_id}）："
+                    + (str(args.get("reason") or "") or "子代理回滚")
+                ),
             )
         if self._state.status(node_id) != "running":
             raise ValueError(

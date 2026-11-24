@@ -35,11 +35,13 @@ __all__ = [
     "AbandonScope",
     "CommitScopeTerminal",
     "IntegrateScope",
+    "IntegrationLineRetracted",
     "PrepareScopeWorkspace",
     "RebuildScriptDecl",
     "RestoreCommitted",
     "RestoreScope",
     "RestoreSessionBound",
+    "RetractIntegrationLine",
     "ScopeAbandoned",
     "ScopeIntegrated",
     "ScopeIntegrationRejected",
@@ -175,6 +177,22 @@ class RestoreScope(RunAction):
 
 
 @dataclass(frozen=True)
+class RetractIntegrationLine(RunAction):
+    """集成线回退动作：宿主回退集成线到目标检查点的集成提交。
+
+    先校验后 reset（目标已登记、属当前集成线、是当前头祖先、区间不
+    含自建路径变更），保留者按原集成序换序重放，根代次 +1、失效作
+    用域废弃；expected_root_epoch 为旧根代次，不匹配拒绝。
+    """
+
+    checkpoint_id: str
+    target_scope_id: str
+    expected_root_epoch: int
+    client_op_id: str
+    context: str | None = None
+
+
+@dataclass(frozen=True)
 class ScopeRestored(RunNotification):
     """组检查点恢复完成通知：新代次、一并废弃的后代与恢复数据就绪。"""
 
@@ -182,6 +200,22 @@ class ScopeRestored(RunNotification):
     new_scope_epoch: int
     checkpoint_id: str
     abandoned_descendants: tuple[tuple[str, int], ...] = ()
+    context: str | None = None
+
+
+@dataclass(frozen=True)
+class IntegrationLineRetracted(RunNotification):
+    """集成线回退完成通知：新线头、新根代次与失效/保留划分。
+
+    invalidated 为失效作用域及其新代次（目标在列），preserved 为按
+    原集成序重放的保留者（不重跑）。
+    """
+
+    new_root_head: str
+    new_root_epoch: int
+    target_commit: str
+    invalidated: tuple[tuple[str, int], ...] = ()
+    preserved: tuple[str, ...] = ()
     context: str | None = None
 
 

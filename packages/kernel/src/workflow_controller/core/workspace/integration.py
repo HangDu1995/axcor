@@ -19,7 +19,9 @@
 工作区释放。判定以写者建区时的集成头为公共基准、限定 merge 路径集：
 双方变更路径集不相交则按路径构造集成树；相交时按档位处理——可合并
 档走三方合并（干净则并入集成树）、严格档直接判冲突。冲突结果携带
-冲突路径与双方身份。集成树只前进不回退。
+冲突路径与双方身份。集成线只前进不回退；已合并回滚的集成线回退与
+保留者换序重放也经本模块：回退链先在对象库内构造完成、再一次性
+推进根引用与根检出，失败时引用不动。
 """
 
 from __future__ import annotations
@@ -32,6 +34,9 @@ import uuid
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
+
+from workflow_controller.core.workspace.oplog import CommitFacts, operation_marker
+from workflow_controller.core.workspace.repository import ROOT_INTEGRATION_REF
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -46,6 +51,7 @@ __all__ = [
     "IntegrationCoordinator",
     "IntegrationCoordinatorError",
     "IntegrationSuccess",
+    "ReplayStep",
     "WorkspaceTarget",
 ]
 
@@ -114,6 +120,15 @@ class IntegrationSuccess:
 
     new_head: str
     integrated_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ReplayStep:
+    """换序重放的一个保留者：建区基线与其终态提交。"""
+
+    scope_id: str
+    base_commit: str
+    head_commit: str
 
 
 class IntegrationCoordinator:
@@ -211,6 +226,110 @@ class IntegrationCoordinator:
             ["diff", "--name-only", "-z", "--no-renames", base, head, "--", *pathspecs]
         )
         return [path for path in out.split("\0") if path]
+
+    async def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        """谱系判定：ancestor 是否为 descendant 的祖先（含相等）。"""
+        proc = await self._start_repo_git(["merge-base", "--is-ancestor", ancestor, descendant])
+        await proc.communicate()
+        if proc.returncode == 0:
+            return True
+        if proc.returncode == 1:
+            return False
+        raise IntegrationCoordinatorError(
+            f"git merge-base --is-ancestor 失败（rc={proc.returncode}）：{ancestor} → {descendant}"
+        )
+
+    async def commit_exists(self, commit: str) -> bool:
+        """提交对象是否存在于私有仓。"""
+        proc = await self._start_repo_git(
+            ["rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"]
+        )
+        await proc.communicate()
+        return proc.returncode == 0
+
+    async def read_commit_facts(self, commit: str) -> CommitFacts | None:
+        """读一条提交的父提交与提交信息（操作日志判据核验的事实源）。"""
+        out = await self._run_repo_git(["log", "-1", "--pretty=%P%x00%B", commit])
+        parent, _, message = out.partition("\0")
+        first_parent = parent.strip().split(" ", 1)[0] if parent.strip() else ""
+        return CommitFacts(parent=first_parent, message=message) if first_parent else None
+
+    async def line_integration_order(self, head: str) -> list[tuple[str, str]]:
+        """沿集成线首父链解析集成序：[(作用域, 集成提交)]，按时间正序。
+
+        集成与保留者重放的线提交信息都以「integrate <作用域>」开头，
+        换序重放按此序进行可复现的冲突检查序列。
+        """
+        subjects = await self._first_parent_subjects(head)
+        reversed_pairs: list[tuple[str, str]] = []
+        for commit, subject in reversed(subjects):
+            if subject.startswith("integrate "):
+                reversed_pairs.append((subject.removeprefix("integrate ").strip(), commit))
+        return reversed_pairs
+
+    async def first_parent_commits(self, head: str) -> set[str]:
+        """集成线首父链上的全部提交（含 head 与基线种子）。"""
+        return {commit for commit, _subject in await self._first_parent_subjects(head)}
+
+    async def _first_parent_subjects(self, head: str) -> list[tuple[str, str]]:
+        """首父链的 (提交, 主题) 对，按时间倒序（新在前）。"""
+        out = await self._run_repo_git(["log", "--first-parent", "--pretty=%H%x00%s", head])
+        pairs: list[tuple[str, str]] = []
+        for line in out.splitlines():
+            commit, _, subject = line.partition("\0")
+            if commit:
+                pairs.append((commit, subject))
+        return pairs
+
+    async def root_status_clean(self, exclude_pathspecs: Sequence[str]) -> bool:
+        """根检出在集成线路径面上是否存在未提交变化（自建产物不在此面）。"""
+        target = WorkspaceTarget(path=self._repository.root_dir, separated_env=True)
+        restriction = [".", *_ROOT_RESERVED_EXCLUDES, *exclude_pathspecs]
+        status = await self._run_target_git(target, ["status", "--porcelain", "--", *restriction])
+        return not status.strip()
+
+    async def retract_line_to(
+        self,
+        *,
+        target_commit: str,
+        replay: Sequence[ReplayStep],
+        merge_pathspecs: Sequence[str],
+        client_op_id: str,
+    ) -> str:
+        """在对象库内构造回退后的新线：reset 到目标后按序重放保留者 diff。
+
+        只产生提交对象、不动任何引用——失败（重放冲突，构造上不应发生）
+        时旧线完好；无保留者时新线即目标提交本身。
+        """
+        new_head = target_commit
+        for step in replay:
+            restricted = await self._build_restricted_commit(
+                base_commit=step.base_commit,
+                head=step.head_commit,
+                merge_pathspecs=merge_pathspecs,
+                message=f"merge-path delta of {step.scope_id}",
+            )
+            merged_tree, conflict_paths = await self._merge_trees(
+                base=step.base_commit, ours=new_head, theirs=restricted
+            )
+            if merged_tree is None:
+                raise IntegrationCoordinatorError(
+                    f"保留者重放出现合并冲突（构造上不应发生）：{step.scope_id}"
+                    f" 冲突路径 {conflict_paths}"
+                )
+            message = f"integrate {step.scope_id}\n\n{operation_marker(client_op_id)}"
+            new_head = (
+                await self._run_repo_git(
+                    ["commit-tree", merged_tree, "-p", new_head, "-m", message]
+                )
+            ).strip()
+        return new_head
+
+    async def advance_root_checkout(self, new_head: str) -> None:
+        """把集成线引用与根检出推进到指定提交（reset 落地步，幂等）。"""
+        await self._run_repo_git(["update-ref", ROOT_INTEGRATION_REF, new_head])
+        target = WorkspaceTarget(path=self._repository.root_dir, separated_env=True)
+        await self._run_target_git(target, ["read-tree", "-u", "--reset", new_head])
 
     async def commit_pending_state(
         self,

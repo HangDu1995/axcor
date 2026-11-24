@@ -34,6 +34,7 @@ __all__ = [
     "AbandonScope",
     "CheckpointRecorded",
     "IntegrateScope",
+    "IntegrationLineRetracted",
     "PrepareScopeWorkspace",
     "RestoreCommitted",
     "RestoreScope",
@@ -151,6 +152,21 @@ class ScopeAbandoned:
     scope_id: str
     new_scope_epoch: int
     abandoned_descendants: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True)
+class IntegrationLineRetracted:
+    """集成线回退完成通知：新线头、新根代次与失效/保留划分。
+
+    invalidated 为失效作用域及其新代次（目标在列），preserved 为按
+    原集成序重放的保留者；保留者作用域、分支与检查点不动。
+    """
+
+    new_root_head: str
+    new_root_epoch: int
+    target_commit: str
+    invalidated: tuple[tuple[str, int], ...] = ()
+    preserved: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

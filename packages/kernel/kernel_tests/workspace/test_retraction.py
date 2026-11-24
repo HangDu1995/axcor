@@ -1,0 +1,282 @@
+# Copyright (c) 2026 Workflow Controller Contributors
+#
+# Licensed under the MIT License (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://opensource.org/licenses/MIT
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""已合并回滚的集成线回退直测：先校验后 reset、谱系失效集与换序重放。
+
+现场用真实 git 构造「同基线兄弟 + 下游 + 活动写者」的集成线，断言
+回退后的线恰为保留者终态（逐字节）、失效集按基线谱系划分、根代次
+传播与旧根代次请求拒绝、拒绝路径对根头/根工作树/代次/账本零改动。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import pytest
+
+from workflow_controller.core.workspace.actions import ScopeIntegrated
+from workflow_controller.core.workspace.manager import WorkspaceManagerError
+from workflow_controller.core.workspace.repository import ROOT_INTEGRATION_REF
+from workflow_controller.core.workspace.scope_tree import ScopeState, ScopeTreeError
+
+from ._support import FakeOrchestrator, build_workspace, run_git
+
+if TYPE_CHECKING:
+    from workflow_controller.core.workspace.actions import IntegrationLineRetracted
+
+
+class _LineageSite:
+    """谱系现场：同基线兄弟 a/b、下游 d、基线干净的活动写者 e、失效活动写者 f。"""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.root, self.repository, self.manager = build_workspace(tmp_path)
+        self.orchestrator = FakeOrchestrator(self.manager)
+        self.bases: dict[str, str] = {}
+
+    async def prepare(self, key: str) -> Path:
+        prepared = await self.orchestrator.prepare(key)
+        self.bases[key] = prepared.integration_base_commit
+        return Path(prepared.workspace_path)
+
+    async def integrate(self, key: str) -> None:
+        outcome = await self.orchestrator.integrate(key)
+        assert isinstance(outcome, ScopeIntegrated)
+
+    async def build(self) -> None:
+        """a/b/e 同基线先行，a 集成后 d、f 建区（基线含 a 的集成）。"""
+        await self.orchestrator.bootstrap_root()
+        ws_a = await self.prepare("node-a")
+        ws_b = await self.prepare("node-b")
+        ws_e = await self.prepare("node-e")
+        (ws_a / "design" / "a.md").write_text("from-a\n", encoding="utf-8")
+        (ws_b / "design" / "b.md").write_text("from-b\n", encoding="utf-8")
+        (ws_e / "design" / "e.md").write_text("from-e\n", encoding="utf-8")
+        await self.integrate("node-a")
+        ws_d = await self.prepare("node-d")
+        ws_f = await self.prepare("node-f")
+        (ws_d / "design" / "d.md").write_text("from-d\n", encoding="utf-8")
+        (ws_d / "design" / "a.md").write_text("d-extends-a\n", encoding="utf-8")
+        (ws_f / "design" / "f.md").write_text("from-f\n", encoding="utf-8")
+        await self.integrate("node-b")
+        await self.integrate("node-d")
+        # e 保持活动：基线不含 a 的集成，回退后按旧根代次拒绝其集成
+
+    async def retract_a(
+        self, *, client_op_id: str = "retract-1", epoch: int = 1
+    ) -> IntegrationLineRetracted:
+        return await self.manager.retract_integration_line(
+            target_scope_id="node-a",
+            target_commit=self.bases["node-a"],
+            expected_root_epoch=epoch,
+            client_op_id=client_op_id,
+        )
+
+    def pollute_line_with_writer_local(self) -> str:
+        """在集成线上落一个含自建路径变更的提交（不动根工作树），返回提交。"""
+        payload = self.repository.repo_dir / "pollute-test-blob"
+        payload.write_bytes(b"polluted-log\n")
+        blob = run_git(["hash-object", "-w", str(payload)], self.repository.repo_dir).strip()
+        payload.unlink()
+        head = run_git(["rev-parse", "HEAD"], self.repository.repo_dir).strip()
+        tree = self._polluted_tree(head, blob)
+        commit = run_git(
+            ["commit-tree", tree, "-p", head, "-m", "pollute line with writer_local"],
+            self.repository.repo_dir,
+        ).strip()
+        run_git(["update-ref", ROOT_INTEGRATION_REF, commit], self.repository.repo_dir)
+        return commit
+
+    def _polluted_tree(self, head: str, blob: str) -> str:
+        """基准树加一个自建路径条目后写树（经临时索引）。"""
+        import os
+        import subprocess
+
+        index = self.repository.repo_dir / "index.pollute-test"
+        env = dict(os.environ, GIT_DIR=str(self.repository.repo_dir), GIT_INDEX_FILE=str(index))
+        for args in (
+            ["git", "read-tree", head],
+            ["git", "update-index", "--add", "--cacheinfo", f"100644,{blob},run.log"],
+            ["git", "write-tree"],
+        ):
+            proc = subprocess.run(args, capture_output=True, text=True, check=True, env=env)
+        index.unlink(missing_ok=True)
+        return proc.stdout.strip()
+
+    def restore_line_ref(self, commit: str) -> None:
+        """把集成线引用拨回指定提交（污染构造的还原）。"""
+        run_git(["update-ref", ROOT_INTEGRATION_REF, commit], self.repository.repo_dir)
+
+
+async def _zero_change_facts(site: _LineageSite) -> tuple:
+    """根头、根工作树与账本快照（零改动断言用）。"""
+    head = await site.manager.current_integration_head()
+    tree = {
+        str(p.relative_to(site.root)): p.read_bytes()
+        for p in sorted(site.root.rglob("*"))
+        if p.is_file() and ".workflow-controller" not in p.parts
+    }
+    records = await site.manager.list_scopes()
+    ledger = [
+        (r.scope_id, r.scope_epoch, r.root_epoch, r.state.value, r.integration_base_commit)
+        for r in records
+    ]
+    return head, tree, ledger
+
+
+async def test_retraction_lineage_replay_and_epoch_propagation(tmp_path: Path) -> None:
+    """谱系失效集（同基线兄弟保留、下游与失效活动写者废弃）+ 重放逐字节 + 根代次传播。"""
+    site = _LineageSite(tmp_path)
+    await site.build()
+
+    head_before = await site.manager.current_integration_head()
+    b_scope = await site.manager.get_scope("node-b")
+    assert b_scope is not None
+    b_branch_head_before = run_git(["rev-parse", "scope/node-b"], site.repository.repo_dir).strip()
+    result = await site.retract_a()
+
+    # 根代次 +1、新头推进；失效 = 目标 + 下游 d + 活动写者 f；保留 = b
+    assert result.new_root_epoch == 2
+    assert result.new_root_head != head_before
+    assert {scope for scope, _epoch in result.invalidated} == {"node-a", "node-d", "node-f"}
+    assert result.preserved == ("node-b",)
+
+    # 根检出：a/d 的产物撤回、b 的产出保留
+    assert not (site.root / "design" / "a.md").exists()
+    assert not (site.root / "design" / "d.md").exists()
+    assert (site.root / "design" / "b.md").read_text(encoding="utf-8") == "from-b\n"
+
+    # 重放后的线在 merge 路径上与保留者终态逐字节一致
+    diff = run_git(
+        ["diff", "--name-only", result.new_root_head, b_branch_head_before, "--", "design"],
+        site.repository.repo_dir,
+    )
+    assert diff.strip() == ""
+
+    # 保留者作用域与分支不动；失效者换代且工作区移除
+    b_scope_after = await site.manager.get_scope("node-b")
+    assert b_scope_after is not None
+    assert b_scope_after.state is ScopeState.INTEGRATED
+    assert b_scope_after.scope_epoch == b_scope.scope_epoch
+    assert (
+        run_git(["rev-parse", "scope/node-b"], site.repository.repo_dir).strip()
+        == b_branch_head_before
+    )
+    for key in ("node-a", "node-d", "node-f"):
+        record = await site.manager.get_scope(key)
+        assert record is not None
+        assert record.state is ScopeState.DISCARDED
+        assert record.scope_epoch == 2
+        assert not (site.repository.workspaces_dir / key).exists()
+
+    # 旧根代次的集成请求一律拒绝：干净活动写者 e 的集成被代次纪律挡下
+    with pytest.raises(ScopeTreeError, match="旧根代次"):
+        await site.orchestrator.integrate("node-e")
+
+    # 同操作号重放幂等：返回原结果，不产生第二次回退
+    replay = await site.retract_a()
+    assert replay.new_root_epoch == result.new_root_epoch
+    assert replay.new_root_head == result.new_root_head
+    assert {s for s, _e in replay.invalidated} == {s for s, _e in result.invalidated}
+
+
+async def test_retraction_rejections_leave_zero_change(tmp_path: Path) -> None:
+    """校验拒绝零改动：目标不在线上/目标为当前头/区间含自建变更/根检出脏。"""
+    site = _LineageSite(tmp_path)
+    await site.build()
+    head_before = await site.manager.current_integration_head()
+    facts = await _zero_change_facts(site)
+
+    # ② 目标不属于当前集成线：作用域分支提交不在集成线首父链上
+    b_branch_head = run_git(["rev-parse", "scope/node-b"], site.repository.repo_dir).strip()
+    with pytest.raises(WorkspaceManagerError, match="不属于当前集成线"):
+        await site.manager.retract_integration_line(
+            target_scope_id="node-a",
+            target_commit=b_branch_head,
+            expected_root_epoch=1,
+            client_op_id="retract-x1",
+        )
+
+    # ③ 目标为当前集成头：非严格祖先（空集成目标的形态）
+    with pytest.raises(WorkspaceManagerError, match="严格）祖先"):
+        await site.manager.retract_integration_line(
+            target_scope_id="node-a",
+            target_commit=head_before or "",
+            expected_root_epoch=1,
+            client_op_id="retract-x2",
+        )
+
+    # ④ 回退区间含自建路径变更：构造一个带自建路径的线提交后拒绝
+    polluted = site.pollute_line_with_writer_local()
+    try:
+        with pytest.raises(WorkspaceManagerError, match="自建路径变更"):
+            await site.manager.retract_integration_line(
+                target_scope_id="node-a",
+                target_commit=site.bases["node-a"],
+                expected_root_epoch=1,
+                client_op_id="retract-x3",
+            )
+    finally:
+        site.restore_line_ref(head_before or "")
+
+    # 根检出存在未提交变化：先经集成落账再回退
+    (site.root / "design" / "loose.md").write_text("loose\n", encoding="utf-8")
+    try:
+        with pytest.raises(WorkspaceManagerError, match="未提交变化"):
+            await site.manager.retract_integration_line(
+                target_scope_id="node-a",
+                target_commit=site.bases["node-a"],
+                expected_root_epoch=1,
+                client_op_id="retract-x4",
+            )
+    finally:
+        (site.root / "design" / "loose.md").unlink()
+    _ = polluted
+
+    # 拒绝后零改动：根头、根工作树、账本与代次与回退前一致
+    head_after, tree_after, ledger_after = await _zero_change_facts(site)
+    assert head_after == facts[0]
+    assert tree_after == facts[1]
+    assert ledger_after == facts[2]
+
+
+async def test_retraction_replays_multiple_preservers_in_original_order(
+    tmp_path: Path,
+) -> None:
+    """多个保留者按原集成序重放：序取自集成线历史，内容收敛到保留者终态。"""
+    site = _LineageSite(tmp_path)
+    await site.orchestrator.bootstrap_root()
+    ws_a = await site.prepare("node-a")
+    ws_b = await site.prepare("node-b")
+    ws_c = await site.prepare("node-c")
+    (ws_a / "design" / "a.md").write_text("from-a\n", encoding="utf-8")
+    (ws_b / "design" / "b.md").write_text("from-b\n", encoding="utf-8")
+    (ws_c / "design" / "c.md").write_text("from-c\n", encoding="utf-8")
+    # 集成序 b → a → c：回退 a 时保留者按原集成序为 (b, c)
+    await site.integrate("node-b")
+    await site.integrate("node-a")
+    await site.integrate("node-c")
+
+    result = await site.retract_a()
+    assert result.preserved == ("node-b", "node-c")
+    # 重放后的线沿原集成序：线信息含 b、c 的集成主题（可复现序列）
+    log = run_git(
+        ["log", "--first-parent", "--pretty=%s", result.new_root_head],
+        site.repository.repo_dir,
+    ).splitlines()
+    integrated_subjects = [s for s in log if s.startswith("integrate ")]
+    assert integrated_subjects == ["integrate node-c", "integrate node-b"]
+    for name in ("b.md", "c.md"):
+        assert (site.root / "design" / name).exists()
+    assert not (site.root / "design" / "a.md").exists()

@@ -489,6 +489,7 @@ class GraphPlugin(Plugin):
             workflow_source=Path(run.program_ref) if run.program_ref else None,
             **pick_runner_options(dict(blob.get("options") or {})),
         )
+        driver.resume_workspace_seq(int(blob.get("workspace_seq", 0) or 0))
         if not user_prompt_path.exists():
             self._recreate_user_prompt(
                 run_id,

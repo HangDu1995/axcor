@@ -407,13 +407,15 @@ class RunAPI:
         expected_epoch: int,
         scope_id: str | None = None,
         checkpoint_id: str | None = None,
+        expected_root_epoch: int | None = None,
         reason: str = "",
     ) -> dict[str, Any]:
-        """未合并节点回滚请求（异步）：转发驱动 rollback_node op，返回 operation_id。
+        """节点回滚请求（异步）：转发驱动 rollback_node op，返回 operation_id。
 
         显式给出的 checkpoint_id 先对 run 的检查点账本核验存在（无有效
-        检查点明确拒绝）；其余前置（traceback 开关、已集成目标、代次）
-        由驱动在受理时校验。
+        检查点明确拒绝）；目标已集成（passed）时为已合并回滚，须另携带
+        旧根代次 expected_root_epoch（取 run 作用域查询的根行值）；其余
+        前置（traceback 开关、代次）由驱动在受理时校验。
         """
         if checkpoint_id:
             rows = await self.list_run_checkpoints(run_id)
@@ -428,6 +430,8 @@ class RunAPI:
             args["scope_id"] = scope_id
         if checkpoint_id is not None:
             args["checkpoint_id"] = checkpoint_id
+        if expected_root_epoch is not None:
+            args["expected_root_epoch"] = expected_root_epoch
         if reason:
             args["reason"] = reason
         try:
@@ -445,12 +449,15 @@ class RunAPI:
         checkpoint_id: str,
         scope_id: str | None = None,
         replay_dispatch: bool = False,
+        expected_root_epoch: int | None = None,
         reason: str = "",
     ) -> dict[str, Any]:
         """子代理回滚请求（异步）：转发驱动 rollback_subagent op，返回 operation_id。
 
         检查点须为该 run 的派发组检查点行；replay_dispatch 开启时先做
-        「单 task、无其他副作用」校验，多副作用组明确拒绝。
+        「单 task、无其他副作用」校验，多副作用组明确拒绝。目标已集成
+        到根（节点 passed）时按已合并回滚传播，须另携带旧根代次
+        expected_root_epoch。
         """
         rows = await self.list_run_checkpoints(run_id)
         row = next((r for r in rows if r["checkpoint_id"] == checkpoint_id), None)
@@ -467,10 +474,12 @@ class RunAPI:
             "client_op_id": client_op_id,
             "expected_epoch": expected_epoch,
             "checkpoint_id": checkpoint_id,
-            "replay_dispatch": True,
+            "replay_dispatch": replay_dispatch,
         }
         if scope_id is not None:
             args["scope_id"] = scope_id
+        if expected_root_epoch is not None:
+            args["expected_root_epoch"] = expected_root_epoch
         if reason:
             args["reason"] = reason
         try:

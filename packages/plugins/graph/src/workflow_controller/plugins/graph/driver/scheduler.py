@@ -234,6 +234,65 @@ def plan_rollback(
     )
 
 
+def plan_integrated_restore(
+    state: GraphState,
+    dag: DAG,
+    target: str,
+    reason: RollbackReason,
+    expected_gen: int,
+    invalidated_nodes: set[str],
+) -> RollbackPlan | None:
+    """已合并回滚计划：reset 集取谱系失效集（非 DAG 后代闭包）。
+
+    失效集来自核心按基线谱系计算的废弃作用域对应节点（目标在列），
+    与 DAG 拓扑无关——谱系不含目标的保留者不重跑；expected_gen 不匹
+    配返回 None（先行回滚会改变代次）。
+    """
+    nodes = state.snapshot()["nodes"]
+    if target not in nodes or reason.trigger_node not in nodes:
+        logger.warning(
+            "rollback: discard integrated restore plan for missing node (target=%s trigger=%s)",
+            target,
+            reason.trigger_node,
+        )
+        return None
+    if state.gen(reason.trigger_node) != expected_gen:
+        logger.warning(
+            "rollback: discard stale integrated restore request for %s (expected gen %s, now %s)",
+            target,
+            expected_gen,
+            state.gen(reason.trigger_node),
+        )
+        return None
+    new_gen = state.max_gen() + 1
+    reset_nodes = set(invalidated_nodes) | {target, reason.trigger_node}
+    parent_gen_node = state.subgraph_parent(target)
+    old_parent_gen = 0
+    if parent_gen_node:
+        old_parent_gen = state.gen(parent_gen_node)
+        reset_nodes.add(parent_gen_node)
+    stop_nodes = {
+        nid for nid in reset_nodes if (nodes.get(nid, {}) or {}).get("status") == "running"
+    }
+    discard_subgraphs = {
+        nid: old_ids
+        for nid in reset_nodes
+        if nid != parent_gen_node and (old_ids := state.subgraph_node_ids(nid))
+    }
+    return RollbackPlan(
+        target=target,
+        trigger_node=reason.trigger_node,
+        trigger_gen=expected_gen,
+        reason=reason.text,
+        new_gen=new_gen,
+        reset_nodes=reset_nodes,
+        stop_nodes=stop_nodes,
+        parent_gen_node=parent_gen_node,
+        old_parent_gen=old_parent_gen,
+        discard_subgraphs=discard_subgraphs,
+    )
+
+
 def apply_rollback(state: GraphState, dag: DAG, plan: RollbackPlan) -> None:
     """按计划落账：归档重置、废弃旧子图、记回滚边与预算。"""
     for nid in plan.reset_nodes:

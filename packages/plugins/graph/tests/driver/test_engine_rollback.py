@@ -158,16 +158,21 @@ def test_traceback_disabled_rejects_rollback(tmp_path: Path) -> None:
         driver.handle_op("rollback_node", _op_args())
 
 
-def test_integrated_target_rejected(tmp_path: Path) -> None:
-    """显式请求命中已集成（passed）目标：明确拒绝「已合并回滚未实现」。"""
+def test_integrated_target_registers_integrated_chain(tmp_path: Path) -> None:
+    """显式请求命中已集成（passed）目标：登记为已合并回滚链（须携带旧根代次）。"""
     driver = _started_driver(tmp_path)
     decide(driver, (proc_exit("node=a", 0),))
     decide(driver, (terminal_note("node=a"),))  # type: ignore[arg-type]
     decide(driver, (proc_exit("node=a/verify", 0),))
     decide(driver, (integrated_note("node=a"),))  # type: ignore[arg-type]
     assert driver.state.status("a") == "passed"
-    with pytest.raises(ValueError, match="已合并回滚未实现"):
+    # 未携带旧根代次：明确拒绝
+    with pytest.raises(ValueError, match="expected_root_epoch"):
         driver.handle_op("rollback_node", _op_args())
+    result = driver.handle_op("rollback_node", _op_args(expected_root_epoch=1))
+    assert result["kind"] == "rollback_integrated"
+    assert result["phase"] == "pending"
+    assert result["checkpoint_id"] == "a-w1:scope_start:e1"
 
 
 def test_missing_scope_rejected(tmp_path: Path) -> None:

@@ -26,6 +26,10 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 __all__ = [
     "INITIAL_EPOCH",
@@ -159,6 +163,11 @@ class ScopeTree:
         """树当前集成线代次。"""
         return self._require_root().root_epoch
 
+    @property
+    def root_scope_id(self) -> str | None:
+        """根作用域标识；未建根为 None。"""
+        return self._root_scope_id
+
     async def create_root_scope(
         self,
         *,
@@ -189,6 +198,33 @@ class ScopeTree:
         self._scopes[scope_id] = record
         self._root_scope_id = scope_id
         return record
+
+    async def load_records(self, records: Sequence[ScopeRecord]) -> None:
+        """崩溃恢复的整账装载：替换全部行并重建父子索引。
+
+        只接受恰好一个根作用域的行集；父子引用须闭合（父在集合内或
+        为根），否则对不上账、显式失败。
+        """
+        if self._root_scope_id is not None or self._scopes:
+            raise ScopeTreeError("账本非空，不能整账装载")
+        roots = [r for r in records if r.scope_kind is ScopeKind.ROOT]
+        if len(roots) != 1:
+            raise ScopeTreeError(f"整账装载须恰好一个根作用域，实得 {len(roots)}")
+        root = roots[0]
+        if root.parent_scope_id is not None:
+            raise ScopeTreeError(f"根作用域不得携带父引用：{root.scope_id}")
+        known = {r.scope_id for r in records}
+        children: dict[str, list[str]] = {}
+        for record in records:
+            self._scopes[record.scope_id] = record
+            if record.scope_id == root.scope_id:
+                continue
+            parent_id = record.parent_scope_id
+            if not parent_id or parent_id not in known:
+                raise ScopeTreeError(f"作用域的父引用不在集合内：{record.scope_id}（{parent_id}）")
+            children.setdefault(parent_id, []).append(record.scope_id)
+        self._children = children
+        self._root_scope_id = root.scope_id
 
     async def create_child_scope(
         self,

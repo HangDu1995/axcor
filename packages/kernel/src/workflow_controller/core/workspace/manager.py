@@ -25,12 +25,14 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from workflow_controller.core.workspace.actions import (
     AbandonScope,
     IntegrateScope,
+    IntegrationLineRetracted,
     PrepareScopeWorkspace,
     ScopeAbandoned,
     ScopeIntegrated,
@@ -49,15 +51,21 @@ from workflow_controller.core.workspace.gate import (
 )
 from workflow_controller.core.workspace.integration import (
     IntegrationConflict,
+    ReplayStep,
     WorkspaceTarget,
 )
-from workflow_controller.core.workspace.oplog import operation_marker
+from workflow_controller.core.workspace.oplog import (
+    OperationPhase,
+    SagaOperation,
+    operation_marker,
+)
 from workflow_controller.core.workspace.repository import ROOT_INTEGRATION_REF, ROOT_SEED_REF
 from workflow_controller.core.workspace.scope_tree import (
     INITIAL_EPOCH,
     ScopeGateState,
     ScopeKind,
     ScopeState,
+    ScopeTreeError,
 )
 
 if TYPE_CHECKING:
@@ -71,12 +79,20 @@ if TYPE_CHECKING:
         ScopeWorkspace,
         WorkspaceRepository,
     )
-    from workflow_controller.core.workspace.scope_tree import ScopeRecord, ScopeTree
+    from workflow_controller.core.workspace.scope_tree import AbandonedScope, ScopeRecord, ScopeTree
 
 __all__ = ["ScopeQuiesceFailedError", "WorkspaceManager", "WorkspaceManagerError"]
 
 # 后台写进程排空钩子：入参为作用域标识
 BackgroundDrainHook = Callable[[str], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class _RetractionPlan:
+    """一次集成线回退的失效集与保留者重放序。"""
+
+    invalidated: list[ScopeRecord]
+    preserved: list[ReplayStep]
 
 
 class WorkspaceManagerError(RuntimeError):
@@ -412,6 +428,223 @@ class WorkspaceManager:
             ),
         )
 
+    async def retract_integration_line(
+        self,
+        *,
+        target_scope_id: str,
+        target_commit: str,
+        expected_root_epoch: int,
+        client_op_id: str,
+    ) -> IntegrationLineRetracted:
+        """已合并回滚的集成线回退：先校验后 reset，保留者按原集成序重放。
+
+        校验四条件（目标已登记属调用方前置、属当前集成线、是当前集成
+        头祖先、回退区间不含自建路径变更）全部先于任何改动——任一不
+        满足即拒绝，根头、根工作树、根代次与账本零变化。失效集按基线
+        谱系计算（含目标自身与基于失效基线的活动写者）；重放链先在
+        对象库内构造、记新头后再推进引用与根检出，代次递增与失效作
+        用域废弃随后落账、操作日志收口。
+        """
+        root_id = self._tree.root_scope_id
+        if root_id is None:
+            raise WorkspaceManagerError("作用域树尚未建立根作用域")
+        existing = await self._oplog.get(client_op_id)
+        if existing is not None:
+            return self._retract_cached_or_reject(
+                existing,
+                target_scope_id=target_scope_id,
+                target_commit=target_commit,
+                expected_root_epoch=expected_root_epoch,
+            )
+        await self._tree.require_root_epoch(expected_root_epoch)
+        current_head = await self._repository.resolve_ref(ROOT_INTEGRATION_REF)
+        if current_head is None:
+            raise WorkspaceManagerError("集成线引用缺失，无法回退")
+        await self._validate_retract_target(target_scope_id, target_commit, current_head)
+        plan = await self._plan_retraction(target_scope_id, target_commit, current_head)
+        root = await self._require_scope(root_id)
+        async with self._quiesced(root_id):
+            # 闸门内复核：头与根代次仍与校验时一致，否则按分叉拒绝
+            if await self._repository.resolve_ref(ROOT_INTEGRATION_REF) != current_head:
+                raise WorkspaceManagerError("集成头在受理后发生变化，回退拒绝（分叉）")
+            await self._tree.require_root_epoch(expected_root_epoch)
+            await self._oplog.begin(
+                client_op_id=client_op_id,
+                op_kind="retract_integration_line",
+                expected_old_head=current_head,
+                scope_epoch=root.scope_epoch,
+                root_epoch=expected_root_epoch,
+                metadata={
+                    "target_scope_id": target_scope_id,
+                    "target_commit": target_commit,
+                    "invalidated": [item.scope_id for item in plan.invalidated],
+                    "preserved": [step.scope_id for step in plan.preserved],
+                },
+            )
+            new_head = await self._coordinator.retract_line_to(
+                target_commit=target_commit,
+                replay=plan.preserved,
+                merge_pathspecs=self._manifest.git_diff_restriction_specs(),
+                client_op_id=client_op_id,
+            )
+            await self._oplog.record_new_head(client_op_id, new_head)
+            await self._coordinator.advance_root_checkout(new_head)
+            new_root_epoch = await self._tree.advance_root_epoch(
+                expected_root_epoch=expected_root_epoch
+            )
+            abandoned: list[tuple[str, int]] = []
+            for record in plan.invalidated:
+                for item in await self._abandon_scope_physically(record):
+                    abandoned.append((item.scope_id, item.new_scope_epoch))
+            result = IntegrationLineRetracted(
+                new_root_head=new_head,
+                new_root_epoch=new_root_epoch,
+                target_commit=target_commit,
+                invalidated=tuple(abandoned),
+                preserved=tuple(step.scope_id for step in plan.preserved),
+            )
+            await self._oplog.commit(
+                client_op_id,
+                result={
+                    "new_root_head": new_head,
+                    "new_root_epoch": new_root_epoch,
+                    "target_commit": target_commit,
+                    "invalidated": abandoned,
+                    "preserved": list(result.preserved),
+                },
+            )
+        return result
+
+    def _retract_cached_or_reject(
+        self,
+        existing: SagaOperation,
+        *,
+        target_scope_id: str,
+        target_commit: str,
+        expected_root_epoch: int,
+    ) -> IntegrationLineRetracted:
+        """同操作号重放：已收口按参数一致返回原结果，其余显式拒绝。"""
+        metadata = existing.metadata
+        consistent = (
+            existing.op_kind == "retract_integration_line"
+            and metadata.get("target_scope_id") == target_scope_id
+            and metadata.get("target_commit") == target_commit
+            and existing.root_epoch == expected_root_epoch
+        )
+        if not consistent:
+            raise WorkspaceManagerError(f"操作号已绑定不同的回退请求：{existing.client_op_id}")
+        if existing.phase is not OperationPhase.COMMITTED:
+            raise WorkspaceManagerError(
+                f"回退操作未收口（{existing.phase.value}），须经崩溃恢复核对后重试"
+            )
+        payload = existing.result
+        if not isinstance(payload, dict):
+            raise WorkspaceManagerError(f"已收口回退缺少结果账：{existing.client_op_id}")
+        return IntegrationLineRetracted(
+            new_root_head=str(payload["new_root_head"]),
+            new_root_epoch=int(payload["new_root_epoch"]),
+            target_commit=str(payload["target_commit"]),
+            invalidated=tuple((str(i[0]), int(i[1])) for i in payload.get("invalidated", ())),
+            preserved=tuple(str(i) for i in payload.get("preserved", ())),
+        )
+
+    async def _validate_retract_target(
+        self, target_scope_id: str, target_commit: str, current_head: str
+    ) -> None:
+        """回退目标校验：在册、属当前集成线、是当前头祖先、区间无自建变更。
+
+        全部为只读判定——任一不满足时本次回退零改动（校验先于闸门与
+        一切落账）。
+        """
+        target = await self._require_scope(target_scope_id)
+        if target.parent_scope_id != self._tree.root_scope_id:
+            raise WorkspaceManagerError(f"回退目标必须是集成线的直接写者：{target_scope_id}")
+        if target.state not in (ScopeState.INTEGRATED, ScopeState.RELEASED):
+            raise WorkspaceManagerError(
+                f"回退目标未集成：{target_scope_id}（{target.state.value}）"
+            )
+        if not await self._coordinator.commit_exists(target_commit):
+            raise WorkspaceManagerError(f"回退目标提交不存在于私有仓：{target_commit}")
+        line_chain = await self._coordinator.first_parent_commits(current_head)
+        if target_commit not in line_chain:
+            raise WorkspaceManagerError(f"回退目标不属于当前集成线：{target_commit}")
+        if target_commit == current_head or not await self._coordinator.is_ancestor(
+            target_commit, current_head
+        ):
+            raise WorkspaceManagerError(f"回退目标不是当前集成头的（严格）祖先：{target_commit}")
+        dirty_paths = await self._coordinator.changed_paths(
+            target_commit,
+            current_head,
+            self._manifest.git_writer_local_specs(),
+        )
+        if dirty_paths:
+            raise WorkspaceManagerError(
+                f"回退区间含自建路径变更，拒绝回退：{sorted(dirty_paths)[:5]}"
+            )
+        if not await self._coordinator.root_status_clean(
+            self._manifest.git_line_commit_exclude_specs()
+        ):
+            raise WorkspaceManagerError("根检出存在未提交变化，先经集成落账再回退")
+
+    async def _plan_retraction(
+        self, target_scope_id: str, target_commit: str, current_head: str
+    ) -> _RetractionPlan:
+        """失效集计算（谱系判据）与保留者重放序解析。
+
+        谱系基准是目标的集成提交（其成果进入集成线的那个提交，自线
+        历史解析），不是回退目标本身——回退目标是建区基线、只定线回
+        退到哪。已集成写者的建区基线祖先链含目标集成提交即失效重跑，
+        不含则保留并按原集成序重放；基于失效基线的活动写者一并废弃。
+        """
+        root_id = self._tree.root_scope_id or ""
+        invalidated: list[ScopeRecord] = []
+        preserved: list[ReplayStep] = []
+        order_pairs = await self._coordinator.line_integration_order(current_head)
+        order = {scope_id: index for index, (scope_id, _commit) in enumerate(order_pairs)}
+        pivot = next(
+            (commit for scope_id, commit in order_pairs if scope_id == target_scope_id), None
+        )
+        if pivot is None:
+            raise WorkspaceManagerError(f"回退目标在当前集成线上没有集成提交：{target_scope_id}")
+        for record in await self._tree.list_all_scopes():
+            if record.parent_scope_id != root_id or record.scope_id == target_scope_id:
+                continue
+            if record.scope_kind is not ScopeKind.MAIN_WRITER:
+                continue
+            base = record.integration_base_commit or ""
+            consumed = bool(base) and await self._coordinator.is_ancestor(pivot, base)
+            if record.state in (ScopeState.INTEGRATED, ScopeState.RELEASED):
+                if consumed:
+                    invalidated.append(record)
+                else:
+                    preserved.append(await self._replay_step(record, order))
+            elif record.state in (ScopeState.ACTIVE, ScopeState.AWAITING_INTEGRATION) and consumed:
+                invalidated.append(record)
+        target = await self._require_scope(target_scope_id)
+        preserved.sort(key=lambda step: order[step.scope_id])
+        return _RetractionPlan(
+            invalidated=[target, *invalidated],
+            preserved=preserved,
+        )
+
+    async def _replay_step(self, record: ScopeRecord, order: dict[str, int]) -> ReplayStep:
+        """把一个保留写者解析为重放步：分支头存在且在当前线上有集成序。"""
+        if record.scope_id not in order:
+            raise WorkspaceManagerError(f"保留写者在当前集成线上找不到集成序：{record.scope_id}")
+        if not record.workspace_ref:
+            raise WorkspaceManagerError(f"保留写者缺少工作区引用：{record.scope_id}")
+        _path, branch = self._parse_workspace_ref(record.workspace_ref)
+        head = await self._repository.resolve_ref(f"refs/heads/{branch}") if branch else None
+        if head is None:
+            raise WorkspaceManagerError(
+                f"保留写者分支缺失，对不上账：{record.scope_id}（{branch}）"
+            )
+        return ReplayStep(
+            scope_id=record.scope_id,
+            base_commit=record.integration_base_commit or "",
+            head_commit=head,
+        )
+
     async def commit_scope_terminal(self, scope_id: str) -> tuple[str, str]:
         """闸门内提交作用域未提交状态为终态执行态，返回提交与分支。
 
@@ -448,21 +681,9 @@ class WorkspaceManager:
         target = await self._require_scope(request.scope_id)
         if target.scope_kind is ScopeKind.ROOT:
             raise WorkspaceManagerError("根作用域不可废弃")
-        verified = await self._tree.require_scope_epoch(
-            request.scope_id, request.expected_scope_epoch
+        abandoned = await self._abandon_scope_physically(
+            await self._tree.require_scope_epoch(request.scope_id, request.expected_scope_epoch)
         )
-        for record in (verified, *await self._tree.list_descendants(request.scope_id)):
-            if record.workspace_ref is None:
-                continue
-            path, _branch = self._parse_workspace_ref(record.workspace_ref)
-            if path.exists():
-                await self._coordinator.release_worktree(path)
-        abandoned = await self._tree.abandon_scope(
-            request.scope_id, expected_scope_epoch=request.expected_scope_epoch
-        )
-        for item in abandoned:
-            self._claims.release(item.scope_id)
-            self._reader_scopes.discard(item.scope_id)
         return ScopeAbandoned(
             scope_id=request.scope_id,
             new_scope_epoch=abandoned[0].new_scope_epoch,
@@ -470,6 +691,22 @@ class WorkspaceManager:
                 (item.scope_id, item.new_scope_epoch) for item in abandoned[1:]
             ),
         )
+
+    async def _abandon_scope_physically(self, target: ScopeRecord) -> list[AbandonedScope]:
+        """先移除目标及后代工作区，再账面各自换代一次并回收登记。"""
+        for record in (target, *await self._tree.list_descendants(target.scope_id)):
+            if record.workspace_ref is None:
+                continue
+            path, _branch = self._parse_workspace_ref(record.workspace_ref)
+            if path.exists():
+                await self._coordinator.release_worktree(path)
+        abandoned = await self._tree.abandon_scope(
+            target.scope_id, expected_scope_epoch=target.scope_epoch
+        )
+        for item in abandoned:
+            self._claims.release(item.scope_id)
+            self._reader_scopes.discard(item.scope_id)
+        return abandoned
 
     async def release_scope(self, scope_id: str) -> ScopeRecord:
         """回收工作区：物理裁剪工作树，已集成者账面转已释放，分支保留。"""
@@ -493,6 +730,49 @@ class WorkspaceManager:
     async def get_scope(self, scope_id: str) -> ScopeRecord | None:
         """查询作用域账本行。"""
         return await self._tree.get_scope(scope_id)
+
+    def restore_claims(self, scope_id: str, claims: tuple[str, ...]) -> None:
+        """崩溃恢复后补登记作用域的声明写路径（出生声明的账面重建）。"""
+        if claims:
+            self._claims.register(scope_id, claims)
+
+    async def complete_retraction_ledger(self, operation: SagaOperation) -> None:
+        """集成线回退的崩溃补账：根代次推进与失效废弃按已生效事实补齐。
+
+        只在引用推进确认后调用（操作处于已写阶段）；各步幂等——根代
+        次已推进到目标值或失效作用域已废弃时跳过，收口结果按操作账
+        重建。
+        """
+        if operation.op_kind != "retract_integration_line":
+            raise WorkspaceManagerError(f"非集成线回退操作：{operation.client_op_id}")
+        try:
+            await self._tree.advance_root_epoch(expected_root_epoch=operation.root_epoch)
+        except ScopeTreeError as exc:
+            if exc.current_root_epoch != operation.root_epoch + 1:
+                raise
+        abandoned: list[tuple[str, int]] = []
+        for scope_id in operation.metadata.get("invalidated", ()):
+            record = await self._tree.get_scope(str(scope_id))
+            if record is None:
+                continue  # 未经检查点行重建的边角（显式降级面）
+            try:
+                items = await self._abandon_scope_physically(record)
+            except ScopeTreeError as exc:
+                if exc.current_scope_epoch == record.scope_epoch + 1:
+                    continue  # 崩溃前已废弃过（部分补账幂等）
+                raise
+            for item in items:
+                abandoned.append((item.scope_id, item.new_scope_epoch))
+        await self._oplog.commit(
+            operation.client_op_id,
+            result={
+                "new_root_head": operation.actual_new_head,
+                "new_root_epoch": operation.root_epoch + 1,
+                "target_commit": operation.metadata.get("target_commit"),
+                "invalidated": abandoned,
+                "preserved": list(operation.metadata.get("preserved", ())),
+            },
+        )
 
     async def list_scopes(self) -> list[ScopeRecord]:
         """全部作用域账本行（根起深度优先）。"""
