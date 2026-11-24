@@ -1898,6 +1898,9 @@ class GraphDriver:
             self._nodes[node_id] = act
         act.phase = _PHASE_EXEC_PROC
         workspace = self._node_workspace(node_id)
+        # bash 节点无会话出生回执：派进程即本代执行起点，running 档案事件
+        # 在此补发（节点累计超时规则的事实源；成员节点由激活回执路径发）
+        self._emit_node_history(actions, node_id, "running", attempt=attempt)
         actions.append(
             StartProcess(
                 cmd=render(node.get("command", "true"), ctx),

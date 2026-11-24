@@ -158,12 +158,16 @@ class NodeClock:
     session_id: str = ""  # 执行/验收 session（告警载荷，可得范围内）
     verify_session_id: str = ""
 
-    def elapsed_seconds(self, now: datetime) -> int:
-        """累计用时（含当前开段）：冻结态即 accumulated。"""
+    def elapsed_seconds_exact(self, now: datetime) -> float:
+        """累计用时（含当前开段，浮点精确）：时钟迁移与滚动落账的内部基准。"""
         total = self.accumulated_seconds
         if self.running_since is not None:
             total += max((now - self.running_since).total_seconds(), 0.0)
-        return int(total)
+        return total
+
+    def elapsed_seconds(self, now: datetime) -> int:
+        """累计用时（告警载荷的整秒呈现）。"""
+        return int(self.elapsed_seconds_exact(now))
 
 
 def make_alert_id() -> str:

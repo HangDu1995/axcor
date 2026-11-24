@@ -497,11 +497,11 @@ class NodeTimeoutRule(DetectionRule):
         """到期检查：只在开段（运行中）且未报过时告警（终态检查）。"""
         if clock.fired or clock.running_since is None:
             return
-        elapsed = clock.elapsed_seconds(now)
-        if elapsed < clock.threshold_seconds:
+        elapsed_exact = clock.elapsed_seconds_exact(now)
+        if elapsed_exact < clock.threshold_seconds:
             return
         clock.fired = True
-        clock.accumulated_seconds = float(elapsed)
+        clock.accumulated_seconds = elapsed_exact
         clock.running_since = None
         try:
             await emit_run_fault_event(
@@ -516,7 +516,7 @@ class NodeTimeoutRule(DetectionRule):
                     "session_id": clock.session_id,
                     "verify_session_id": clock.verify_session_id,
                     "started_at": clock.started_at.isoformat(),
-                    "elapsed_seconds": elapsed,
+                    "elapsed_seconds": int(elapsed_exact),
                     "threshold_seconds": clock.threshold_seconds,
                 },
             )
@@ -524,7 +524,7 @@ class NodeTimeoutRule(DetectionRule):
                 "watchdog alert fired: node %s (gen %s) 累计 %ss 超时限 %ss",
                 clock.node_id,
                 clock.gen,
-                elapsed,
+                int(elapsed_exact),
                 clock.threshold_seconds,
             )
         except Exception:
@@ -543,7 +543,7 @@ class NodeTimeoutRule(DetectionRule):
         if clock is None:
             return
         if clock.running_since is not None:
-            clock.accumulated_seconds = float(clock.elapsed_seconds(now))
+            clock.accumulated_seconds = clock.elapsed_seconds_exact(now)
             clock.running_since = None
             await self._persist(clock)
 
@@ -553,7 +553,7 @@ class NodeTimeoutRule(DetectionRule):
             return
         for clock in list(self._clocks.values()):
             if clock.run_id == run_id and clock.running_since is not None:
-                clock.accumulated_seconds = float(clock.elapsed_seconds(now))
+                clock.accumulated_seconds = clock.elapsed_seconds_exact(now)
                 clock.running_since = None
                 await self._persist(clock)
 
@@ -572,7 +572,7 @@ class NodeTimeoutRule(DetectionRule):
                 and clock.gen < gen
                 and clock.running_since is not None
             ):
-                clock.accumulated_seconds = float(clock.elapsed_seconds(now))
+                clock.accumulated_seconds = clock.elapsed_seconds_exact(now)
                 clock.running_since = None
                 await self._persist(clock)
 
@@ -580,7 +580,7 @@ class NodeTimeoutRule(DetectionRule):
         """开段滚动落账：计时段起点前移到本拍（崩溃损失 ≤ 一拍）。"""
         if clock.running_since is None:
             return
-        clock.accumulated_seconds = float(clock.elapsed_seconds(now))
+        clock.accumulated_seconds = clock.elapsed_seconds_exact(now)
         clock.running_since = now
         await self._persist(clock)
 
