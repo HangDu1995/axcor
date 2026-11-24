@@ -18,10 +18,14 @@
 首个副作用前建组（组恢复点不可变），同 message 后续副作用入组只前进
 child_base_commit（用于该子建区与补账，不作为恢复目标）。本模块只做
 runtime 无关的核心逻辑，屏障的受理与有界等待在 run 平面。
+
+另承载组副作用台账（DispatchReplayLedger）：按组留存原始 task 调用
+参数与副作用计数，供 replay_dispatch 的「单 task、无其他副作用」校验。
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -38,6 +42,8 @@ from workflow_controller.core.workspace.actions import (
 from workflow_controller.core.workspace.scope_tree import ScopeKind
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from workflow_controller.core.checkpoints import (
         CheckpointStore,
         DispatchAnchor,
@@ -50,21 +56,33 @@ __all__ = [
     "DispatchAdmission",
     "DispatchGroupArbiter",
     "DispatchGroupError",
+    "DispatchReplayLedger",
+    "GroupSideEffectRecord",
+    "ReplayRejectedError",
 ]
+
+# 子代理工作区声明词面：writer（默认，独立可写工作区）| reader（detached 快照）
+WORKSPACE_WRITER = "writer"
+WORKSPACE_READER = "reader"
 
 
 class DispatchGroupError(RuntimeError):
     """组仲裁拒绝：状态或参数不满足时显式失败。"""
 
 
+class ReplayRejectedError(DispatchGroupError):
+    """replay_dispatch 拒绝：组不满足「单 task、无其他副作用」。"""
+
+
 @dataclass(frozen=True)
 class ChildDispatchRequest:
-    """task 派发的建区参数：预置作用域键、可选属主与声明写路径。"""
+    """task 派发的建区参数：预置作用域键、可选属主、声明写路径与工作区档位。"""
 
     scope_key: str
     client_op_id: str
     owner_ref: str | None = None
     claims: tuple[str, ...] = ()
+    workspace: str = WORKSPACE_WRITER
 
 
 @dataclass(frozen=True)
@@ -78,6 +96,7 @@ class DispatchAdmission:
     child_scope_id: str | None = None
     child_cwd: str | None = None
     child_base_commit: str | None = None
+    reader_snapshot: bool = False
 
 
 @dataclass
@@ -93,13 +112,110 @@ class _ActiveGroup:
     established: bool = field(default=False)
 
 
+@dataclass(frozen=True)
+class GroupSideEffectRecord:
+    """组副作用台账行：task 调用参数与全部副作用的工具调用号。"""
+
+    group_id: str
+    tasks: tuple[dict[str, str], ...] = ()
+    side_effect_tool_use_ids: tuple[str, ...] = ()
+
+
+class DispatchReplayLedger:
+    """组副作用台账：JSON 文件按组留存，供恢复时重放与校验。"""
+
+    def __init__(self, base_dir: Path) -> None:
+        """台账目录惰性创建于首次写入。"""
+        self._base_dir = base_dir
+
+    def record_task(
+        self,
+        group_id: str,
+        *,
+        tool_use_id: str,
+        tool_name: str,
+        tool_input: object,
+    ) -> None:
+        """登记一个 task 派发的原始调用参数。"""
+        record = self._load(group_id)
+        tasks = [t for t in record.tasks if t.get("tool_use_id") != tool_use_id]
+        tasks.append(
+            {
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "tool_input": json.dumps(tool_input, ensure_ascii=False, default=str),
+            }
+        )
+        self._save(group_id, replace(record, tasks=tuple(tasks)))
+
+    def record_side_effect(self, group_id: str, *, tool_use_id: str) -> None:
+        """登记一个非 task 副作用（写文件类/Bash 工具）。"""
+        record = self._load(group_id)
+        ids = list(record.side_effect_tool_use_ids)
+        if tool_use_id and tool_use_id not in ids:
+            ids.append(tool_use_id)
+        self._save(group_id, replace(record, side_effect_tool_use_ids=tuple(ids)))
+
+    def require_single_task(self, group_id: str, checkpoint_id: str) -> dict[str, str]:
+        """校验组满足重放前提并返回唯一 task 的原始调用参数。
+
+        多 task 或存在其他副作用的组回滚会撤回整组，只重放目标 task 会
+        缺输入——明确拒绝；台账缺席（崩溃残留丢失或旧组）同样拒绝。
+        """
+        record = self._load(group_id)
+        if not record.tasks or record.side_effect_tool_use_ids or len(record.tasks) != 1:
+            raise ReplayRejectedError(
+                f"replay_dispatch 仅允许单 task、无其他副作用的派发组：{checkpoint_id}"
+                f"（组内 task {len(record.tasks)} 个、其他副作用 {len(record.side_effect_tool_use_ids)} 个），"
+                "多副作用组请用自然续跑"
+            )
+        return record.tasks[0]
+
+    def _load(self, group_id: str) -> GroupSideEffectRecord:
+        """读组台账；文件缺席返回空记录。"""
+        path = self._path(group_id)
+        if not path.is_file():
+            return GroupSideEffectRecord(group_id=group_id)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return GroupSideEffectRecord(group_id=group_id)
+        return GroupSideEffectRecord(
+            group_id=group_id,
+            tasks=tuple(raw.get("tasks") or ()),
+            side_effect_tool_use_ids=tuple(raw.get("side_effects") or ()),
+        )
+
+    def _save(self, group_id: str, record: GroupSideEffectRecord) -> None:
+        """写组台账（原子替换）。"""
+        self._base_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "tasks": [dict(t) for t in record.tasks],
+            "side_effects": list(record.side_effect_tool_use_ids),
+        }
+        path = self._path(group_id)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+
+    def _path(self, group_id: str) -> Path:
+        """组台账文件路径（组标识含作用域前缀，天然不冲突）。"""
+        return self._base_dir / f"{group_id}.json"
+
+
 class DispatchGroupArbiter:
     """按父作用域维护活动派发组并执行组检查点落账。"""
 
-    def __init__(self, manager: WorkspaceManager, checkpoints: CheckpointStore) -> None:
-        """装配工作区管理器与检查点账本。"""
+    def __init__(
+        self,
+        manager: WorkspaceManager,
+        checkpoints: CheckpointStore,
+        replay_ledger: DispatchReplayLedger | None = None,
+    ) -> None:
+        """装配工作区管理器、检查点账本与可选组副作用台账。"""
         self._manager = manager
         self._checkpoints = checkpoints
+        self._replay_ledger = replay_ledger
         self._active: dict[str, _ActiveGroup] = {}
         self._group_seq = 0
 
@@ -111,6 +227,8 @@ class DispatchGroupArbiter:
         child: ChildDispatchRequest | None = None,
         barrier_quality: BarrierQuality,
         orchestration_state_ref: str,
+        tool_name: str = "",
+        tool_input: object = None,
     ) -> DispatchAdmission:
         """受理一个副作用屏障：建组或入组，task 场景建子工作区并回 cwd。
 
@@ -142,6 +260,7 @@ class DispatchGroupArbiter:
 
         if child is None:
             # 写文件类副作用：组检查点已先于本副作用，放行（修改落父分支）
+            self._record_side_effect(group, anchor.tool_use_id)
             return DispatchAdmission(
                 dispatch_group_id=group.group_id,
                 group_checkpoint_id=group.group_checkpoint_id,
@@ -149,6 +268,9 @@ class DispatchGroupArbiter:
                 anchor=self._finalize_anchor(anchor, group.group_id),
             )
 
+        self._record_task(group, anchor.tool_use_id, tool_name, tool_input)
+        if child.workspace == WORKSPACE_READER:
+            return await self._admit_reader(group, parent, anchor, child)
         prepared = await self._manager.prepare_scope_workspace(
             PrepareScopeWorkspace(
                 parent_scope_id=parent_scope_id,
@@ -186,6 +308,50 @@ class DispatchGroupArbiter:
             child_cwd=prepared.workspace_path,
             child_base_commit=prepared.base_commit,
         )
+
+    async def _admit_reader(
+        self,
+        group: _ActiveGroup,
+        parent: ScopeRecord,
+        anchor: DispatchAnchor,
+        child: ChildDispatchRequest,
+    ) -> DispatchAdmission:
+        """reader 派发准入：组恢复点上的 detached 快照，无分支不入账后续派发行。"""
+        prepared = await self._manager.prepare_reader_workspace(
+            parent.scope_id, child.scope_key, base_commit=group.group_commit
+        )
+        group.established = True
+        return DispatchAdmission(
+            dispatch_group_id=group.group_id,
+            group_checkpoint_id=group.group_checkpoint_id,
+            checkpoint_id=group.group_checkpoint_id,
+            anchor=self._finalize_anchor(anchor, group.group_id),
+            child_scope_id=prepared.scope_id,
+            child_cwd=prepared.workspace_path,
+            child_base_commit=group.group_commit,
+            reader_snapshot=True,
+        )
+
+    def _record_task(
+        self,
+        group: _ActiveGroup,
+        tool_use_id: str,
+        tool_name: str,
+        tool_input: object,
+    ) -> None:
+        """组台账登记 task 调用参数（replay_dispatch 的重放数据源）。"""
+        if self._replay_ledger is not None:
+            self._replay_ledger.record_task(
+                group.group_id,
+                tool_use_id=tool_use_id,
+                tool_name=tool_name or "Task",
+                tool_input=tool_input,
+            )
+
+    def _record_side_effect(self, group: _ActiveGroup, tool_use_id: str) -> None:
+        """组台账登记非 task 副作用（多副作用组拒绝重放的判据）。"""
+        if self._replay_ledger is not None:
+            self._replay_ledger.record_side_effect(group.group_id, tool_use_id=tool_use_id)
 
     async def attach_child_session(
         self,

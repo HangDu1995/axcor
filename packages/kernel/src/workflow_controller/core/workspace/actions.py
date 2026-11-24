@@ -140,6 +140,8 @@ class ScopeRestored:
     scope_id: str
     new_scope_epoch: int
     root_epoch: int
+    checkpoint_id: str = ""
+    abandoned_descendants: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)

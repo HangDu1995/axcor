@@ -56,6 +56,12 @@ from workflow_controller.core.checkpoints import (
     ScopeCheckpoint,
     checkpoint_to_dict,
 )
+from workflow_controller.core.conversation_restore import (
+    ConversationRestoreData,
+    ConversationRestorePlan,
+    ConversationRestorer,
+    TranscriptLocator,
+)
 from workflow_controller.core.run_export import RunExportService
 from workflow_controller.core.run_host import KILL_GRACE_S as KILL_GRACE_S
 from workflow_controller.core.run_host import STOP_DRAIN_TIMEOUT_S as STOP_DRAIN_TIMEOUT_S
@@ -100,8 +106,11 @@ from workflow_controller.core.workspace.claims import (
     ClaimRejectedError,
 )
 from workflow_controller.core.workspace.dispatch_groups import (
+    WORKSPACE_READER,
     ChildDispatchRequest,
     DispatchGroupArbiter,
+    DispatchReplayLedger,
+    ReplayRejectedError,
 )
 from workflow_controller.core.workspace.integration import IntegrationCoordinator
 from workflow_controller.core.workspace.manager import ScopeQuiesceFailedError
@@ -154,9 +163,12 @@ from workflow_controller.plugin.workspace import (
     IntegrateScope,
     PrepareScopeWorkspace,
     RestoreCommitted,
+    RestoreScope,
+    RestoreSessionBound,
     ScopeAbandoned,
     ScopeIntegrated,
     ScopeIntegrationRejected,
+    ScopeRestored,
     ScopeTerminalCommitted,
     ScopeWorkspacePrepared,
     WorkspaceActionFailed,
@@ -164,6 +176,7 @@ from workflow_controller.plugin.workspace import (
     WorkspaceTreeConfig,
 )
 from workflow_controller.session.events import Event, EventType, SessionOutcome
+from workflow_controller.transcript.sources import resolve_claude_session_path
 from workflow_controller.watchdog.fault import (
     SCOPE_QUIESCE_FAILED_RULE,
     WORKSPACE_CONFLICT_RULE,
@@ -207,6 +220,16 @@ _FROZEN_ENTRY_MARKER = (
 _LAYR_CONFIG_NAME = (
     "layr.yaml"  # layr 程序的组件面配置（从程序目录向上找，同名同序镜像 layr 侧 find_layr_config）
 )
+
+
+def _json_loads_or_none(text: str) -> Any:
+    """解析 JSON 字符串；空串或坏输入返回 None。"""
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
 
 
 def _find_layr_config(start_dir: Path) -> Path | None:
@@ -843,6 +866,22 @@ def _workspace_branch_of(scope: ScopeRecord) -> str | None:
     return scope.workspace_ref.rpartition("|")[2] or None
 
 
+@dataclass
+class _PendingSubagentRestore:
+    """子代理回滚链的待绑定恢复：数据就绪，会话在确认后创建。"""
+
+    data: ConversationRestoreData
+    bound_session_id: str | None = None
+
+
+def _default_transcript_locator(native_session_id: str, workspace_path: str) -> Path | None:
+    """默认 L2 定位：按父会话原生标识与工作目录解析 claude 系 JSONL。"""
+    if not native_session_id:
+        return None
+    found = resolve_claude_session_path(native_session_id, workspace_path, None)
+    return found
+
+
 class _WorkspaceTree:
     """单 run 的工作区树运行时：装配好的管理器与根作用域标识。
 
@@ -865,6 +904,8 @@ class _WorkspaceTree:
         drain_background_writers 为可注入的后台写进程排空回调。
         """
         repository = WorkspaceRepository(Path(config.root_dir), tree_id=run_id)
+        self.tree_dir = repository.tree_dir
+        self.replay_ledger = DispatchReplayLedger(repository.tree_dir / "dispatch")
         self.manager = WorkspaceManager(
             repository=repository,
             scope_tree=ScopeTree(),
@@ -877,12 +918,14 @@ class _WorkspaceTree:
             claims_enforce=config.claims_enforce,
         )
         self.checkpoints = checkpoints
-        self.arbiter = DispatchGroupArbiter(self.manager, checkpoints)
+        self.arbiter = DispatchGroupArbiter(self.manager, checkpoints, self.replay_ledger)
         self.retain_after_merge = config.retain_after_merge
         self.on_no_dispatch_barrier = config.on_no_dispatch_barrier
         self.barrier_wait_timeout_s = config.background_drain_timeout_s
         self.root_scope_id = f"{run_id}-root"
         self._child_seq = 0
+        # 子代理回滚链的待绑定恢复数据（scope_id → 恢复事实与已绑定会话）
+        self.pending_restores: dict[str, _PendingSubagentRestore] = {}
 
     async def initialize(self) -> None:
         """导入基线并建根作用域；私有仓已存在时显式失败。"""
@@ -918,6 +961,7 @@ class RunCoordinator:
         affiliation: SessionRunAffiliationService,
         decide_timeout_s: float = DECIDE_TIMEOUT_S,
         workspace_drain_hook: BackgroundDrainHook | None = None,
+        workspace_transcript_locator: TranscriptLocator | None = None,
     ) -> None:
         self._orch = orchestrator
         self._run_store = run_store
@@ -926,8 +970,20 @@ class RunCoordinator:
         set_barrier_port = getattr(orchestrator, "set_dispatch_barrier_port", None)
         if callable(set_barrier_port):
             set_barrier_port(self.submit_dispatch_barrier)
+        # 会话宿主侧的子代理启动端口：组检查点行回填子会话映射（尽力）
+        set_start_port = getattr(orchestrator, "set_subagent_start_port", None)
+        if callable(set_start_port):
+            set_start_port(self.record_subagent_start)
         # 工作区闸门的可注入后台写进程排空回调（后台写者清单接线前默认无）
         self._workspace_drain_hook = workspace_drain_hook
+        # 对话恢复的 L2 定位器（默认按 claude 系路径解析；测试可注入）
+        resume_starter = getattr(orchestrator, "start_session_with_resume", None)
+        self._restorer = ConversationRestorer(
+            locate_transcript=workspace_transcript_locator or _default_transcript_locator,
+            start_resumed_session=resume_starter
+            if callable(resume_starter)
+            else self._reject_resumed_session,
+        )
         # 冻结映射：工厂集在插件装载后不可变（无热重载），重名注册已在
         # 组合根聚合时 raise——boot 期 fail-fast，而非首次 start_run
         self._driver_factories: dict[str, RunDriverFactory] = dict(driver_factories)
@@ -960,6 +1016,8 @@ class RunCoordinator:
         self._workspace_trees: dict[
             str, _WorkspaceTree
         ] = {}  # run_id → 工作区树运行时（首个工作区动作惰性建立）
+        # 派发准入的子会话回填线索：(run_id, tool_use_id) → (检查点, 子作用域)
+        self._dispatch_admissions: dict[tuple[str, str], tuple[str, str]] = {}
         self._decide_pools: dict[
             str, ThreadPoolExecutor
         ] = {}  # format → decide 线程子池（惰性创建）
@@ -1468,6 +1526,7 @@ class RunCoordinator:
         data: Mapping[str, Any],
         *,
         runtime: str = "",
+        workspace: str = "writer",
     ) -> BarrierOutcome:
         """派发屏障入口：会话宿主发起，经 FIFO 在 run 任务内执行核心动作。
 
@@ -1497,6 +1556,7 @@ class RunCoordinator:
                 context=affiliation.context,
                 data=dict(data),
                 reply=reply,
+                workspace=workspace,
             ),
         )
         try:
@@ -1509,6 +1569,49 @@ class RunCoordinator:
                 ),
                 fault=fault_event_type(SCOPE_QUIESCE_FAILED_RULE),
             )
+
+    async def record_subagent_start(self, session_id: str, data: Mapping[str, Any]) -> None:
+        """子代理启动回执：按派发准入回填组检查点行的子会话映射（尽力）。"""
+        affiliation = self._affiliation.resolve(session_id)
+        if affiliation is None:
+            return
+        tree = self._workspace_trees.get(affiliation.run_id)
+        if tree is None:
+            return
+        tool_use_id = str(data.get("parent_tool_use_id") or data.get("tool_use_id") or "")
+        native_child = str(data.get("agent_id") or "")
+        if not tool_use_id or not native_child:
+            return
+        admission = self._dispatch_admissions.get((affiliation.run_id, tool_use_id))
+        if admission is None:
+            return
+        checkpoint_id, child_scope_id = admission
+        try:
+            await tree.arbiter.attach_child_session(checkpoint_id, child_scope_id, native_child)
+        except Exception:
+            logger.warning("子会话映射回填失败（不阻塞子代理运行）：checkpoint=%s", checkpoint_id)
+
+    async def validate_dispatch_replay(self, run_id: str, checkpoint_id: str) -> None:
+        """replay_dispatch 前置校验：目标组须单 task 且无其他副作用。"""
+        tree = self._workspace_trees.get(run_id)
+        if tree is None:
+            raise ReplayRejectedError(
+                f"run {run_id} 无工作区树运行时，无法校验重放组：{checkpoint_id}"
+            )
+        checkpoint = await tree.checkpoints.get(checkpoint_id)
+        if (
+            checkpoint is None
+            or checkpoint.dispatch_anchor is None
+            or checkpoint.trigger is not CheckpointTrigger.BEFORE_CHILD
+        ):
+            raise ReplayRejectedError(f"重放目标不是派发组检查点：{checkpoint_id}")
+        anchor = checkpoint.dispatch_anchor
+        tree.replay_ledger.require_single_task(anchor.dispatch_group_id, checkpoint_id)
+
+    @staticmethod
+    async def _reject_resumed_session(*args: Any, **kwargs: Any) -> Any:
+        """编排器无 resume 入口时显式失败（不静默降级）。"""
+        raise RuntimeError("编排器缺少 start_session_with_resume 入口，无法绑定恢复会话")
 
     async def load_driver_snapshot(self, run_id: str) -> dict[str, Any] | None:
         """最新驱动快照（读盘；配置重读与外部对账用）。"""
@@ -1932,6 +2035,8 @@ class RunCoordinator:
         tree = self._workspace_trees.pop(run_id, None)
         if tree is not None:
             tree.checkpoints.close()  # 释放检查点账本连接（磁盘产物留给 GC）
+        for key in [k for k in self._dispatch_admissions if k[0] == run_id]:
+            self._dispatch_admissions.pop(key, None)
         if not task.cancelled() and task.exception() is not None:
             logger.error("run %s 任务异常结束", run_id, exc_info=task.exception())
 
@@ -2291,6 +2396,7 @@ class RunCoordinator:
                 scope_key=scope_key,
                 client_op_id=client_op_id,
                 owner_ref=f"session={req.session_id}",
+                workspace=WORKSPACE_READER if req.workspace == WORKSPACE_READER else "writer",
             )
             preallocated = scope_key
         anchor = self._barrier_anchor(req, preallocated)
@@ -2301,7 +2407,14 @@ class RunCoordinator:
             child=child,
             barrier_quality=(BarrierQuality.PRECISE if strict else BarrierQuality.LATE_BARRIER),
             orchestration_state_ref=orchestration_ref,
+            tool_name=str(req.data.get("tool_name") or ""),
+            tool_input=req.data.get("tool_input"),
         )
+        if child is not None and admission.child_scope_id:
+            self._dispatch_admissions[(rt.run_id, anchor.tool_use_id)] = (
+                admission.checkpoint_id,
+                admission.child_scope_id,
+            )
         return BarrierProceed(child_cwd=admission.child_cwd)
 
     async def _barrier_parent_scope(
@@ -2490,9 +2603,13 @@ class RunCoordinator:
         if isinstance(action, AbandonScope):
             await self._execute_workspace_abandon(rt, action)
             return True
-        # 恢复确认（RestoreCommitted）：编排层失效计划持久化确认，核心重建
-        # 闸门接线前为纯确认、无独立回执——紧随的建区动作回执即生效信号
-        return isinstance(action, RestoreCommitted)
+        if isinstance(action, RestoreScope):
+            await self._execute_workspace_restore(rt, action)
+            return True
+        if isinstance(action, RestoreCommitted):
+            await self._execute_restore_commit(rt, action)
+            return True
+        return False
 
     async def _execute_workspace_prepare(
         self, rt: RunRuntime, action: PrepareScopeWorkspace
@@ -2565,7 +2682,14 @@ class RunCoordinator:
     async def _reply_workspace_failure(
         self,
         rt: RunRuntime,
-        action: PrepareScopeWorkspace | CommitScopeTerminal | IntegrateScope | AbandonScope,
+        action: (
+            PrepareScopeWorkspace
+            | CommitScopeTerminal
+            | IntegrateScope
+            | AbandonScope
+            | RestoreScope
+            | RestoreCommitted
+        ),
         *,
         error: BaseException,
     ) -> None:
@@ -2816,6 +2940,145 @@ class RunCoordinator:
                 context=action.context,
             ),
         )
+
+    async def _execute_workspace_restore(self, rt: RunRuntime, action: RestoreScope) -> None:
+        """执行组检查点恢复：闸门内 reset 撤回组内副作用并备好对话恢复数据。
+
+        定序保证的前半步：本方法只准备恢复数据（截断 + 种子），不启动
+        新 session——编排层持久化失效状态（RestoreCommitted）之后才创建
+        绑定。检查点须为该父作用域的组检查点行（before_child + 组行）。
+        """
+        tree = self._workspace_trees.get(rt.run_id)
+        if tree is None:
+            self._notify(
+                rt.run_id,
+                WorkspaceActionFailed(
+                    action="RestoreScope",
+                    client_op_id=action.client_op_id,
+                    error=f"run {rt.run_id} 无工作区树",
+                    context=action.context,
+                ),
+            )
+            return
+        try:
+            checkpoint = await tree.checkpoints.get(action.checkpoint_id)
+            if checkpoint is None:
+                raise ValueError(f"检查点不存在：{action.checkpoint_id}")
+            if checkpoint.trigger is not CheckpointTrigger.BEFORE_CHILD:
+                raise ValueError(f"回滚目标须为派发组检查点：{action.checkpoint_id}")
+            if checkpoint.scope_id != action.scope_id:
+                raise ValueError(
+                    f"检查点不属于目标作用域：{action.checkpoint_id}（{checkpoint.scope_id}）"
+                )
+            anchor = checkpoint.dispatch_anchor
+            if anchor is None or not anchor.dispatch_group_id:
+                raise ValueError(f"检查点缺少派发锚点：{action.checkpoint_id}")
+            if action.checkpoint_id != (
+                f"{action.scope_id}:before_child:{anchor.dispatch_group_id}"
+            ):
+                raise ValueError(f"回滚目标须为组恢复点行（而非派发行）：{action.checkpoint_id}")
+            scope = await tree.manager.get_scope(action.scope_id)
+            if scope is None:
+                raise ValueError(f"作用域不存在：{action.scope_id}")
+            replay_task: dict[str, str] | None = None
+            if action.replay_dispatch:
+                replay_task = tree.replay_ledger.require_single_task(
+                    anchor.dispatch_group_id, action.checkpoint_id
+                )
+            restored = await tree.manager.restore_scope(
+                action.scope_id,
+                restore_commit=checkpoint.workspace_commit,
+                expected_scope_epoch=action.expected_scope_epoch,
+                client_op_id=action.client_op_id,
+            )
+            plan = ConversationRestorePlan(
+                run_id=rt.run_id,
+                scope_id=action.scope_id,
+                scope_epoch=restored.new_scope_epoch,
+                checkpoint_id=action.checkpoint_id,
+                anchor=anchor,
+                workspace_path=self._scope_workspace_path(scope),
+                seed_dir=tree.tree_dir / "restore" / action.client_op_id,
+                session_runtime=action.session_runtime,
+                replay_tool_name=replay_task.get("tool_name", "") if replay_task else "",
+                replay_tool_input=(
+                    _json_loads_or_none(replay_task.get("tool_input", "")) if replay_task else None
+                ),
+            )
+            data = await self._restorer.prepare(plan)
+            tree.pending_restores[action.scope_id] = _PendingSubagentRestore(data=data)
+            # 组恢复点已回退：该作用域的活动组失效（新 message 开新组）
+            tree.arbiter.forget(action.scope_id)
+        except Exception as e:
+            await self._reply_workspace_failure(rt, action, error=e)
+            return
+        self._notify(
+            rt.run_id,
+            ScopeRestored(
+                scope_id=restored.scope_id,
+                new_scope_epoch=restored.new_scope_epoch,
+                checkpoint_id=action.checkpoint_id,
+                abandoned_descendants=restored.abandoned_descendants,
+                context=action.context,
+            ),
+        )
+
+    async def _execute_restore_commit(self, rt: RunRuntime, action: RestoreCommitted) -> None:
+        """恢复确认执行：子代理链在此创建并绑定恢复 session（幂等）。"""
+        if not action.restore_binding:
+            return  # 未合并节点回滚链：纯确认，紧随的建区回执即生效信号
+        tree = self._workspace_trees.get(rt.run_id)
+        pending = None if tree is None else tree.pending_restores.get(action.scope_id)
+        if pending is None:
+            self._notify(
+                rt.run_id,
+                WorkspaceActionFailed(
+                    action="RestoreCommitted",
+                    client_op_id=action.client_op_id,
+                    error=(f"恢复数据缺席（树运行时重建或恢复链丢失）：{action.scope_id}"),
+                    context=action.context,
+                ),
+            )
+            return
+        if pending.bound_session_id is not None:
+            self._notify(
+                rt.run_id,
+                RestoreSessionBound(
+                    scope_id=action.scope_id,
+                    session_id=pending.bound_session_id,
+                    checkpoint_id=pending.data.plan.checkpoint_id,
+                    context=action.context,
+                ),
+            )
+            return
+        try:
+            binding = await self._restorer.bind(pending.data)
+            with contextlib.suppress(Exception):
+                await self._affiliation.attach(
+                    binding.session_id, rt.run_id, role="executor", context=action.context
+                )
+            with contextlib.suppress(Exception):
+                await self._affiliation.set_context(binding.session_id, action.context)
+        except Exception as e:
+            await self._reply_workspace_failure(rt, action, error=e)
+            return
+        pending.bound_session_id = binding.session_id
+        self._notify(
+            rt.run_id,
+            RestoreSessionBound(
+                scope_id=action.scope_id,
+                session_id=binding.session_id,
+                checkpoint_id=pending.data.plan.checkpoint_id,
+                context=action.context,
+            ),
+        )
+
+    @staticmethod
+    def _scope_workspace_path(scope: ScopeRecord) -> str:
+        """作用域工作区路径（workspace_ref 前段）。"""
+        if not scope.workspace_ref:
+            raise RuntimeError(f"作用域没有工作区引用：{scope.scope_id}")
+        return scope.workspace_ref.rpartition("|")[0]
 
     async def _await_sessions_task(self, rt: RunRuntime, action: AwaitSessions) -> None:
         """session 等待后台任务：等待完成（超时已保证停 session）后仅唤醒循环。"""

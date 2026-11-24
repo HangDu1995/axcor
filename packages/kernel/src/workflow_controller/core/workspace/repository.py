@@ -188,6 +188,36 @@ class WorkspaceRepository:
             base_commit=base_commit_after_materialize,
         )
 
+    async def create_reader_workspace(
+        self,
+        scope_key: str,
+        *,
+        commit: str,
+    ) -> Path:
+        """建 reader 子代理的 detached worktree 只读快照：无分支、不建基线提交。
+
+        严格模式下 reader 的写入不构成保证：本仓不做只读挂载强制，按
+        审计约定处理（越界写由 file_provenance 审计与对账发现）。
+        """
+        if not scope_key or "/" in scope_key:
+            raise WorkspaceRepositoryError(f"非法 scope_key：{scope_key!r}")
+        workspace_path = self.workspaces_dir / scope_key
+        if workspace_path.exists():
+            raise WorkspaceRepositoryError(f"作用域工作区已存在：{workspace_path}")
+        await self._run_repo_git(
+            ["worktree", "add", "--quiet", "--detach", str(workspace_path), commit]
+        )
+        return workspace_path
+
+    async def reset_workspace_state(self, workspace_path: Path, commit: str) -> None:
+        """把工作区文件态硬恢复到目标提交：reset 后清掉全部未跟踪残留。
+
+        clean 带 -x：被忽略路径中未跟踪的构建产物同属检查点之后的
+        副作用，一并撤回（可重建路径由重建脚本重新生成）。
+        """
+        await self._run_workspace_git(workspace_path, ["reset", "--hard", commit])
+        await self._run_workspace_git(workspace_path, ["clean", "-fdx", "--quiet"])
+
     async def commit_workspace_state(self, workspace_path: Path, message: str) -> str:
         """全量暂存并提交工作区当前状态，返回提交号。"""
         await self._run_workspace_git(workspace_path, ["add", "-A", "--force"])

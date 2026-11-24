@@ -38,9 +38,12 @@ __all__ = [
     "PrepareScopeWorkspace",
     "RebuildScriptDecl",
     "RestoreCommitted",
+    "RestoreScope",
+    "RestoreSessionBound",
     "ScopeAbandoned",
     "ScopeIntegrated",
     "ScopeIntegrationRejected",
+    "ScopeRestored",
     "ScopeTerminalCommitted",
     "ScopeWorkspacePrepared",
     "WorkspaceActionFailed",
@@ -142,11 +145,53 @@ class RestoreCommitted(RunAction):
     """失效计划已持久化确认：核心此后方可重建工作区。
 
     无独立回执通知——紧随的建区/绑定动作回执即确认（核心重建闸门接线
-    前本动作为纯确认，宿主接受即生效）。
+    前本动作为纯确认，宿主接受即生效）。restore_binding 为真时表示子
+    代理回滚链：宿主须在此后创建并绑定恢复 session，恢复数据缺席即
+    动作失败。
     """
 
     scope_id: str
     client_op_id: str
+    context: str | None = None
+    restore_binding: bool = False
+
+
+@dataclass(frozen=True)
+class RestoreScope(RunAction):
+    """组检查点恢复动作：宿主把父作用域文件态恢复到组恢复点。
+
+    撤回该组全部副作用（scope_epoch+1、后代子作用域废弃），并准备
+    对话恢复数据（截断 + 种子，不启动新 session）；replay_dispatch
+    为真时按组台账校验并携带原始 task 调用参数。
+    """
+
+    scope_id: str
+    checkpoint_id: str
+    expected_scope_epoch: int
+    client_op_id: str
+    session_runtime: str | None = None
+    replay_dispatch: bool = False
+    context: str | None = None
+
+
+@dataclass(frozen=True)
+class ScopeRestored(RunNotification):
+    """组检查点恢复完成通知：新代次、一并废弃的后代与恢复数据就绪。"""
+
+    scope_id: str
+    new_scope_epoch: int
+    checkpoint_id: str
+    abandoned_descendants: tuple[tuple[str, int], ...] = ()
+    context: str | None = None
+
+
+@dataclass(frozen=True)
+class RestoreSessionBound(RunNotification):
+    """恢复会话绑定完成通知：新会话已按原 run/作用域/新代次绑定。"""
+
+    scope_id: str
+    session_id: str
+    checkpoint_id: str
     context: str | None = None
 
 

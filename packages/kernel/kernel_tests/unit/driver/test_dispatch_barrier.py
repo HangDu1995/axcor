@@ -156,6 +156,36 @@ async def test_sdk_pre_tool_dispatch_deny_blocks() -> None:
     assert "fault.scope_quiesce_failed" in result["reason"]
 
 
+async def test_sdk_pre_tool_passes_workspace_declaration() -> None:
+    """task 输入的 workspace 声明随屏障载荷透传（reader 快照声明）。"""
+    seen: list[dict[str, Any]] = []
+
+    def dispatch(sid: str, data: dict[str, Any]) -> BarrierProceed:
+        seen.append(data)
+        return BarrierProceed(child_cwd="/ws/reader-1")
+
+    hooks = _hooks(dispatch=dispatch)
+    await _sdk_pre_tool_cb(
+        {
+            "tool_name": "Task",
+            "tool_input": {"prompt": "read only", "workspace": "reader"},
+            "session_id": "nat-1",
+        },
+        "toolu-1",
+        None,
+        hooks=hooks,
+    )
+    assert seen[0]["workspace"] == "reader"
+    # 未声明时按 writer 默认
+    await _sdk_pre_tool_cb(
+        {"tool_name": "Task", "tool_input": {"prompt": "write"}, "session_id": "nat-1"},
+        "toolu-2",
+        None,
+        hooks=hooks,
+    )
+    assert seen[1]["workspace"] == "writer"
+
+
 async def test_sdk_pre_tool_side_effect_barrier_routes() -> None:
     """写文件类工具走副作用屏障；非副作用工具不触发。"""
     seen: list[str] = []

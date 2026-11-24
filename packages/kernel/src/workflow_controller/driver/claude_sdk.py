@@ -488,6 +488,10 @@ async def _sdk_pre_tool_cb(
         "agent_id": input_data.get("agent_id", ""),
         "agent_type": input_data.get("agent_type", ""),
         "prompt_id": input_data.get("prompt_id", ""),
+        # 子代理工作区声明（reader 快照）经工具输入透传；未声明按 writer
+        "workspace": (input_data.get("tool_input") or {}).get("workspace", "writer")
+        if isinstance(input_data.get("tool_input"), dict)
+        else "writer",
     }
     # 前置屏障（⑤ 副作用 / ① task 派发）：拒绝即阻断工具执行
     barrier_outcome: BarrierProceed | BarrierDeny | None = None

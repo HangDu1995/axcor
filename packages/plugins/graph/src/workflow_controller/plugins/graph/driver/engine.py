@@ -78,9 +78,12 @@ from workflow_controller.plugin.workspace import (
     PrepareScopeWorkspace,
     RebuildScriptDecl,
     RestoreCommitted,
+    RestoreScope,
+    RestoreSessionBound,
     ScopeAbandoned,
     ScopeIntegrated,
     ScopeIntegrationRejected,
+    ScopeRestored,
     ScopeTerminalCommitted,
     ScopeWorkspacePrepared,
     WorkspaceActionFailed,
@@ -281,10 +284,13 @@ _TIMER_MEMBER = "member"
 _TIMER_VERIFY_SCRIPT = "verify_script"
 _TIMER_VERDICT = "verdict"
 
-# 回滚操作阶段：登记 → 废弃中（等 ScopeAbandoned）→ 重建中（等新工作区）→ 终态
+# 回滚操作阶段：登记 → 废弃中（等 ScopeAbandoned）→ 重建中（等新工作区）→ 终态；
+# 子代理链：登记 → 恢复中（等 ScopeRestored）→ 绑定中（等 RestoreSessionBound）
 _OP_PENDING = "pending"
 _OP_ABANDONING = "abandoning"
 _OP_REBUILDING = "rebuilding"
+_OP_RESTORING = "restoring"
+_OP_BINDING = "binding"
 _OP_SUCCEEDED = "succeeded"
 _OP_FAILED = "failed"
 
@@ -388,6 +394,8 @@ class GraphDriver:
         self._dag_needs_members = any(self._node_needs_member(n) for n in self._dag.nodes)
         # 建区键序号：驱动生命周期内单调递增，保证不重号
         self._workspace_seq = 0
+        # 子代理回滚链在途的绑定确认操作号（回执到达或崩溃恢复后清/重发）
+        self._binding_confirmed: set[str] = set()
         # 步进状态（runtime-only；恢复后由调度重建）
         self._nodes: dict[str, NodeActivity] = {}
         self._agents_ready = program.agents_dir is None
@@ -575,6 +583,7 @@ class GraphDriver:
                 self._state.set_graph_status("running")
                 self._emit_graph_event(actions, "graph_started")
             self._advance_restore_ops(actions)
+            self._advance_subagent_restore_ops(actions)
             actions.extend(self._schedule(world))
             # 就绪节点启动会改变图状态；本轮返回前与节点档案保持一致。
             self._sync_graph_status(actions)
@@ -589,6 +598,9 @@ class GraphDriver:
     ) -> None:
         """显式重开检查整图；普通崩溃仅恢复被中断的 running 节点。"""
         self._demote_abandoning_restore_ops()
+        self._demote_restoring_subagent_ops()
+        # 在途绑定确认是否送达未知：恢复后重发（宿主侧幂等）
+        self._binding_confirmed.clear()
         if not running:
             return
         if reopened_at and reopened_at != self._applied_reopen_at:
@@ -775,6 +787,8 @@ class GraphDriver:
             }
         if op == "rollback_node":
             return self._register_rollback_op(args)
+        if op == "rollback_subagent":
+            return self._register_subagent_rollback_op(args)
         if op == "get_operation":
             return self._operation_status(str(args.get("operation_id") or ""))
         if op == "reload_definition":
@@ -869,6 +883,10 @@ class GraphDriver:
             self._on_workspace_prepared(note, actions)
         elif isinstance(note, ScopeAbandoned):
             self._on_workspace_abandoned(note, actions)
+        elif isinstance(note, ScopeRestored):
+            self._on_scope_restored(note, actions)
+        elif isinstance(note, RestoreSessionBound):
+            self._on_restore_session_bound(note)
         elif isinstance(note, ScopeTerminalCommitted):
             self._on_scope_terminal_committed(note, actions)
         elif isinstance(note, ScopeIntegrated):
@@ -2503,7 +2521,7 @@ class GraphDriver:
         不静默吞。
         """
         for record in self._state.operations().values():
-            if record.get("phase") != _OP_PENDING:
+            if record.get("phase") != _OP_PENDING or record.get("kind") != "rollback_node":
                 continue
             node_id = record["node_id"]
             mapping = self._state.node_workspace(node_id)
@@ -2670,6 +2688,225 @@ class GraphDriver:
                 and record.get("node_id") == node_id
             ):
                 self._fail_operation(record, f"重建工作区失败: {note.error}")
+            elif (
+                phase == _OP_RESTORING
+                and note.action == "RestoreScope"
+                and note.client_op_id == record.get("restore_op_id")
+            ):
+                self._fail_operation(record, f"组检查点恢复失败: {note.error}")
+            elif (
+                phase == _OP_BINDING
+                and note.action == "RestoreCommitted"
+                and note.client_op_id == record.get("operation_id")
+            ):
+                self._fail_operation(record, f"恢复会话绑定失败: {note.error}")
+
+    # ── 子代理回滚异步确认链 ────────────────────────────────────
+
+    def _register_subagent_rollback_op(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """子代理回滚 op 受理：只登记操作账并立即返回 operation_id。
+
+        回滚目标为派发组检查点（组恢复点行）；已集成到根（节点 passed）
+        的传播按已合并回滚处理，S4c 前明确拒绝。replay_dispatch 的「单
+        task、无其他副作用」校验在宿主侧（组副作用台账），受理面只透传。
+        """
+        if self._workspace_config is None:
+            raise ValueError("traceback workspace 未开启，拒绝文件回滚")
+        client_op_id = str(args.get("client_op_id") or "")
+        node_id = str(args.get("node_id") or "")
+        checkpoint_id = str(args.get("checkpoint_id") or "")
+        if not client_op_id:
+            raise ValueError("client_op_id 不能为空")
+        if not checkpoint_id:
+            raise ValueError("子代理回滚须指明组检查点（checkpoint_id）")
+        if self._dag_node(node_id) is None:
+            raise ValueError(f"节点不存在：{node_id}")
+        existing = self._state.operation_by_client(client_op_id)
+        if existing is not None:
+            if existing.get("kind") != "rollback_subagent" or (
+                existing.get("node_id") != node_id or existing.get("checkpoint_id") != checkpoint_id
+            ):
+                raise ValueError(f"client_op_id 冲突：{client_op_id} 已绑定其他回滚请求")
+            return self._operation_view(existing)
+        if self._state.status(node_id) == "passed":
+            raise ValueError(
+                f"目标已集成（passed）：{node_id}，子代理修改已合并到根，已合并回滚未实现"
+            )
+        if self._state.status(node_id) != "running":
+            raise ValueError(
+                f"子代理回滚目标须为执行中节点：{node_id}（{self._state.status(node_id)}）"
+            )
+        mapping = self._state.node_workspace(node_id)
+        if mapping is None:
+            raise ValueError(f"目标无有效检查点（节点无在册作用域）：{node_id}")
+        scope_id = str(args.get("scope_id") or "")
+        if scope_id and scope_id != mapping[0]:
+            raise ValueError(f"scope_id 与当前作用域不符：{mapping[0]}")
+        expected_epoch = args.get("expected_epoch")
+        if not isinstance(expected_epoch, int) or isinstance(expected_epoch, bool):
+            raise ValueError("expected_epoch 需为整数")
+        if expected_epoch != mapping[1]:
+            raise ValueError(f"expected_epoch 不匹配：当前作用域代次 {mapping[1]}")
+        now = datetime.now(tz=UTC).isoformat()
+        record: dict[str, Any] = {
+            "operation_id": client_op_id,
+            "client_op_id": client_op_id,
+            "kind": "rollback_subagent",
+            "node_id": node_id,
+            "scope_id": mapping[0],
+            "scope_epoch": mapping[1],
+            "checkpoint_id": checkpoint_id,
+            "expected_gen": self._state.gen(node_id),
+            "reason": str(args.get("reason") or "") or "子代理回滚",
+            "replay_dispatch": bool(args.get("replay_dispatch") or False),
+            "phase": _OP_PENDING,
+            "error": "",
+            "new_gen": 0,
+            "created_at": now,
+            "updated_at": now,
+        }
+        self._state.upsert_operation(record)
+        logger.info(
+            "subagent rollback op %s registered for node %s (scope %s e%s, group %s)",
+            client_op_id,
+            node_id,
+            mapping[0],
+            mapping[1],
+            checkpoint_id,
+        )
+        return self._operation_view(record)
+
+    def _advance_subagent_restore_ops(self, actions: list[RunAction]) -> None:
+        """推进子代理回滚链：登记态发恢复动作，绑定态重发确认（幂等）。"""
+        for record in self._state.operations().values():
+            if record.get("kind") != "rollback_subagent":
+                continue
+            if record.get("phase") == _OP_PENDING:
+                node_id = record["node_id"]
+                mapping = self._state.node_workspace(node_id)
+                if (
+                    mapping is None
+                    or mapping[0] != record["scope_id"]
+                    or mapping[1] != record["scope_epoch"]
+                ):
+                    self._fail_operation(record, "目标作用域映射已变化（重试或其他回滚先行）")
+                    continue
+                if self._state.gen(node_id) != record["expected_gen"]:
+                    self._fail_operation(record, "目标节点代次已变化（其他回滚先行）")
+                    continue
+                self._workspace_seq += 1
+                record["restore_op_id"] = f"rb-sub-restore-{self._workspace_seq}"
+                record["phase"] = _OP_RESTORING
+                record["updated_at"] = datetime.now(tz=UTC).isoformat()
+                self._state.upsert_operation(record)
+                actions.append(
+                    RestoreScope(
+                        scope_id=mapping[0],
+                        checkpoint_id=record["checkpoint_id"],
+                        expected_scope_epoch=mapping[1],
+                        client_op_id=record["restore_op_id"],
+                        session_runtime=self._runtime or None,
+                        replay_dispatch=bool(record.get("replay_dispatch") or False),
+                        context=f"node={node_id}",
+                    )
+                )
+            elif record.get("phase") == _OP_BINDING:
+                if str(record.get("operation_id")) in self._binding_confirmed:
+                    continue  # 确认在途不重发；崩溃恢复后由此重发（宿主侧幂等）
+                # 恢复数据已备好：每轮重发确认直至绑定回执（宿主侧幂等）
+                actions.append(
+                    RestoreCommitted(
+                        scope_id=record["scope_id"],
+                        client_op_id=record["operation_id"],
+                        context=f"node={record['node_id']}",
+                        restore_binding=True,
+                    )
+                )
+
+    def _demote_restoring_subagent_ops(self) -> None:
+        """恢复时把恢复中相位退回登记态：崩溃窗内恢复是否已执行未知，
+        重发恢复动作按代次幂等——已换代则宿主侧显式失败收口。"""
+        for record in self._state.operations().values():
+            if record.get("kind") != "rollback_subagent" or record.get("phase") != _OP_RESTORING:
+                continue
+            record["phase"] = _OP_PENDING
+            record["updated_at"] = datetime.now(tz=UTC).isoformat()
+            self._state.upsert_operation(record)
+
+    def _on_scope_restored(self, note: ScopeRestored, actions: list[RunAction]) -> None:
+        """组检查点恢复回执：失效落账（清旧会话绑定、换代映射）并发绑定确认。"""
+        for record in self._state.operations().values():
+            if record.get("kind") != "rollback_subagent" or record.get("phase") != _OP_RESTORING:
+                continue
+            if record.get("scope_id") != note.scope_id:
+                continue
+            if note.context != f"node={record['node_id']}":
+                continue
+            if note.new_scope_epoch != int(record.get("scope_epoch", 0)) + 1:
+                self._fail_operation(record, f"恢复回执代次异常：{note.new_scope_epoch}")
+                return
+            node_id = record["node_id"]
+            mapping = self._state.node_workspace(node_id)
+            if mapping is not None and mapping[0] == note.scope_id:
+                self._state.set_node_workspace(
+                    node_id, note.scope_id, note.new_scope_epoch, mapping[2]
+                )
+            record["scope_epoch"] = note.new_scope_epoch
+            # 待绑定身份持久化：清档案会话绑定，恢复会话到达后回填
+            old_sid = self._state.node_session_id(node_id)
+            self._state.clear_session_id(node_id)
+            act = self._nodes.get(node_id)
+            if act is not None:
+                act.session_id = None
+            if old_sid:
+                actions.append(DiscardSession(session_id=old_sid))
+            self._emit_graph_event(
+                actions,
+                "subagent_rollback",
+                node_id=node_id,
+                checkpoint_id=record["checkpoint_id"],
+                reason=record.get("reason") or "子代理回滚",
+            )
+            actions.append(
+                RestoreCommitted(
+                    scope_id=record["scope_id"],
+                    client_op_id=record["operation_id"],
+                    context=f"node={node_id}",
+                    restore_binding=True,
+                )
+            )
+            # 本轮已发确认：推进面跳过，避免同轮双发（宿主侧幂等兜底）
+            self._binding_confirmed.add(str(record["operation_id"]))
+            record["phase"] = _OP_BINDING
+            record["updated_at"] = datetime.now(tz=UTC).isoformat()
+            self._state.upsert_operation(record)
+            return
+
+    def _on_restore_session_bound(self, note: RestoreSessionBound) -> None:
+        """恢复会话绑定回执：重绑节点执行会话，操作收口。"""
+        for record in self._state.operations().values():
+            if record.get("kind") != "rollback_subagent" or record.get("phase") != _OP_BINDING:
+                continue
+            if record.get("scope_id") != note.scope_id:
+                continue
+            if note.context != f"node={record['node_id']}":
+                continue
+            node_id = record["node_id"]
+            self._state.set_node_session_id(node_id, note.session_id)
+            act = self._nodes.get(node_id)
+            if act is not None:
+                act.session_id = note.session_id
+            record["phase"] = _OP_SUCCEEDED
+            record["updated_at"] = datetime.now(tz=UTC).isoformat()
+            self._state.upsert_operation(record)
+            self._binding_confirmed.discard(str(record["operation_id"]))
+            logger.info(
+                "subagent rollback op %s completed: node %s rebinds session %s",
+                record["operation_id"],
+                node_id,
+                note.session_id,
+            )
+            return
 
     def _merge_subgraph(self, act: NodeActivity) -> None:
         """验收通过后把子图节点合并进父图 DAG/state。

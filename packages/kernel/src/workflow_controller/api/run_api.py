@@ -435,6 +435,49 @@ class RunAPI:
         except RunNotFoundError as e:
             raise RunApiNotFoundError(e.args[0] if e.args else run_id) from e
 
+    async def request_subagent_rollback(
+        self,
+        run_id: str,
+        *,
+        node_id: str,
+        client_op_id: str,
+        expected_epoch: int,
+        checkpoint_id: str,
+        scope_id: str | None = None,
+        replay_dispatch: bool = False,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """子代理回滚请求（异步）：转发驱动 rollback_subagent op，返回 operation_id。
+
+        检查点须为该 run 的派发组检查点行；replay_dispatch 开启时先做
+        「单 task、无其他副作用」校验，多副作用组明确拒绝。
+        """
+        rows = await self.list_run_checkpoints(run_id)
+        row = next((r for r in rows if r["checkpoint_id"] == checkpoint_id), None)
+        if row is None:
+            raise ValueError(f"检查点不存在于该 run：{checkpoint_id}")
+        if row.get("trigger") != "before_child" or not (row.get("dispatch_anchor") or {}).get(
+            "dispatch_group_id"
+        ):
+            raise ValueError(f"回滚目标须为派发组检查点：{checkpoint_id}")
+        if replay_dispatch:
+            await self._coord.validate_dispatch_replay(run_id, checkpoint_id)
+        args: dict[str, Any] = {
+            "node_id": node_id,
+            "client_op_id": client_op_id,
+            "expected_epoch": expected_epoch,
+            "checkpoint_id": checkpoint_id,
+            "replay_dispatch": True,
+        }
+        if scope_id is not None:
+            args["scope_id"] = scope_id
+        if reason:
+            args["reason"] = reason
+        try:
+            return await self._coord.request_driver_op(run_id, "rollback_subagent", args)
+        except RunNotFoundError as e:
+            raise RunApiNotFoundError(e.args[0] if e.args else run_id) from e
+
     async def reload_run_definition(
         self, run_id: str, program_path: str | Path | None = None
     ) -> dict[str, Any]:

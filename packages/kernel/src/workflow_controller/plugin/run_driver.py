@@ -466,6 +466,8 @@ class DispatchBarrierRequest(RunNotification):
     context: str | None = None
     data: Mapping[str, Any] = field(default_factory=dict)
     reply: Any = None
+    # 子代理工作区声明：writer（默认）| reader（detached 只读快照）
+    workspace: str = "writer"
 
 
 # ── 协议 ──────────────────────────────────────────────────────────

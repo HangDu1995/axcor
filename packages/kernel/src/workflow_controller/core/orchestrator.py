@@ -141,6 +141,8 @@ class Orchestrator:
     _stop_block_limit: int
     # 派发屏障端口：run 平面注册后会话宿主把屏障请求转交协调器队列
     _dispatch_barrier_port: Callable[..., Awaitable[BarrierOutcome]] | None
+    # 子代理启动端口：run 平面注册后据派发准入回填组检查点子会话映射
+    _subagent_start_port: Callable[..., Awaitable[None]] | None
 
     def __init__(
         self,
@@ -623,6 +625,18 @@ class Orchestrator:
         """登记派发屏障端口（run 平面注册；此后新激活会话接线屏障回调）。"""
         self._dispatch_barrier_port = port
 
+    def set_subagent_start_port(self, port: Callable[..., Awaitable[None]]) -> None:
+        """登记子代理启动端口（run 平面注册；此后新激活会话接线回填回调）。"""
+        self._subagent_start_port = port
+
+    async def _handle_subagent_start(self, session_id: str, data: dict[str, Any]) -> None:
+        """子代理启动回执分发：先记入 tracker，再尽力回填组检查点映射。"""
+        await self._subagents.on_start(session_id, data)
+        port = self._subagent_start_port
+        if port is not None:
+            with contextlib.suppress(Exception):
+                await port(session_id, data)
+
     async def _handle_dispatch_barrier(
         self,
         session_id: str,
@@ -639,7 +653,13 @@ class Orchestrator:
         runtime = ""
         if session is not None:
             runtime = resolve_runtime(session.config.runtime or self.config.runtime)
-        return await port(session_id, kind, data, runtime=runtime)
+        return await port(
+            session_id,
+            kind,
+            data,
+            runtime=runtime,
+            workspace=str(data.get("workspace") or "writer"),
+        )
 
     def make_driver_hooks(
         self,
@@ -685,7 +705,7 @@ class Orchestrator:
                 data.get("last_assistant_message", "") or "",
                 block_key=sid,
             ),
-            on_subagent_start=self._subagents.on_start,
+            on_subagent_start=self._handle_subagent_start,
             on_subagent_progress=self._subagents.on_progress,
             on_subagent_stop=self._subagents.on_stop,
             before_side_effect_tool=before_side_effect_tool,
@@ -2296,6 +2316,7 @@ class Orchestrator:
         # 派发屏障端口：run 平面（RunCoordinator）注册；未注册时驱动层
         # 屏障回调不接线（旧路径零变化）
         self._dispatch_barrier_port = None
+        self._subagent_start_port = None
 
     def _init_plane_integrations(self) -> None:
         """平面集成组件初始化：watchdog/subagent/overlay/文件变更（__init__ 专用）。"""

@@ -35,6 +35,7 @@ from workflow_controller.core.workspace.actions import (
     ScopeAbandoned,
     ScopeIntegrated,
     ScopeIntegrationRejected,
+    ScopeRestored,
     ScopeWorkspacePrepared,
 )
 from workflow_controller.core.workspace.claims import (
@@ -110,6 +111,8 @@ class WorkspaceManager:
         self._claims = ClaimsRegistry()
         self._claims_enforce = claims_enforce
         self._gates: dict[str, ScopeGate] = {}
+        # reader 子代理作用域（detached worktree）：永不进集成线
+        self._reader_scopes: set[str] = set()
 
     async def initialize_root(self, *, scope_id: str, owner_ref: str | None = None) -> RootRefs:
         """建立根作用域：导入基线、立根双引用并登记账本。"""
@@ -223,6 +226,8 @@ class WorkspaceManager:
     ) -> ScopeIntegrated | ScopeIntegrationRejected:
         """串行集成：双侧闸门内先落各自未提交状态，再按两档判定并入父树。"""
         record = await self._require_scope(request.scope_id)
+        if record.scope_id in self._reader_scopes:
+            raise WorkspaceManagerError(f"reader 作用域永不集成：{record.scope_id}")
         if record.state is ScopeState.ACTIVE:
             record = await self._tree.set_state(record.scope_id, ScopeState.AWAITING_INTEGRATION)
         if record.state is not ScopeState.AWAITING_INTEGRATION:
@@ -303,6 +308,110 @@ class WorkspaceManager:
                 integrated_paths=outcome.integrated_paths,
             )
 
+    async def prepare_reader_workspace(
+        self, parent_scope_id: str, scope_key: str, *, base_commit: str
+    ) -> ScopeWorkspacePrepared:
+        """建 reader 子代理工作区：父作用域最近检查点 commit 的 detached 快照。
+
+        无分支、永不集成；不占用闸门内提交（快照基点已发布）。严格模式
+        下其写入不构成保证——只读性按审计约定处理（见 repository 同名方法）。
+        """
+        parent = await self._require_scope(parent_scope_id)
+        if parent.state is not ScopeState.ACTIVE:
+            raise WorkspaceManagerError(
+                f"父作用域非活动态不能建 reader 快照：{parent_scope_id}（{parent.state.value}）"
+            )
+        existing = await self._tree.get_scope(scope_key)
+        if existing is not None:
+            raise WorkspaceManagerError(f"作用域标识已被占用：{scope_key}")
+        workspace_path = await self._repository.create_reader_workspace(
+            scope_key, commit=base_commit
+        )
+        await self._tree.create_child_scope(
+            scope_id=scope_key,
+            parent_scope_id=parent.scope_id,
+            scope_kind=ScopeKind.SUBAGENT,
+            integration_base_commit=base_commit,
+            owner_ref=None,
+        )
+        record = await self._tree.activate_scope(
+            scope_key,
+            workspace_ref=f"{workspace_path.as_posix()}|",
+            scope_base_commit=base_commit,
+        )
+        self._reader_scopes.add(scope_key)
+        return ScopeWorkspacePrepared(
+            scope_id=record.scope_id,
+            scope_epoch=record.scope_epoch,
+            base_commit=base_commit,
+            integration_base_commit=base_commit,
+            workspace_path=workspace_path.as_posix(),
+        )
+
+    async def restore_scope(
+        self,
+        scope_id: str,
+        *,
+        restore_commit: str,
+        expected_scope_epoch: int,
+        client_op_id: str,
+    ) -> ScopeRestored:
+        """组检查点恢复：闸门内 reset 到组恢复点并撤回全部组内副作用。
+
+        物理序：先移除后代工作区，再闸门内落当前态、reset 到组恢复点；
+        账面序：目标换代保持活动、后代废弃换代；全程三阶段记账。
+        """
+        record = await self._require_scope(scope_id)
+        if record.scope_kind is ScopeKind.ROOT:
+            raise WorkspaceManagerError("根作用域不经组检查点恢复")
+        if record.state is not ScopeState.ACTIVE:
+            raise WorkspaceManagerError(
+                f"作用域非活动态不能恢复：{scope_id}（{record.state.value}）"
+            )
+        verified = await self._tree.require_scope_epoch(scope_id, expected_scope_epoch)
+        for descendant in await self._tree.list_descendants(scope_id):
+            if descendant.workspace_ref is None:
+                continue
+            path, _branch = self._parse_workspace_ref(descendant.workspace_ref)
+            if path.exists():
+                await self._coordinator.release_worktree(path)
+        writer_path, _branch = self._require_workspace(verified)
+        writer_target = WorkspaceTarget(path=writer_path, separated_env=False)
+        async with self._quiesced(scope_id):
+            old_head = await self._coordinator.commit_pending_state(
+                writer_target,
+                exclude_pathspecs=self._manifest.git_scope_commit_exclude_specs(),
+                message=f"scope {scope_id} state before restore",
+            )
+            await self._oplog.begin(
+                client_op_id=client_op_id,
+                op_kind="restore_scope",
+                expected_old_head=old_head,
+                scope_epoch=verified.scope_epoch,
+                root_epoch=verified.root_epoch,
+                metadata={"scope_id": scope_id, "restore_commit": restore_commit},
+            )
+            await self._repository.reset_workspace_state(writer_path, restore_commit)
+            await self._oplog.record_new_head(client_op_id, restore_commit)
+            restored, abandoned = await self._tree.restore_scope(
+                scope_id, expected_scope_epoch=expected_scope_epoch
+            )
+            for item in abandoned:
+                self._claims.release(item.scope_id)
+                self._reader_scopes.discard(item.scope_id)
+            await self._oplog.commit(
+                client_op_id,
+                result={"restore_commit": restore_commit},
+            )
+        return ScopeRestored(
+            scope_id=scope_id,
+            new_scope_epoch=restored.new_scope_epoch,
+            root_epoch=(await self._require_scope(scope_id)).root_epoch,
+            abandoned_descendants=tuple(
+                (item.scope_id, item.new_scope_epoch) for item in abandoned
+            ),
+        )
+
     async def commit_scope_terminal(self, scope_id: str) -> tuple[str, str]:
         """闸门内提交作用域未提交状态为终态执行态，返回提交与分支。
 
@@ -353,6 +462,7 @@ class WorkspaceManager:
         )
         for item in abandoned:
             self._claims.release(item.scope_id)
+            self._reader_scopes.discard(item.scope_id)
         return ScopeAbandoned(
             scope_id=request.scope_id,
             new_scope_epoch=abandoned[0].new_scope_epoch,
@@ -377,6 +487,7 @@ class WorkspaceManager:
         if record.state is ScopeState.INTEGRATED:
             record = await self._tree.set_state(scope_id, ScopeState.RELEASED)
         self._claims.release(scope_id)
+        self._reader_scopes.discard(scope_id)
         return record
 
     async def get_scope(self, scope_id: str) -> ScopeRecord | None:

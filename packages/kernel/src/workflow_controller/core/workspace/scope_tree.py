@@ -325,6 +325,30 @@ class ScopeTree:
             )
         return abandoned
 
+    async def restore_scope(
+        self, scope_id: str, *, expected_scope_epoch: int
+    ) -> tuple[AbandonedScope, list[AbandonedScope]]:
+        """组检查点恢复的账面步：目标换代但保持活动，后代废弃换代。"""
+        target = await self.require_scope_epoch(scope_id, expected_scope_epoch)
+        restored = AbandonedScope(scope_id=target.scope_id, new_scope_epoch=target.scope_epoch + 1)
+        abandoned: list[AbandonedScope] = []
+        for descendant in await self.list_descendants(target.scope_id):
+            abandoned.append(
+                AbandonedScope(
+                    scope_id=descendant.scope_id,
+                    new_scope_epoch=descendant.scope_epoch + 1,
+                )
+            )
+        for item in abandoned:
+            self._mutate(
+                item.scope_id,
+                scope_epoch=item.new_scope_epoch,
+                state=ScopeState.DISCARDED,
+                gate_state=ScopeGateState.RUNNING,
+            )
+        self._mutate(target.scope_id, scope_epoch=restored.new_scope_epoch)
+        return restored, abandoned
+
     async def advance_root_epoch(self, *, expected_root_epoch: int) -> int:
         """集成线回退时根代次 +1：基于旧根代次的请求此后一律拒绝。"""
         root = self._require_root()

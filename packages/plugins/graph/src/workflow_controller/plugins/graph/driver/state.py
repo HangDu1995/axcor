@@ -215,6 +215,14 @@ class GraphState:
     def clear_session_id(self, node_id: str) -> None:
         self._set_node_field(node_id, "workflow_controller_session_id", None)
 
+    def node_session_id(self, node_id: str) -> str | None:
+        """节点档案的执行会话绑定；未绑定为 None。"""
+        return self._data["nodes"][node_id].get("workflow_controller_session_id")
+
+    def set_node_session_id(self, node_id: str, session_id: str) -> None:
+        """回填节点执行会话绑定（恢复会话到达时，不改节点状态）。"""
+        self._set_node_field(node_id, "workflow_controller_session_id", session_id)
+
     def set_verify_session_id(self, node_id: str, session_id: str | None) -> None:
         self._set_node_field(node_id, "verify_session_id", session_id)
 
