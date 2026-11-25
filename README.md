@@ -1,6 +1,6 @@
 # Workflow Controller
 
-由上游源仓的子集导出工具生成（来源提交 `a2901213cb799408d950b666cf5c4dae59de0fb9`，cannbot 档），经 subtree
+由上游源仓的子集导出工具生成（来源提交 `2cdebfb4bddc3700eed8d4933f31aa26ba2ff076`，cannbot 档），经 subtree
 同步维护；除许可证表述外的修改一律先落上游源仓，再同步到本模块。
 
 ## 内容

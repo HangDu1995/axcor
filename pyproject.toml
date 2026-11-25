@@ -64,7 +64,6 @@ ignore = ["E501", "RUF001", "RUF002", "RUF003", "N815", "E402"]
 "tests/**" = ["B009", "B010"]
 "packages/*/kernel_tests/**" = ["B009", "B010"]
 "packages/plugins/*/tests/**" = ["B009", "B010"]
-"examples/**" = ["B009", "B010"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["workflow_controller"]
