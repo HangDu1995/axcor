@@ -795,25 +795,7 @@ class AuthRotator:
             if result.get("provider_kind") and kind_source is None:
                 # 候选验证时无 kind，结果里的 kind 是本次实测探测所得
                 kind_source = "probe"
-            if not result.get("success"):
-                error = (
-                    result["worker"].get("error")
-                    or result["reviewer"].get("error")
-                    or "no usable worker or reviewer capability"
-                )
-                if existing is None:
-                    raise ValueError(f"provider validation failed: {error}")
-                logger.warning(
-                    "existing provider %s validation failed (saved state): %s",
-                    entry["model"] or "provider",
-                    error,
-                )
-            elif result["worker"].get("status") != ValidationStatus.VALID.value:
-                logger.warning(
-                    "provider %s worker validation failed (saved reviewer-only): %s",
-                    entry["model"] or "provider",
-                    result.get("error") or "unknown error",
-                )
+            _report_validation_outcome(result, existing, entry)
             validated.append(result)
             kind_sources.append(kind_source)
             normalized.append({k: v for k, v in entry.items() if v})
@@ -2218,6 +2200,31 @@ async def _resolve_settings_entry(
         model_catalog_path,
     )
     return key, entry, candidate
+
+
+def _report_validation_outcome(
+    result: dict[str, Any], existing: AuthProvider | None, entry: dict[str, str]
+) -> None:
+    """校验结果处置：新条目失败即拒；已有条目保存态降级为告警日志。"""
+    if not result.get("success"):
+        error = (
+            result["worker"].get("error")
+            or result["reviewer"].get("error")
+            or "no usable worker or reviewer capability"
+        )
+        if existing is None:
+            raise ValueError(f"provider validation failed: {error}")
+        logger.warning(
+            "existing provider %s validation failed (saved state): %s",
+            entry["model"] or "provider",
+            error,
+        )
+    elif result["worker"].get("status") != ValidationStatus.VALID.value:
+        logger.warning(
+            "provider %s worker validation failed (saved reviewer-only): %s",
+            entry["model"] or "provider",
+            result.get("error") or "unknown error",
+        )
 
 
 def _existing_validations_match(existing: AuthProvider, fingerprint: str) -> bool:
