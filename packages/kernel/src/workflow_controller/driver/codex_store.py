@@ -1,3 +1,11 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+
 """Codex 子代理 rollout 只读进度层。"""
 
 from __future__ import annotations
@@ -443,8 +451,6 @@ class SubagentProgressMonitor:
             if child.stop_requested and not self._finished:
                 await self._read_child_progress(child, tail)
                 self._complete_child(child.child_thread_id)
-        except asyncio.CancelledError:
-            raise
         except Exception:
             logger.debug(
                 "子代理进度任务失败: child=%s",
