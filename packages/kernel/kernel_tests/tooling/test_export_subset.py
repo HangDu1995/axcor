@@ -54,6 +54,16 @@ def _build_subset_tree(root: Path) -> None:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("x\n", encoding="utf-8")
+    (root / ".gitignore").write_text(
+        "dist/\n" + "\n".join(export_subset.CANNBOT_GITIGNORE_STRIPPED) + "\n",
+        encoding="utf-8",
+    )
+    (root / "pyproject.toml").write_text(
+        '[tool.ruff.lint.per-file-ignores]\n"tests/**" = ["B009", "B010"]\n'
+        + "\n".join(export_subset.CANNBOT_PYPROJECT_STRIPPED)
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def test_cannbot_trim_removes_frozen_paths_and_keeps_neighbors(tmp_path: Path) -> None:
@@ -64,6 +74,32 @@ def test_cannbot_trim_removes_frozen_paths_and_keeps_neighbors(tmp_path: Path) -
     trimmed = (*export_subset.CANNBOT_EXCLUDED_DIRS, *export_subset.CANNBOT_EXCLUDED_FILES)
     assert not any((tmp_path / relative).exists() for relative in trimmed)
     assert all((tmp_path / relative).is_file() for relative in KEPT_PATHS)
+
+
+def test_cannbot_trim_strips_dead_config_lines_and_keeps_neighbors(tmp_path: Path) -> None:
+    _build_subset_tree(tmp_path)
+
+    export_subset.apply_cannbot_profile(tmp_path)
+
+    gitignore = (tmp_path / ".gitignore").read_text(encoding="utf-8")
+    pyproject = (tmp_path / "pyproject.toml").read_text(encoding="utf-8")
+    for dead in (
+        *export_subset.CANNBOT_GITIGNORE_STRIPPED,
+        *export_subset.CANNBOT_PYPROJECT_STRIPPED,
+    ):
+        assert dead not in gitignore
+        assert dead not in pyproject
+    assert "dist/" in gitignore
+    assert '"tests/**" = ["B009", "B010"]' in pyproject
+
+
+def test_cannbot_trim_fails_when_dead_config_line_missing(tmp_path: Path) -> None:
+    _build_subset_tree(tmp_path)
+    lines = (tmp_path / "pyproject.toml").read_text(encoding="utf-8").splitlines(keepends=True)
+    (tmp_path / "pyproject.toml").write_text("".join(lines[:-1]), encoding="utf-8")
+
+    with pytest.raises(export_subset.ExportError, match="冻结死配置行缺席"):
+        export_subset.apply_cannbot_profile(tmp_path)
 
 
 def test_cannbot_trim_fails_when_frozen_path_missing(tmp_path: Path) -> None:

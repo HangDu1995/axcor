@@ -45,9 +45,27 @@ DELIVERABLE_PLUGINS = (
 )
 DIST_PREFIX = "workflow-controller-plugin-"
 CANNBOT_PROFILE = "cannbot"
-# 拷贝时排除的本地构建产物与缓存
+# 拷贝时排除的本地产物与缓存（对齐根 .gitignore：copytree 不识别 git 忽略
+# 规则，运行时数据目录若不在此排除会被扫进子集/快照）
 COPY_IGNORE = shutil.ignore_patterns(
-    "__pycache__", ".pytest_cache", ".ruff_cache", "build", "dist", "*.egg-info"
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".import_linter_cache",
+    "build",
+    "dist",
+    "*.egg-info",
+    ".eggs",
+    ".venv",
+    "node_modules",
+    ".workflow-controller",
+    ".coverage",
+    "coverage.xml",
+    "*.py[cod]",
+    ".DS_Store",
+    ".idea",
+    ".vscode",
 )
 # 随子集带走的根级文件（.gitignore 防快照线误收构建产物）；插件测试的场景
 # 输入内聚在各自包内（tests/fixtures），examples 不再随子集
@@ -90,6 +108,11 @@ CANNBOT_EXCLUDED_FILES = (
 # 裁剪后按类别复扫的残留判定：unit/driver 不得有逐 runtime 深度单测、unit
 # 顶层不得有 provider 矩阵用例（防根树新增同类文件绕过冻结清单静默漏裁）
 DEEP_TEST_PREFIXES = ("test_claude", "test_codex", "test_opencode")
+# cannbot 档剔除的死配置行：子集不含 docs/ 与 examples/，上游根 .gitignore /
+# pyproject 中指向这些路径的条目随之失效（冻结，调整前先改
+# docs/local/cannbot-minimal-initial-pr-analysis.md 再同步此处）
+CANNBOT_GITIGNORE_STRIPPED = ("# 本地文档", "docs/local/")
+CANNBOT_PYPROJECT_STRIPPED = ('"examples/**" = ["B009", "B010"]',)
 
 
 class ExportError(Exception):
@@ -119,7 +142,7 @@ def copy_subset(target: Path, members: list[str], profile: str | None) -> None:
 
 
 def apply_cannbot_profile(target: Path) -> None:
-    """按冻结清单剔除 cannbot 档不含的测试内容，并做互锁校验。"""
+    """按冻结清单剔除 cannbot 档不含的测试内容与死配置行，并做互锁校验。"""
     for relative in (*CANNBOT_EXCLUDED_DIRS, *CANNBOT_EXCLUDED_FILES):
         path = target / relative
         if not path.exists():
@@ -128,7 +151,22 @@ def apply_cannbot_profile(target: Path) -> None:
             shutil.rmtree(path)
         else:
             path.unlink()
+    _strip_dead_config_lines(target / ".gitignore", CANNBOT_GITIGNORE_STRIPPED)
+    _strip_dead_config_lines(target / "pyproject.toml", CANNBOT_PYPROJECT_STRIPPED)
     _validate_cannbot_trim(target)
+
+
+def _strip_dead_config_lines(path: Path, dead_lines: tuple[str, ...]) -> None:
+    """剔除模块内指向不存在路径的配置行；冻结行缺席即失败（防根树漂移静默漏剔除）。"""
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    present = {line.strip() for line in lines}
+    missing = set(dead_lines) - present
+    if missing:
+        raise ExportError(
+            f"{path.name} 冻结死配置行缺席（根树漂移，须同步冻结清单）：{sorted(missing)}"
+        )
+    kept = [line for line in lines if line.strip() not in dead_lines]
+    path.write_text("".join(kept), encoding="utf-8")
 
 
 def _validate_cannbot_trim(target: Path) -> None:
