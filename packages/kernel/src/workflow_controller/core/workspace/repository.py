@@ -551,7 +551,7 @@ def run_snapshot_git_sync(
     *,
     timeout: float = 30.0,
 ) -> subprocess.CompletedProcess[str]:
-    """快照仓身份的同步 git 调用（导入重建轨的 commit 作者与快照引擎一致）。"""
+    """快照仓身份的同步 git 调用（导入重建轨沿用历史快照仓的 commit 作者）。"""
     env = _sync_git_env()
     env.update(
         {
@@ -593,7 +593,7 @@ def remove_all_remotes(git_dir: Path) -> None:
 
 
 def legacy_snapshot_dir_for(cwd: Path) -> Path:
-    """会话原目录对应的插件快照仓目录（兼容读取的寻址约定）。"""
+    """会话原目录对应的历史快照仓目录（兼容读取的寻址约定）。"""
     return Path(cwd) / ".workflow-controller" / "snapshots"
 
 

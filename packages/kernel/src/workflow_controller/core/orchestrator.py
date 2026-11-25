@@ -558,7 +558,7 @@ class Orchestrator:
         initial_current_iteration: int | None = None,
     ) -> Session:
         """Start a session, optionally resuming a seeded SDK session and carrying
-        plugin metadata (e.g. agent_traceback's fork origin).
+        plugin metadata (e.g. checkpoint replay fork origin).
 
         Like :meth:`start_session_with_config` but, BEFORE activation, pre-sets the
         SDK session id to resume (the seeded session) and merges ``plugin_metadata``

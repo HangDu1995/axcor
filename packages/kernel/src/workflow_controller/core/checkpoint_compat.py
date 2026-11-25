@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""历史检查点兼容读取器：插件旧 ``checkpoints`` 表的内核侧读写面。
+"""历史检查点兼容读取器：旧 ``checkpoints`` 表的内核侧读写面。
 
 旧表 schema（十五列、旧 ``main_part_id`` 锚点）由本模块以复制常量的方式
-直连，不 import 插件代码；读取面不建表（表缺席即空结果），写入面仅供
-session 导入能力落历史行（建表 DDL 与插件逐字一致，二者并存期互不干扰）。
+直连；读取面不建表（表缺席即空结果），写入面仅供 session 导入能力落
+历史行（DDL 为旧表形状的逐字复刻，新库缺席时铺设、与历史库共存）。
 """
 
 from __future__ import annotations
@@ -38,14 +38,14 @@ __all__ = [
     "store_legacy_checkpoint",
 ]
 
-# 旧表列序（与插件写入/读取的 SELECT 顺序一致，行映射按位置取值）
+# 旧表列序（与历史行写入/读取的 SELECT 顺序一致，行映射按位置取值）
 LEGACY_CHECKPOINT_COLUMNS = (
     "checkpoint_id, session_id, iteration, agent_id, agent_type, trigger, "
     "git_ref, event_rowid, main_part_id, parent_checkpoint_id, created_at, "
     "file_count, byte_size, status, inner_git"
 )
 
-# 旧表 DDL：与插件侧逐字一致（导入能力在旧表缺席时铺设；读取面永不建表）
+# 旧表 DDL：旧表形状的逐字复刻（导入能力在旧表缺席时铺设；读取面永不建表）
 LEGACY_CHECKPOINTS_DDL = """
     CREATE TABLE IF NOT EXISTS checkpoints (
         checkpoint_id    TEXT PRIMARY KEY,

@@ -1829,13 +1829,7 @@ class RunCoordinator:
             session_id=session_id,
             iteration=0,
             event_type="session_delete",
-            data={
-                "session_id": session_id,
-                # run × traceback 特性叠加未开发：不带谱系payload，agent_traceback
-                # 按自身回退链处理（fork_root 由 boot reaper 回退）。
-                "birth_traceback": None,
-                "clean_reconstruct": None,
-            },
+            data={"session_id": session_id},
         )
         await self._bus.emit_ephemeral(event)
 

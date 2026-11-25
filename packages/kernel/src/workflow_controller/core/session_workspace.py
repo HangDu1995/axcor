@@ -107,7 +107,7 @@ def workspace_config_of(traceback: SessionTracebackConfig, root_dir: Path) -> Wo
     if traceback.mode != "workspace":
         raise SessionWorkspaceError(
             f"单会话 traceback 仅支持 workspace 模式（收到 {traceback.mode!r}）；"
-            "snapshot 兼容模式由 agent_traceback 插件承载"
+            "snapshot 兼容模式已随旧插件退役移除"
         )
     return WorkspaceTreeConfig(
         root_dir=str(root_dir),

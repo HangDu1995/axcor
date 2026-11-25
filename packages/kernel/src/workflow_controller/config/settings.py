@@ -100,12 +100,12 @@ class SessionTracebackConfig(BaseModel):
     """单会话 traceback 工作区模式配置（内核侧配置通道）。
 
     词面与工作流侧 traceback 段对齐：未携带或 ``enabled`` 关闭的会话
-    行为不变；snapshot 兼容模式继续由 agent_traceback 插件自身配置
-    承载，本通道只管 workspace 模式。
+    行为不变；snapshot 兼容模式已随旧插件退役移除，本通道只管
+    workspace 模式。
     """
 
     enabled: bool = True
-    # 模式仅支持 workspace：snapshot_compatible 由插件承载，此处显式拒绝
+    # 模式仅支持 workspace：snapshot_compatible 已随旧插件退役，显式拒绝防旧配置误配
     mode: str = "workspace"
     # 派发屏障弱化档：fail（默认，严格）| compat_late_barrier（显式弱化）
     on_no_dispatch_barrier: str = "fail"
