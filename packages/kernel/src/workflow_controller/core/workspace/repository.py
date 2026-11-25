@@ -54,7 +54,9 @@ __all__ = [
     "legacy_snapshot_file",
     "legacy_snapshot_list",
     "legacy_snapshot_restore",
+    "remove_all_remotes",
     "run_git_sync",
+    "run_snapshot_git_sync",
 ]
 
 
@@ -541,6 +543,53 @@ def run_git_sync(
         timeout=timeout,
         env=_sync_git_env(),
     )
+
+
+def run_snapshot_git_sync(
+    cwd: Path,
+    args: Sequence[str],
+    *,
+    timeout: float = 30.0,
+) -> subprocess.CompletedProcess[str]:
+    """快照仓身份的同步 git 调用（导入重建轨的 commit 作者与快照引擎一致）。"""
+    env = _sync_git_env()
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "workflow-controller-snapshot",
+            "GIT_AUTHOR_EMAIL": "workflow-controller-snapshot@local",
+            "GIT_COMMITTER_NAME": "workflow-controller-snapshot",
+            "GIT_COMMITTER_EMAIL": "workflow-controller-snapshot@local",
+        }
+    )
+    return subprocess.run(
+        ["git", "-c", "core.hooksPath=", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+    )
+
+
+def remove_all_remotes(git_dir: Path) -> None:
+    """剥除指定 ``.git`` 目录的全部 remote（防外连与 token 持久化，best-effort）。"""
+    result = subprocess.run(
+        ["git", "--git-dir", str(git_dir), "remote"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=_sync_git_env(),
+    )
+    if result.returncode != 0:
+        return
+    for name in result.stdout.split():
+        subprocess.run(
+            ["git", "--git-dir", str(git_dir), "remote", "rm", name],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_sync_git_env(),
+        )
 
 
 def legacy_snapshot_dir_for(cwd: Path) -> Path:

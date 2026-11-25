@@ -81,6 +81,7 @@ from workflow_controller.core.session_run_affiliation import SessionRunAffiliati
 from workflow_controller.core.session_traceback import SessionTracebackHost
 from workflow_controller.core.session_workspace import SessionWorkspaceHost
 from workflow_controller.core.subagent_tracker import SubagentTracker
+from workflow_controller.core.workspace.residue_reaper import WorkspaceResidueReaper
 from workflow_controller.driver.hooks import (
     BarrierOutcome,
     BarrierProceed,
@@ -195,6 +196,14 @@ class Orchestrator:
         # 激活后挂靠钩子：显式归属在 _runtime_lock 临界区内落账的唯一通道
         self._post_attach_hook: Callable[[Session], Awaitable[None]] | None = None
         self.register_post_attach_hook(self._attach_on_activate)
+        # 工作区残留 TTL 清理器：崩溃残留树/过期检查点行/fork 孤儿目录的兜底
+        self._residue_reaper = WorkspaceResidueReaper(
+            checkpoint_db_path=lambda: self.run_store.db_path,
+            list_sessions=self.pool.list_sessions,
+            scan_roots=lambda: [self.default_project_dir],
+        )
+        # 启动期清理任务（best-effort 后台跑一轮，不阻塞启动）
+        self._residue_reaper_task: asyncio.Task[None] | None = None
         self.auth_rotator: AuthRotator | None = None
         self._limit_detector: LimitDetector | None = None
         self._reviewer_runner: DriverReviewerRunner | None = None
@@ -230,6 +239,19 @@ class Orchestrator:
     def default_project_dir(self) -> Path:
         """守护进程存储标识（启动期定格，run 根等记录路径的家）。"""
         return self._default_project_dir
+
+    async def _run_residue_reaper(self) -> None:
+        """启动期残留清理任务体：best-effort 跑一轮，异常只记日志。"""
+        try:
+            await self._residue_reaper.reap()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("启动期残留清理失败（不影响启动）", exc_info=True)
+
+    async def reap_workspace_residue(self) -> dict[str, Any]:
+        """显式触发一轮工作区残留清理（启动期自动清理的手动等价物）。"""
+        return await self._residue_reaper.reap()
 
     @property
     def run_store(self) -> RunStore:
@@ -378,6 +400,8 @@ class Orchestrator:
         # 节点时钟账本恢复先于规则接入：崩溃开段按冻结收段、已用时间保留
         await self.watchdog.restore_node_clocks()
         self.watchdog.start()
+        # 残留清理后台跑一轮（池已装载 → 会话存活可判定；best-effort 不阻塞启动）
+        self._residue_reaper_task = asyncio.create_task(self._run_residue_reaper())
         if self.config.hook_server.enabled:
             self._hook_server = self._build_hook_server()
             self._plugin_registry.load(self, self._hook_server)
@@ -1188,6 +1212,12 @@ class Orchestrator:
                 await step()
             except Exception:
                 logger.exception("run-plane shutdown step failed; continuing")
+        # 0.5 启动期残留清理任务收尾（在途即取消，防关停期仍在扫盘）
+        if self._residue_reaper_task is not None:
+            self._residue_reaper_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._residue_reaper_task
+            self._residue_reaper_task = None
         # 1. Stop every per-session runtime before stopping drivers.
         runtime_tasks = list(self._loop_tasks.values())
         for loop in list(self._loops.values()):

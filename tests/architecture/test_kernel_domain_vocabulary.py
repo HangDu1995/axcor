@@ -66,6 +66,15 @@ DOMAIN_TERM_WHITELIST = {
     "src/workflow_controller/core/run_export.py": 1,
     # 跨系统格式标识 x_context_bay（docstring + 行键），claude-jsonl 写出轨的元数据键
     "src/workflow_controller/transcript/claude_jsonl_out.py": 2,
+    # 外部 cannbot session db 的格式标识（能力自插件迁入内核，S5b；随 S5c 插件删除一并收口）
+    "src/workflow_controller/api/run_api.py": 1,
+    "src/workflow_controller/core/restore/cannbot_reader.py": 9,
+    "src/workflow_controller/core/restore/checkpoint_deriver.py": 1,
+    "src/workflow_controller/core/restore/file_rebuilder.py": 1,
+    "src/workflow_controller/core/restore/import_runner.py": 8,
+    "src/workflow_controller/core/restore/transcriber.py": 4,
+    "src/workflow_controller/core/run_coordinator.py": 1,
+    "src/workflow_controller/core/session_traceback.py": 1,
     # agent_traceback 读 cannbot session db 的外部格式标识（插件成包入扫描面后生效）
     "src/workflow_controller/plugins/agent_traceback/claude_session_seed.py": 1,
     "src/workflow_controller/plugins/agent_traceback/plugin.py": 1,

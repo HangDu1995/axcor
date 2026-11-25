@@ -36,6 +36,12 @@ from workflow_controller.core.checkpoint_compat import (
     LegacyCheckpointReader,
     legacy_checkpoint_to_dict,
 )
+from workflow_controller.core.restore.claude_seed import detect_replay_runtime
+from workflow_controller.core.restore.import_runner import (
+    ImportRunnerPorts,
+    SessionImportRunner,
+    import_log_path_for,
+)
 from workflow_controller.core.restore.replay import ReplayPorts, TracebackReplayRunner
 from workflow_controller.core.workspace.repository import (
     legacy_snapshot_dir_for,
@@ -94,6 +100,7 @@ class SessionTracebackHost:
         write_hook_config: Callable[[Path], None] | None = None,
         snapshot_timeout_seconds: float = 30.0,
         git_history_max_mb: int = 0,
+        source_opencode_db: Callable[[], Path | None] | None = None,
     ) -> None:
         """装配端口：检查点库、会话事实、会话创建/持久化与 runtime 解析。"""
         self._checkpoint_db_path = checkpoint_db_path
@@ -112,6 +119,7 @@ class SessionTracebackHost:
         self._fork_roots: dict[str, str] = {}
         self._snapshot_timeout_seconds = snapshot_timeout_seconds
         self._git_history_max_mb = git_history_max_mb
+        self._source_opencode_db = source_opencode_db
 
     # ── 统一查询面 ──────────────────────────────────────────
 
@@ -204,6 +212,77 @@ class SessionTracebackHost:
         """登记 fork 会话 → 目录映射（删除会话时回收，崩溃残留由清理器兜底）。"""
         self._fork_roots[session_id] = fork_root
 
+    # ── 外部 session db 导入（import-db 的内核等价物） ───────
+
+    async def replay_runtime(self, session_id: str) -> str:
+        """探测会话源对话的 runtime（重放表单预填面；会话不在场返回空串）。"""
+        session = await self._resolve_session(session_id)
+        if session is not None:
+            config = getattr(session, "config", None)
+            sdk_session_id = str(getattr(session, "sdk_session_id", "") or "")
+            cwd = str(getattr(config, "cwd", "") or "")
+            runtime = getattr(config, "runtime", None)
+            config_dir = (getattr(config, "env_overrides", None) or {}).get("CLAUDE_CONFIG_DIR")
+        else:
+            row = await self._load_roster_session(session_id)
+            if row is None:
+                return ""
+            try:
+                config = json.loads(row.get("config_json") or "{}")
+            except (TypeError, ValueError):
+                config = {}
+            sdk_session_id = str(row.get("sdk_session_id") or "")
+            cwd = str(config.get("cwd") or "")
+            runtime = config.get("runtime")
+            config_dir = (config.get("env_overrides") or {}).get("CLAUDE_CONFIG_DIR")
+        return await asyncio.to_thread(
+            detect_replay_runtime,
+            sdk_session_id=sdk_session_id,
+            cwd=cwd,
+            configured_runtime=runtime,
+            default_runtime=self._default_runtime() or "claude_sdk",
+            source_config_dir=config_dir,
+        )
+
+    async def import_session(
+        self,
+        db_path: str | Path,
+        target_cwd: str | Path,
+        *,
+        log_path: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """从外部 cannbot session db 重建为本仓会话（含历史检查点）。
+
+        同步等待到完成；``log_path`` 非空时边重建边写日志文件（行缓冲，
+        供查询面下载）。结果结构与插件 import-db 逐字段一致。
+        """
+        runner = SessionImportRunner(
+            ImportRunnerPorts(
+                create_session=self._create_session,
+                persist_session=self._persist_session,
+                store_events=self._store_events,
+                checkpoint_db_path=self._checkpoint_db_path,
+                source_opencode_db=self._source_opencode_db,
+            )
+        )
+        return await runner.import_session(
+            Path(db_path),
+            Path(target_cwd),
+            log_path=Path(log_path) if log_path else None,
+        )
+
+    def read_import_log(self, target_cwd: str | Path) -> dict[str, Any]:
+        """读导入日志内容（重建中读到部分行，完成后读全文；缺席为 None）。"""
+        base = Path(target_cwd).expanduser().resolve()
+        log_file = import_log_path_for(base)
+        if not base.is_dir() or not log_file.is_file():
+            return {"exists": False, "path": str(log_file), "content": ""}
+        try:
+            content = log_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return {"exists": False, "path": str(log_file), "content": ""}
+        return {"exists": True, "path": str(log_file), "content": content}
+
     async def cleanup_fork(self, session_id: str) -> None:
         """会话删除时回收其 fork 目录（事件缺失时回落持久化溯源行）。"""
         fork_root = self._fork_roots.pop(session_id, None)
@@ -264,12 +343,12 @@ class SessionTracebackHost:
 
     async def _snapshot_dir_of(self, session_id: str) -> Path | None:
         """解析会话原目录对应的插件快照仓目录（托管形态反推原目录）。"""
-        from workflow_controller.core.session_workspace import _derive_original_dir
+        from workflow_controller.core.session_workspace import derive_original_dir
 
         cwd = await self._session_cwd(session_id)
         if not cwd:
             return None
-        original = _derive_original_dir(Path(cwd), session_id) or Path(cwd)
+        original = derive_original_dir(Path(cwd), session_id) or Path(cwd)
         snapshot_dir = legacy_snapshot_dir_for(original)
         return snapshot_dir if snapshot_dir.is_dir() else None
 

@@ -218,6 +218,10 @@ class CheckpointStore:
             native_child_session_id,
         )
 
+    async def delete_for_tree(self, root_scope_id: str) -> int:
+        """删一棵作用域树的全部检查点行（树回收/残留清理用），返回删除行数。"""
+        return await asyncio.to_thread(self._delete_for_tree_locked, root_scope_id)
+
     # ── 同步面（锁内）──
 
     def _record_locked(self, checkpoint: ScopeCheckpoint) -> None:
@@ -323,6 +327,39 @@ class CheckpointStore:
                     (json.dumps(mapping), checkpoint_id),
                 )
                 conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def _delete_for_tree_locked(self, root_scope_id: str) -> int:
+        """同步面：按父子链展开树内全部作用域并删行，返回删除行数。"""
+        if not root_scope_id:
+            return 0
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                known = {root_scope_id}
+                frontier = [root_scope_id]
+                while frontier:
+                    placeholders = ",".join("?" for _ in frontier)
+                    children = [
+                        str(row[0])
+                        for row in conn.execute(
+                            "SELECT DISTINCT scope_id FROM scope_checkpoints"
+                            f" WHERE parent_scope_id IN ({placeholders})",
+                            frontier,
+                        ).fetchall()
+                        if str(row[0]) not in known
+                    ]
+                    known.update(children)
+                    frontier = children
+                placeholders = ",".join("?" for _ in known)
+                cursor = conn.execute(
+                    f"DELETE FROM scope_checkpoints WHERE scope_id IN ({placeholders})",
+                    sorted(known),
+                )
+                conn.execute("COMMIT")
+                return cursor.rowcount
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise

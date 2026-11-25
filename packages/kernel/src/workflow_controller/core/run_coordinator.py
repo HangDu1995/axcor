@@ -61,6 +61,7 @@ from workflow_controller.core.restore.conversation import (
     ConversationRestorer,
     TranscriptLocator,
 )
+from workflow_controller.core.restore.import_runner import import_log_path_for
 from workflow_controller.core.run_export import RunExportService
 from workflow_controller.core.run_host import KILL_GRACE_S as KILL_GRACE_S
 from workflow_controller.core.run_host import STOP_DRAIN_TIMEOUT_S as STOP_DRAIN_TIMEOUT_S
@@ -1377,6 +1378,27 @@ class RunCoordinator:
             client_op_id=client_op_id,
             replay_dispatch=replay_dispatch,
         )
+
+    # ── 外部 session db 导入面（HTTP 路由装配住控制台发行包）──
+
+    def replay_session_runtime(self, session_id: str) -> str:
+        """探测会话源对话的 runtime（重放表单预填面）。"""
+        return self._orch.session_traceback.replay_runtime(session_id)
+
+    async def import_session_db(self, db_path: str, target_cwd: str) -> dict[str, Any]:
+        """导入外部 cannbot session db 为本仓会话（边重建边写导入日志）。"""
+        resolved = Path(target_cwd).expanduser().resolve()
+        return await self._orch.session_traceback.import_session(
+            db_path, resolved, log_path=import_log_path_for(resolved)
+        )
+
+    def read_import_log(self, target_cwd: str) -> dict[str, Any]:
+        """读导入日志内容（重建中 partial、完成后全文；缺席 exists=False）。"""
+        return self._orch.session_traceback.read_import_log(target_cwd)
+
+    async def reap_workspace_residue(self) -> dict[str, Any]:
+        """显式触发一次工作区残留清理（启动期自动清理的手动等价物）。"""
+        return await self._orch.reap_workspace_residue()
 
     # ── 成员 session 管理（成员始终为 session）─────────────────────
 

@@ -46,6 +46,7 @@ __all__ = [
     "find_exclude_message_id",
     "find_main_part_id_for_subagent",
     "get_last_seed_error",
+    "init_fork_db_from_source",
     "read_main_session_parts",
     "seed_prebuilt_session",
 ]
@@ -238,7 +239,7 @@ def _warn_unknown_tables(src: sqlite3.Connection) -> None:
         pass
 
 
-def _init_fork_db_from_source(dest_path: Path, source_path: Path) -> bool:
+def init_fork_db_from_source(dest_path: Path, source_path: Path) -> bool:
     """初始化 fork db：从 source 做 schema-only 拷贝（不拷 session 数据行）。
 
     失败时清理半成品 dest 文件（含 ``-wal``/``-shm``）。
@@ -564,7 +565,7 @@ def _write_seed_snapshot(
     """初始化（若需）并连接目标 db，写入 seeded session/parts/messages。"""
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     need_init = not dest_path.is_file() or dest_path.stat().st_size == 0
-    if need_init and not _init_fork_db_from_source(dest_path, source_path):
+    if need_init and not init_fork_db_from_source(dest_path, source_path):
         return False
     conn = _open_dest_db(dest_path)
     if conn is None:

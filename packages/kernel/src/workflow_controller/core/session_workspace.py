@@ -123,7 +123,7 @@ def workspace_config_of(traceback: SessionTracebackConfig, root_dir: Path) -> Wo
     )
 
 
-def _derive_original_dir(cwd: Path, session_id: str) -> Path | None:
+def derive_original_dir(cwd: Path, session_id: str) -> Path | None:
     """cwd 已指向托管工作区时反推原目录（崩溃/重开后的续用形态）。"""
     for ancestor in cwd.parents:
         if (
@@ -420,7 +420,7 @@ class SessionWorkspaceHost:
         traceback = session.config.traceback
         cwd = Path(session.config.cwd).expanduser().resolve()
         # cwd 已在托管树内（崩溃/重开）：反推原目录续用既有树
-        original_dir = _derive_original_dir(cwd, sid) or cwd
+        original_dir = derive_original_dir(cwd, sid) or cwd
         if not original_dir.is_dir():
             raise SessionWorkspaceError(f"会话工作目录不存在：{original_dir}")
         tree = SessionWorkspaceTree(
@@ -703,12 +703,20 @@ class SessionWorkspaceHost:
         )
 
     async def cleanup_session(self, session_id: str) -> None:
-        """会话删除路径的整树回收（对已同步树为幂等空操作）。"""
+        """会话删除路径的整树回收（对已同步树为幂等空操作）。
+
+        检查点行随树一并删除——会话既已删除，行不再有查询面（重放/回滚
+        均以会话在场为前提），留存只会成为账面孤儿。
+        """
         owner = self._aliases.pop(session_id, session_id)
         entry = self._entries.pop(owner, None)
         self._barrier_locks.pop(owner, None)
         if entry is None:
             return
+        try:
+            await entry.tree.checkpoints.delete_for_tree(entry.tree.root_scope_id)
+        except Exception:
+            logger.warning("会话 %s 删除时检查点行清理失败（不阻塞树回收）", session_id[:12])
         entry.tree.checkpoints.close()
         await asyncio.to_thread(shutil.rmtree, entry.tree.tree_dir, ignore_errors=True)
 
