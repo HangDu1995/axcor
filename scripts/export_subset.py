@@ -262,8 +262,7 @@ def write_readme(target: Path, selected: list[str], profile: str | None) -> None
     if profile == CANNBOT_PROFILE:
         content = f"""# Workflow Controller
 
-由上游源仓的子集导出工具生成（来源提交 `{source_sha}`，cannbot 档），经 subtree
-同步维护；除许可证表述外的修改一律先落上游源仓，再同步到本模块。
+Workflow Controller 内核与内置插件的自包含 uv workspace 模块。
 
 ## 内容
 
@@ -273,7 +272,7 @@ def write_readme(target: Path, selected: list[str], profile: str | None) -> None
 - `workflow-controller-plugin-fake-driver`（headless 验收驱动，测试依赖强制随附）
 {plugin_lines}
 - 交付插件测试全量随包；内核测试取必要档（开发门禁与逐 runtime 深度单测
-  留在上游，由上游全量门禁守护）
+  不随模块交付）
 
 ## 本地验证
 

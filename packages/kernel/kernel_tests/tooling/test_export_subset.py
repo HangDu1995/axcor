@@ -119,6 +119,17 @@ def test_cannbot_naming_rejects_internal_repo_name(tmp_path: Path) -> None:
         export_subset.validate_cannbot_naming(tmp_path)
 
 
+def test_cannbot_readme_is_neutral(tmp_path: Path) -> None:
+    export_subset.write_readme(
+        tmp_path, ["graph", "agent-traceback"], export_subset.CANNBOT_PROFILE
+    )
+
+    text = (tmp_path / "README.md").read_text(encoding="utf-8")
+    for word in ("上游", "快照", "subtree", "来源提交", "axcor"):
+        assert word not in text
+    assert "uv run pytest" in text
+
+
 def test_cannbot_naming_passes_on_clean_tree(tmp_path: Path) -> None:
     _build_subset_tree(tmp_path)
 
