@@ -96,3 +96,14 @@ def test_switch_license_on_mini_subset(tmp_path: Path) -> None:
     assert (tmp_path / "LICENSE").read_text(encoding="utf-8") == (
         snapshot_tool.LICENSE_SOURCE.read_text(encoding="utf-8")
     )
+
+
+def test_switch_license_rejects_stray_mit_word(tmp_path: Path) -> None:
+    module = tmp_path / "packages/kernel/src/mod.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("".join(_mit_block("#")) + "X = 1\n", encoding="utf-8")
+    stray = tmp_path / "packages/kernel/src/notice.txt"
+    stray.write_text("SPDX-License-Identifier: MIT\n", encoding="utf-8")
+
+    with pytest.raises(snapshot_tool.SnapshotError, match="MIT 字样"):
+        snapshot_tool.switch_license(tmp_path, ["packages/kernel"])

@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -41,8 +42,8 @@ LICENSE_REF = "LicenseRef-CANN-2.0"
 COPYRIGHT_TEXT = "Copyright (c) 2026 Workflow Controller Contributors"
 COMMENT_PREFIXES = ("#", "//")
 MIT_END_MARKER = "limitations under the License."
-MIT_LICENSE_MARKER = b"Licensed under the MIT License"
-PYPROJECT_MIT_LICENSE = b'license = "MIT"'
+# 词边界 MIT 零命中（LIMITED/RATE_LIMIT/COMMITTER 等子串不算）
+MIT_WORD = re.compile(rb"\bMIT\b")
 # 与 cannbot 仓既有文件头逐字一致（7 行正文，按目标文件注释前缀与换行风格拼接）
 CANN_HEADER_BODY = (
     "Copyright (c) 2026 Huawei Technologies Co., Ltd.",
@@ -125,16 +126,16 @@ def switch_license(target: Path, members: list[str]) -> dict[str, int]:
 
 
 def validate_license_switch(target: Path) -> None:
-    """切换互锁：子集内 MIT 许可标记与 pyproject MIT 字段零命中。"""
+    """切换互锁：子集内词边界 MIT 零命中（含许可标记与 pyproject 字段形态）。"""
     offenders = []
     for path in sorted(target.rglob("*")):
         if not path.is_file():
             continue
         content = path.read_bytes()
-        if MIT_LICENSE_MARKER in content or PYPROJECT_MIT_LICENSE in content:
+        if MIT_WORD.search(content):
             offenders.append(path.relative_to(target).as_posix())
     if offenders:
-        raise SnapshotError(f"license 切换后仍含 MIT 标记：{offenders}")
+        raise SnapshotError(f"license 切换后仍含 MIT 字样：{offenders}")
 
 
 def run_git(args: list[str], *, cwd: Path, env_extra: dict[str, str] | None = None) -> str:
