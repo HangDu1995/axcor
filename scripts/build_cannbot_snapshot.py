@@ -114,6 +114,16 @@ def switch_license(target: Path, members: list[str]) -> dict[str, int]:
             path.write_text("".join(replaced), encoding="utf-8")
             counts["headers"] += 1
     (target / "LICENSE").write_text(LICENSE_SOURCE.read_text(encoding="utf-8"), encoding="utf-8")
+    # uv.lock 无 MIT 头可转换（工具生成文件）：直接补 CANN 头注释（TOML 支持 # 注释，
+    # 且 uv lock 重生成会保留头部注释——导出侧重解析后此处每次重补，结论确定）。
+    uv_lock = target / "uv.lock"
+    if uv_lock.is_file():
+        text = uv_lock.read_text(encoding="utf-8")
+        if CANN_HEADER_BODY[0] not in text[:400]:
+            newline = "\r\n" if "\r\n" in text[:400] else "\n"
+            header = "".join(f"# {body}{newline}" for body in CANN_HEADER_BODY) + newline
+            uv_lock.write_text(header + text, encoding="utf-8")
+            counts["headers"] += 1
     for member in members:
         path = target / member / "pyproject.toml"
         text = path.read_text(encoding="utf-8")

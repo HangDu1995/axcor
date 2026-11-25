@@ -98,6 +98,24 @@ def test_switch_license_on_mini_subset(tmp_path: Path) -> None:
     )
 
 
+def test_switch_license_adds_cann_header_to_uv_lock(tmp_path: Path) -> None:
+    (tmp_path / "packages/kernel").mkdir(parents=True)
+    (tmp_path / "packages/kernel/pyproject.toml").write_text('license = "MIT"\n', encoding="utf-8")
+    (tmp_path / "LICENSE").write_text("old MIT license\n", encoding="utf-8")
+    (tmp_path / "uv.lock").write_text('version = 1\nrequires-python = ">=3.12"\n', encoding="utf-8")
+
+    counts = snapshot_tool.switch_license(tmp_path, ["packages/kernel"])
+
+    assert counts["headers"] == 1
+    lines = (tmp_path / "uv.lock").read_text(encoding="utf-8").splitlines()
+    assert lines[:7] == [f"# {body}" for body in snapshot_tool.CANN_HEADER_BODY]
+    assert lines[8:] == ["version = 1", 'requires-python = ">=3.12"']
+
+    # 幂等：已有 CANN 头不重复补
+    again = snapshot_tool.switch_license(tmp_path, ["packages/kernel"])
+    assert again["headers"] == 0
+
+
 def test_switch_license_rejects_stray_mit_word(tmp_path: Path) -> None:
     module = tmp_path / "packages/kernel/src/mod.py"
     module.parent.mkdir(parents=True)
