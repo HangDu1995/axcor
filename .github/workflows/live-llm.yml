@@ -16,8 +16,10 @@ jobs:
       (github.event_name == 'merge_group' && github.event.merge_group.base_ref == 'refs/heads/main') ||
       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
-    # 12 个 fixture，单次调用超时 300s，限流时再重试 1 次，最坏约 12×600s=120min。
-    timeout-minutes: 120
+    # reviewer：12 个 fixture，单次调用超时 300s，限流时再重试 1 次，最坏约 12×600s=120min。
+    # traceback 冒烟：真实模型 3 例，每例 run 等待上界 900s，最坏约 45min；
+    # 离线 7 例只走 loopback，约 1 分钟。
+    timeout-minutes: 180
     # Configure required reviewers before adding the model token to this environment.
     environment: live-llm
     steps:
@@ -42,6 +44,10 @@ jobs:
           : "${ANTHROPIC_AUTH_TOKEN:?Configure LIVE_LLM_PROTECTED_ANTHROPIC_AUTH_TOKEN in the live-llm environment}"
           : "${ANTHROPIC_BASE_URL:?Configure the LIVE_LLM_ANTHROPIC_BASE_URL variable}"
           : "${ANTHROPIC_MODEL:?Configure the LIVE_LLM_ANTHROPIC_MODEL variable}"
-          # 只跑固定的 reviewer replay 目录：合并队列执行 base+PR 合并代码，
+          # 只跑固定的 reviewer replay 目录与 traceback 冒烟目录：合并队列执行 base+PR 合并代码，
           # 不能按 marker 全仓选择测试，否则 fork PR 可在别处新增打标测试窃取实模凭证。
-          uv run --locked pytest -q --live packages/kernel/kernel_tests/regression/reviewer/
+          # 冒烟目录里真实模型用例需要下面的凭证，离线用例只走 loopback、不需要凭证，
+          # 两类同打 live_llm 标记，在本任务一并执行。
+          uv run --locked pytest -q --live \
+            packages/kernel/kernel_tests/regression/reviewer/ \
+            packages/kernel/kernel_tests/regression/traceback_live/

@@ -21,7 +21,7 @@
 | #63 | 已完成 | 本 commit | 屏障、作用域查询与重放前置校验在树不在内存时先按盘上配置重建，确实没有树才按原样放行或拒绝；重建的账本行带回属主，重启后 agent 会话的派发拿到子工作区、副作用落组检查点 |
 | #64 | 已完成 | 本 commit | 子代理停止钩子先经宿主把子作用域并入父作用域并释放子工作区，再交付结果；冲突、闸门不可静止与等待超窗按故障事件留痕并放行；能力矩阵新增完成前置钩子，时序只到代码级。同时修掉派发屏障回调的位置传参冲突——它是本链在生产接线上的前置缺陷 |
 | #65 | 已完成 | 本 commit | 产物读取按发起方节点的活动作用域解析基准目录：有活动作用域读其工作区，否则回落根检出；bash 进程型与 agent 型 generator 在隔离下都跑通 |
-| #66 | | | |
+| #66 | 部分完成 | 本 commit | 冒烟落地（真实模型 3 例 + 离线确定性 7 例，均 live_llm）；网关持续 503，真实模型未验证。离线冒烟在真实捆绑 CLI 上通过，暴露并修掉两处驱动缺陷（init 帧原生会话标识取不到、子代理缺省后台启动）。实测子代理 cwd 注入不成立，按裁决在能力矩阵如实降级：严格档下 claude_sdk 拒绝 writer 派发、出生侧禁 task 工具 |
 | #67 | | | |
 | #68 | | | |
 | #69 | | | |
@@ -362,6 +362,100 @@ run 平面 `packages/plugins/graph/tests/test_workspace_run_plane.py`：`test_ge
   - 重启：恢复读不回 yaml，`fail_unrestorable_subgraph` 丢弃已并入的子图状态；启动恢复随后重跑被中断的 generator。run 平面探针（bash 进程型，在该窗口弃置环境后恢复）里它在新工作区重新生成子图（第 2 次尝试）并整图完成——结局正确，代价是多一次重新编排；agent 型按代码走读是重放已结束的执行会话结局后重新并入，未在 run 平面复现。修复前这条读取路径读根检出，重排同样会以「子图不存在」收场（由同一条读取路径推出，未在修复前源码上重放该窗口）；现在能跑通是本次修复的连带效果，未另立用例（与已有两例是同一条读取路径）。
   - 重载：读不回即硬拒绝（`子图 yaml 缺失或与已合并节点不一致，拒绝重载`）。探针以「子图节点在档、DAG 未含」的档案形态调重载预案：yaml 不在根检出被拒，在根检出通过；暂停恰好落在该状态下的端到端形态未复现。
   - 修法方向：两处读取先按 generator 档案里的工作区路径（随驱动快照持久化）取文件，回落根检出。
+
+### #66 [traceback] claude_sdk 真实 runtime 最小冒烟（agent 执行器 + agent 验收 + generator + 进程重启）
+
+**调查与交付**
+
+冒烟用例住 `packages/kernel/kernel_tests/regression/traceback_live/`，分两类，同打 `live_llm` 标记（默认跳过，`--live` 才实跑），共用同一份场景函数与断言，差别只在谁来应答模型请求：
+
+- 真实模型用例 3 例（`test_real_model_smoke.py`）：需要实模凭证。
+- 离线确定性用例 7 例（`test_offline_smoke.py`）：仓内的脚本化假模型（`scripted_gateway.py`）在 loopback 上按对话状态返回确定的流式响应，驱动同一个捆绑 CLI 走完整产品链路；不触网、不需要凭证，CI 实模任务一并执行。
+
+装配走统一启动入口：真实内核加 graph 插件（插件按入口点自动发现；内核测试不 import 生产插件，只按格式串启动 run）。reviewer 关闭；run 参数指定 `evaluator=always_complete` 与 `max_iterations=1`，成员只跑一轮、不做 LLM 评估，不与冒烟争 hook。模型名取环境变量 `ANTHROPIC_MODEL`，缺省 `glm-5.2`（与 reviewer 实模用例同一缺省）。进程重启在测试内同进程模拟：会话运行时只置停止位并取消，账面上的会话状态原样留下；run 任务与宿主后台任务直接取消；随后杀 CLI 进程组、停 hook server、watchdog 与总线，全程不走关停序；同库重启经启动入口走既有恢复链。
+
+**结果表：真实模型**
+
+| 场景 | 结论 | 证据 |
+|---|---|---|
+| A 执行器 + agent 验收、C generator 子图、D 进程重启 + 冷恢复 | 未验证 | 网关对消息接口持续返回 HTTP 503：缺省模型 `glm-5.2` 经 CLI 重试约 188 秒后失败，按纪律只换一次 `glm-5.3`、同样 503；对照的 reviewer 实模用例（纯 HTTP 单次调用）1.6 秒内 503。判定为环境不可用，不再探测 |
+
+**结果表：离线确定性冒烟**（捆绑 CLI 2.1.327 + 脚本化假模型）
+
+| 场景 | 结论 | 证据 |
+|---|---|---|
+| A agent 执行器 + agent 验收 | 通过 | 执行会话与验收会话各拿到原生会话标识，两个组检查点行分别锚定各自会话（验收上下文 `node=writer/verify`），产出经集成进根检出，工作区释放，无故障事件。2.0 秒 |
+| C agent 型 generator | 通过 | Write 出的子图从节点作用域工作区读出，子图节点 `passed`，产出进根检出。1.5 秒 |
+| D 进程强杀 + 冷恢复复用会话 | 通过（修掉驱动缺陷之后） | 长眠期间强杀、同库重启，同一会话发出续跑提示、原生会话标识不变，沿原作用域经终态提交与集成后 `passed`，两个产物进根检出。10.3 秒 |
+| 弱化档子代理（收尾无延迟） | 通过（强制同步派发之后） | 父会话阻塞到子代理完成后才读到文件；收尾 0.14 秒，结果在收尾返回后 0.03 秒交付，父的下一次工具调用在收尾返回后 0.04 秒。1.6 秒 |
+| 弱化档子代理（收尾注入 8 秒等待） | 通过 | 收尾 8.18 秒，结果仍在收尾返回后 0.03 秒交付——CLI 不是只等 5 秒。9.6 秒 |
+| 严格档拒绝 writer 派发（run 声明 runtime） | 通过 | Task 结果为「No such tool available: Task. Task is disabled for this session」，不建子作用域，节点终态提交与根检出都没有子代理文件。1.0 秒 |
+| 严格档拒绝 writer 派发（run 不声明 runtime） | 通过 | Task 结果为「PreToolUse:Agent hook error: runtime claude_sdk 缺少子代理 cwd 注入能力」，其余断言同上。1.1 秒 |
+
+离线结论只到「真实 CLI + 脚本化模型」：证明的是产品链路在真实 runtime 上的接线与时序，不是模型行为。
+
+**裁决：子代理 cwd 注入如实降级**
+
+事实（裸 SDK 探针与产品路径一致，捆绑 CLI 2.1.327）：Agent 工具面向模型的输入面显式剔除了 `cwd`，它只是内部字段，留给 CLI 自身插件体系的 `agent.spawn` 钩子；PreToolUse 的 `updatedInput` 按该输入面重新校验，`cwd` 被丢弃。无论 `cwd` 是模型传的还是 hook 注入的，子代理都写进父工作目录。此前 claude_sdk 声明具备该能力，严格档照常放行 writer 派发：建出一个空的子作用域并「集成」它，子代理实际运行在父工作区，隔离静默失效，与「无法安全建区一律 fail-fast」相悖。
+
+裁决：按问题单原文「runtime 不满足时在能力矩阵里如实降级而不是留空」处理。
+
+- claude_sdk 不再声明「子代理 cwd 注入」，常量按实际含义改名（剩下的四项只是代码级结论）。后果照既有 fail-closed 路径自然成立：严格档下 claude_sdk 的 writer 派发被拒，出生侧把 task 工具列入禁用。两条路径都有离线用例与单元用例。
+- 显式弱化档仍可派发，但不提供隔离；驱动里注入 `cwd` 的那段现在只有弱化档可达。强制 `run_in_background=false` 保留，它是完成前置钩子能成立的前提。
+- 另寻注入路径（宿主接管 task 工具，或上游 / CLI 插件钩子）是设计变更，本轮不做，记入后续项。
+- 能力矩阵注释改为只写带条件的事实（捆绑 CLI 2.1.327、本地脚本化网关、非真实模型）：cwd 注入不成立及原因；子代理缺省后台启动、强制同步后才成立；正常收尾路径缺省等 600 秒、查询被中断的收尾只等 5 秒。
+
+后续项：严格档下目前没有任何真实 runtime 能派发 writer 子代理（claude_cli、opencode 本就不声明，claude_sdk 现已降级）。要恢复严格档的子代理隔离，需要先做设计决策并改设计文档：是由宿主接管 task 工具、推动上游提供 per-subagent cwd，还是接受弱化档。验收清单里依赖「严格 writer 子代理」的条目在真实 runtime 上均不可达。
+
+**暴露并修复的缺陷（同一个 commit）**
+
+- claude_sdk 驱动取不到 init 帧的原生会话标识。SDK 0.2.184 的 `SystemMessage` 没有 `session_id` 属性，init 帧的标识在 `data["session_id"]` 里；驱动按消息属性取值取空，init 帧被归成普通通知，驱动从不产出 `ITERATION_START`。后果不限于 traceback：`sdk_session_id` 捕获不到、`run_sessions.native_session_id` 不入账（实测）；会话第二轮起不带 `--resume`、每轮都是新对话，崩溃恢复后更无从复用会话（由代码推出）。既有单测的替身把 `session_id` 造成了属性，与真实类型不一致，所以一直是绿的。修复：init 帧改从 `data` 取标识。回归用例直接用真实 SDK 类型构造 init 帧，修复前失败。
+- 子代理缺省在后台启动，父会话不阻塞。捆绑 CLI 的 Agent 工具说明写明「缺省在后台运行、完成时通知」，不挂任何 hook 的裸 SDK 查询同样如此（`task_started` 带 `is_backgrounded: true`，Task 立即返回「Async agent launched」）。这与「父会话停在工具调用上结构性静止」「结果交付前完成集成」两条设计前提冲突：父代理在子代理写文件之前就去读，读到空。修复：驱动在重写 Task 输入时强制 `run_in_background=false`（实测该字段经 `updatedInput` 生效）。回归用例参数化「未指定」与「要求后台」两例，修复前失败。
+
+两处修复在真实 CLI 上的证据来自离线用例的变异验证：还原驱动修复后，A、D 与两条弱化档子代理用例失败（C 与两条拒绝用例不依赖这两处修复，不受影响）。
+
+**依赖「claude_sdk 具备 cwd 注入」的既有用例**
+
+降级后、迁移前共 27 例失败（含下文翻转的引擎层与矩阵声明两例）：建子工作区、完成后并入父作用域、重启后屏障重建这些链路在 claude_sdk 名下不再可达。核心链本身仍要被测，前提是「能力具备」的 25 个用例函数（28 例，其中 2 例降级后因断言路径巧合仍通过）改用只在测试里登记的假 runtime：仓根 `conftest.py` 的夹具 `full_capability_runtime` 经 monkeypatch 在能力表登记一个六项能力全备的假 runtime 并返回其名，用例以它作为屏障的 runtime。没有改成弱化档，那会改变屏障质量的语义；既有断言（含 `barrier_quality == precise`）原样保留。
+
+- `packages/kernel/kernel_tests/unit/run_plane/test_dispatch_barrier_chain.py`：11 个用例（含子代理收尾 5 个）。
+- `packages/kernel/kernel_tests/unit/run_plane/test_subagent_restore_chain.py`：9 个用例经 `ChainHarness` 的 `runtime` 参数。
+- `packages/kernel/kernel_tests/session_workspace/test_session_workspace.py`：3 个；`test_session_workspace_gate.py`：1 个。
+- `packages/plugins/graph/tests/test_workspace_run_plane.py`：1 个。
+
+夹具只能放仓根：插件测试树不得 import `tests.*`，conftest 夹具按目录层级对两棵测试树都可见。
+
+**新增的降级行为用例（修复前失败）**
+
+- 协调器层 `test_dispatch_barrier_chain.py::test_strict_mode_denies_claude_sdk_writer_dispatch`：严格档 + claude_sdk 的 writer 派发被拒、不建子作用域，副作用屏障照常放行。旧声明下实得 `BarrierProceed` 并建出子工作区 `node-a-c1`。
+- 引擎层 `test_engine_dispatch_barrier.py`：既有的「缺 cwd 注入的 runtime 禁派发工具」用例参数化加入 claude_sdk，旧声明下 `KeyError: 'disallowed_tools'`；原「严格档 + claude_sdk 不禁派发工具」用例翻转，另以全能力假 runtime 保留「声明了该能力的 runtime 不受影响」的正向用例。
+- 矩阵声明 `unit/driver/test_dispatch_barrier.py::test_claude_sdk_omits_child_cwd_injection_and_denies_writer_in_strict_mode`：旧声明下仍声明 cwd 注入。
+- 离线端到端 `test_offline_strict_writer_dispatch_denied`（参数化两例）：旧声明下两例都失败。
+
+**决策与偏差**
+
+- 真实模型下三个场景未验证，原因见结果表。按纪律没有反复重试；总览行按「部分完成」记。
+- 一次性假网关固化成了可提交的离线用例（原 #66 交付时的偏差，已按裁决纠正）。固化时踩到两点，都写进了用例注释：捆绑 CLI 会把提示词里的引号、尖括号和 `&` 转义后再发给模型，脚本标记不能带这些字符；同一对话里多次工具调用的标识不能撞号。
+- 两处驱动修复按「小而确定」就地修：都是一两行、都在真实捆绑 CLI 上复现并验证了修法，且都是让运行时行为回到既有设计（会话标识捕获、父会话停在工具调用上），没有改设计文档。
+- 强杀模拟的保真边界：CLI 子进程是被显式 SIGKILL 的。真实的 kill -9 下父进程死、CLI 子进程会成为孤儿，其行为未验证。
+- 冒烟的长眠命令用 `python3 -c "import time; time.sleep(30)"`：捆绑 CLI 对独立的 `sleep N` 做短路、对链式的直接拦截（返回「Blocked: sleep 30 followed by…」），起不到长眠作用。用例另加一道断言，强杀前 run 必须仍未结束，防止长眠没生效时「重启」变成假象。
+- 离线用例靠环境开关 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 关掉捆绑 CLI 的非必要外联；该开关的效果没有独立测量。
+
+**验证**
+
+`packages/kernel/kernel_tests/unit/driver/test_claude_sdk.py`：`test_init_frame_session_id_in_data_starts_iteration`。
+
+`packages/kernel/kernel_tests/unit/driver/test_dispatch_barrier.py`：`test_sdk_pre_tool_dispatch_proceeds_with_cwd_injection`（参数化两例）、`test_claude_sdk_omits_child_cwd_injection_and_denies_writer_in_strict_mode`。
+
+冒烟目录：默认模式 10 例全部跳过；本机 `--live` 实跑离线 7 例通过，约 30 秒。
+
+门禁（最终代码上）：`ruff format --check` 428 个文件已格式化、`ruff check` 全过、`lint-imports` 4 条契约保持 0 破坏、`codespell`（全部 git 跟踪的 markdown）无命中；全量 pytest 2846 通过、25 跳过（基线 2842 通过、15 跳过：新增 4 例单测通过——init 帧 1 例、注入参数化净增 1 例、协调器层拒绝 1 例、引擎层拒绝参数化净增 1 例；冒烟 10 例默认跳过），2 条告警为 breather 插件既有告警；`uv build --package workflow-controller-kernel` 与 `--package workflow-controller-plugin-graph` 的 sdist 与 wheel 构建成功（graph 插件源码未改动，因测试有改动一并构建核对）。
+
+**顺带发现**
+
+- 子代理自身的 Bash 副作用屏障经父会话进入宿主，在父作用域上另建了一个组检查点行——评审的 D6（#71）在真实 CLI 下同样出现，本冒烟未处理。
+- 派发组检查点行的子会话映射回填在真实 CLI 下成立（`task_started` 的工具调用号与 Task 调用对得上），收尾链据此找到子作用域；这是 #64 日志里留待本次核实的未确定项。
+- 屏障入口的等待超窗先于能力门生效：`test_barrier_wait_window_closes_with_fault` 在降级前后都通过，但它实际只测到了入口层超时。
 
 ## 跳过与延期
 

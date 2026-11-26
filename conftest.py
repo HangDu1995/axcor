@@ -12,14 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""仓根共享 pytest 配置：环境隔离插件注册与对全部测试树生效的通用收尾夹具。"""
+"""仓根共享 pytest 配置：环境隔离插件注册与对全部测试树生效的通用夹具。"""
 
 import asyncio
 import logging
 
 import pytest
 
+from workflow_controller.plugin.dispatch_barrier import (
+    DISPATCH_CAPABILITIES_BY_RUNTIME,
+    DispatchCapability,
+    RuntimeDispatchCapabilities,
+)
+
 pytest_plugins = ("tests.support.pytest_hermetic", "pytester")
+
+
+@pytest.fixture
+def full_capability_runtime(monkeypatch: pytest.MonkeyPatch) -> str:
+    """登记一个屏障能力全备的假 runtime 并返回其名。
+
+    只在测试里存在：供前提是「能力具备」的屏障链用例使用，不依赖任何
+    真实 runtime 的能力声明；真实 runtime 的声明变化不影响这些用例。
+    """
+    runtime = "fake-full-capability"
+    monkeypatch.setitem(
+        DISPATCH_CAPABILITIES_BY_RUNTIME,
+        runtime,
+        RuntimeDispatchCapabilities(runtime, frozenset(DispatchCapability)),
+    )
+    return runtime
 
 
 @pytest.fixture(autouse=True)

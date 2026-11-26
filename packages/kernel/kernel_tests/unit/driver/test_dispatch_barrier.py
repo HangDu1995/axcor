@@ -14,15 +14,17 @@
 
 """派发屏障能力矩阵与 SDK 前置屏障接线测试。
 
-矩阵断言按 S4a 代码级核验结论固化：claude SDK 五项全备（Task 输入含
-cwd 参数 + PreToolUse updatedInput 重写，经捆绑 CLI 2.1.327 输入面核验）；
-claude CLI 的 matcher 面由部署侧管理按缺失处理；opencode DB 轮询全缺。
+矩阵断言固化各 runtime 的能力声明：claude SDK 不声明子代理 cwd 注入
+（捆绑 CLI 上实测不成立），其余四项为代码级结论；claude CLI 的 matcher
+面由部署侧管理按缺失处理；opencode DB 轮询全缺。
 """
 
 from __future__ import annotations
 
 import inspect
 from typing import Any
+
+import pytest
 
 from workflow_controller.driver.claude_sdk import (
     ClaudeSDKDriver,
@@ -45,11 +47,10 @@ from workflow_controller.plugin.dispatch_barrier import (
     writer_dispatch_block_reason,
 )
 
-# claude SDK 经代码级核验的五项屏障能力
-_FIVE_VERIFIED = frozenset(
+# claude SDK 经代码级核验的四项屏障能力（不含子代理 cwd 注入）
+_SDK_CODE_LEVEL = frozenset(
     {
         DispatchCapability.TASK_PRE_INTERCEPT,
-        DispatchCapability.CHILD_CWD_INJECTION,
         DispatchCapability.PARENT_LOCAL_QUIESCE,
         DispatchCapability.PRE_DISPATCH_ANCHOR,
         DispatchCapability.SIDE_EFFECT_ARBITRATION,
@@ -57,12 +58,18 @@ _FIVE_VERIFIED = frozenset(
 )
 
 
-def test_claude_sdk_declares_all_five_capabilities() -> None:
-    """claude SDK：进程内 hook 路径五项能力全备（核验结论落档）。"""
+def test_claude_sdk_omits_child_cwd_injection_and_denies_writer_in_strict_mode() -> None:
+    """claude SDK：四项代码级能力在册、子代理 cwd 注入不在册。
+
+    严格档据此拒绝 writer 子代理，副作用屏障照常放行；弱化档两者都放行。
+    """
     caps = dispatch_capabilities_for("claude_sdk")
-    assert caps.capabilities >= _FIVE_VERIFIED
-    assert writer_dispatch_block_reason(caps, strict=True) is None
+    assert caps.capabilities >= _SDK_CODE_LEVEL
+    assert not caps.supports(DispatchCapability.CHILD_CWD_INJECTION)
+    reason = writer_dispatch_block_reason(caps, strict=True)
+    assert reason is not None and "cwd 注入" in reason
     assert group_arbitration_block_reason(caps, strict=True) is None
+    assert writer_dispatch_block_reason(caps, strict=False) is None
 
 
 def test_claude_sdk_declares_subagent_completion_hook() -> None:
@@ -151,11 +158,18 @@ def _async_barrier(fn: Any) -> Any:
     return wrapper
 
 
-async def test_sdk_pre_tool_dispatch_proceeds_with_cwd_injection() -> None:
-    """task 派发屏障放行：updatedInput 注入子代理工作区 cwd。"""
+@pytest.mark.parametrize(
+    "requested", [{}, {"run_in_background": True}], ids=["unset", "background"]
+)
+async def test_sdk_pre_tool_dispatch_proceeds_with_cwd_injection(requested: dict[str, Any]) -> None:
+    """task 派发屏障放行：updatedInput 带子代理工作区 cwd，并强制同步派发。
+
+    捆绑 CLI 的子代理缺省在后台启动，模型即便要求后台运行也改回同步：
+    父会话要停在工具调用上，子作用域才能在结果交付前并入。
+    """
     hooks = _hooks(dispatch=lambda sid, data: _ok("/ws/child-1"))
     result = await _sdk_pre_tool_cb(
-        {"tool_name": "Task", "tool_input": {"prompt": "work"}, "session_id": "nat-1"},
+        {"tool_name": "Task", "tool_input": {"prompt": "work", **requested}, "session_id": "nat-1"},
         "toolu-1",
         None,
         hooks=hooks,
@@ -163,7 +177,12 @@ async def test_sdk_pre_tool_dispatch_proceeds_with_cwd_injection() -> None:
     specific = result["hookSpecificOutput"]
     assert specific["hookEventName"] == "PreToolUse"
     assert specific["permissionDecision"] == "allow"
-    assert specific["updatedInput"] == {"prompt": "work", "cwd": "/ws/child-1"}
+    assert specific["updatedInput"] == {
+        "prompt": "work",
+        **requested,
+        "cwd": "/ws/child-1",
+        "run_in_background": False,
+    }
 
 
 async def test_sdk_pre_tool_dispatch_deny_blocks() -> None:

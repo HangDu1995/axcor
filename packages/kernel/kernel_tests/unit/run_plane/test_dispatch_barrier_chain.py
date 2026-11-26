@@ -18,6 +18,9 @@
 run 平面装配（探针驱动）。能力矩阵门与有界等待收口同在此固化。
 子代理完成走同一条队列：结果交付前并入父作用域、释放子工作区，
 冲突与超窗按故障事件留痕。
+
+链路本身以能力全备的假 runtime 为前提（夹具 full_capability_runtime），
+不依赖任何真实 runtime 的能力声明；真实 runtime 的降级行为另有用例。
 """
 
 from __future__ import annotations
@@ -163,7 +166,9 @@ async def _setup_run(
     return h
 
 
-async def test_dispatch_barrier_returns_child_cwd_through_queue(tmp_path: Path) -> None:
+async def test_dispatch_barrier_returns_child_cwd_through_queue(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
     """task 派发屏障：请求过协调器队列执行核心动作，返回子工作区 cwd。"""
     h = await _setup_run(tmp_path)
     try:
@@ -177,7 +182,7 @@ async def test_dispatch_barrier_returns_child_cwd_through_queue(tmp_path: Path) 
                 "native_session_id": "ses-native-exec",
                 "prompt_id": "msg-1",
             },
-            runtime="claude_sdk",
+            runtime=full_capability_runtime,
         )
         assert isinstance(outcome, BarrierProceed)
         assert outcome.child_cwd
@@ -226,7 +231,10 @@ async def test_side_effect_barrier_establishes_group(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(("kind", "tool_name"), [("side_effect", "Bash"), ("dispatch", "Task")])
 async def test_verifier_session_barrier_lands_on_node_scope(
-    tmp_path: Path, kind: str, tool_name: str
+    tmp_path: Path,
+    kind: str,
+    tool_name: str,
+    full_capability_runtime: str,
 ) -> None:
     """验收会话 context 带相位后缀：屏障放行，组检查点行落在节点作用域。"""
     h = await _setup_run(tmp_path)
@@ -241,7 +249,7 @@ async def test_verifier_session_barrier_lands_on_node_scope(
                 "native_session_id": "ses-native-verify",
                 "prompt_id": "msg-verify-1",
             },
-            runtime="claude_sdk",
+            runtime=full_capability_runtime,
         )
         assert isinstance(outcome, BarrierProceed)
         group_rows = [
@@ -270,6 +278,7 @@ async def test_barrier_lands_on_latest_active_scope_of_node(
     context: str,
     abandon_previous: bool,
     caplog: pytest.LogCaptureFixture,
+    full_capability_runtime: str,
 ) -> None:
     """节点重试后旧作用域已废弃、新作用域活动：执行与验收会话的屏障都落在活动作用域。
 
@@ -285,13 +294,13 @@ async def test_barrier_lands_on_latest_active_scope_of_node(
                 "ses-call",
                 "side_effect",
                 {"tool_name": "Bash", "tool_use_id": "toolu-r1", "prompt_id": "msg-retry"},
-                runtime="claude_sdk",
+                runtime=full_capability_runtime,
             )
             dispatch = await h.coord.submit_dispatch_barrier(
                 "ses-call",
                 "dispatch",
                 {"tool_name": "Task", "tool_use_id": "toolu-r2", "prompt_id": "msg-retry"},
-                runtime="claude_sdk",
+                runtime=full_capability_runtime,
             )
         assert isinstance(side_effect, BarrierProceed)
         assert isinstance(dispatch, BarrierProceed)
@@ -367,6 +376,37 @@ async def test_strict_mode_denies_barrierless_runtime(tmp_path: Path) -> None:
         await _finish_run(h)
 
 
+async def test_strict_mode_denies_claude_sdk_writer_dispatch(tmp_path: Path) -> None:
+    """严格档 + claude_sdk（不声明子代理 cwd 注入）：writer 派发被拒、不建子作用域，副作用屏障照常放行。"""
+    h = await _setup_run(tmp_path)
+    try:
+        dispatch = await h.coord.submit_dispatch_barrier(
+            "ses-exec",
+            "dispatch",
+            {"tool_name": "Task", "tool_use_id": "toolu-1", "prompt_id": "msg-1"},
+            runtime="claude_sdk",
+        )
+        assert isinstance(dispatch, BarrierDeny)
+        assert "cwd 注入" in dispatch.reason
+        scopes = await h.coord.list_run_scopes(h.run_id)
+        assert not [s for s in scopes if s["scope_kind"] == "subagent"]
+        group_rows = [
+            r
+            for r in await h.coord.list_run_checkpoints(h.run_id)
+            if r["trigger"] == "before_child"
+        ]
+        assert group_rows == []
+        side_effect = await h.coord.submit_dispatch_barrier(
+            "ses-exec",
+            "side_effect",
+            {"tool_name": "Bash", "tool_use_id": "toolu-2", "prompt_id": "msg-1"},
+            runtime="claude_sdk",
+        )
+        assert isinstance(side_effect, BarrierProceed)
+    finally:
+        await _finish_run(h)
+
+
 async def test_compat_mode_proceeds_with_late_barrier(tmp_path: Path) -> None:
     """弱化档：显式 compat_late_barrier 下放行并标注 late_barrier。"""
     h = await _setup_run(tmp_path, tree_overrides={"on_no_dispatch_barrier": "compat_late_barrier"})
@@ -413,7 +453,9 @@ def _drop_workspace_tree(h: BridgeHarness) -> None:
     tree.checkpoints.close()
 
 
-async def test_barrier_rebuilds_tree_left_only_on_disk(tmp_path: Path) -> None:
+async def test_barrier_rebuilds_tree_left_only_on_disk(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
     """树只在盘上：屏障先按持久化配置重建树再执行，不静默直通。"""
     h = await _setup_run(tmp_path)
     try:
@@ -422,7 +464,7 @@ async def test_barrier_rebuilds_tree_left_only_on_disk(tmp_path: Path) -> None:
             "ses-exec",
             "dispatch",
             {"tool_name": "Task", "tool_use_id": "toolu-1", "prompt_id": "msg-1"},
-            runtime="claude_sdk",
+            runtime=full_capability_runtime,
         )
         assert isinstance(dispatch, BarrierProceed)
         assert dispatch.child_cwd
@@ -431,7 +473,7 @@ async def test_barrier_rebuilds_tree_left_only_on_disk(tmp_path: Path) -> None:
             "ses-exec",
             "side_effect",
             {"tool_name": "Bash", "tool_use_id": "toolu-2", "prompt_id": "msg-2"},
-            runtime="claude_sdk",
+            runtime=full_capability_runtime,
         )
         assert isinstance(side_effect, BarrierProceed)
         assert side_effect.child_cwd is None
@@ -494,7 +536,9 @@ async def test_read_artifact_rebuilds_tree_left_only_on_disk(tmp_path: Path) -> 
         await _finish_run(h)
 
 
-async def test_replay_validation_rebuilds_tree_left_only_on_disk(tmp_path: Path) -> None:
+async def test_replay_validation_rebuilds_tree_left_only_on_disk(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
     """树只在盘上：重放前置校验先重建树，结论与树在内存时一致。"""
     h = await _setup_run(tmp_path)
     try:
@@ -508,7 +552,7 @@ async def test_replay_validation_rebuilds_tree_left_only_on_disk(tmp_path: Path)
                 "ses-exec",
                 kind,
                 {"tool_name": tool_name, "tool_use_id": tool_use_id, "prompt_id": message},
-                runtime="claude_sdk",
+                runtime=full_capability_runtime,
             )
         group_rows = {
             row["dispatch_anchor"]["tool_use_id"]: row["checkpoint_id"]
@@ -534,7 +578,9 @@ async def test_replay_validation_rebuilds_tree_left_only_on_disk(tmp_path: Path)
 
 
 async def test_query_and_barrier_rebuild_tree_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    full_capability_runtime: str,
 ) -> None:
     """查询面与屏障并发到场只重建一次树：后到者等同一棵树，不各建一棵。"""
     h = await _setup_run(tmp_path)
@@ -559,7 +605,7 @@ async def test_query_and_barrier_rebuild_tree_once(
                 "ses-exec",
                 "dispatch",
                 {"tool_name": "Task", "tool_use_id": "toolu-1", "prompt_id": "msg-1"},
-                runtime="claude_sdk",
+                runtime=full_capability_runtime,
             )
         )
         await asyncio.sleep(0.5)  # 留出 run 任务取到屏障请求的时间
@@ -628,14 +674,14 @@ async def test_unaffiliated_session_passes_through(tmp_path: Path) -> None:
 
 
 async def _dispatch_subagent(
-    h: BridgeHarness, *, workspace: str = "writer", agent_id: str = "agent-1"
+    h: BridgeHarness, *, runtime: str, workspace: str = "writer", agent_id: str = "agent-1"
 ) -> str:
     """派发一个 writer/reader 子代理并回填子会话映射，返回子工作区路径。"""
     outcome = await h.coord.submit_dispatch_barrier(
         "ses-exec",
         "dispatch",
         {"tool_name": "Task", "tool_use_id": "toolu-1", "prompt_id": "msg-1"},
-        runtime="claude_sdk",
+        runtime=runtime,
         workspace=workspace,
     )
     assert isinstance(outcome, BarrierProceed) and outcome.child_cwd
@@ -650,11 +696,13 @@ async def _scope_states(h: BridgeHarness) -> dict[str, str]:
     return {s["scope_id"]: s["state"] for s in await h.coord.list_run_scopes(h.run_id)}
 
 
-async def test_writer_subagent_completion_integrates_into_parent_scope(tmp_path: Path) -> None:
+async def test_writer_subagent_completion_integrates_into_parent_scope(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
     """writer 子代理完成：子分支并入父作用域、产出在父工作区可见、子工作区释放、terminal 行落账。"""
     h = await _setup_run(tmp_path)
     try:
-        child_cwd = await _dispatch_subagent(h)
+        child_cwd = await _dispatch_subagent(h, runtime=full_capability_runtime)
         (Path(child_cwd) / "design" / "from-child.md").write_text("child\n", encoding="utf-8")
 
         await h.coord.settle_subagent_result("ses-exec", {"agent_id": "agent-1"})
@@ -690,11 +738,15 @@ async def test_writer_subagent_completion_integrates_into_parent_scope(tmp_path:
         await _finish_run(h)
 
 
-async def test_reader_subagent_completion_releases_snapshot_workspace(tmp_path: Path) -> None:
+async def test_reader_subagent_completion_releases_snapshot_workspace(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
     """reader 子代理完成：快照工作区释放，作用域按废弃换代、永不集成。"""
     h = await _setup_run(tmp_path)
     try:
-        reader_cwd = await _dispatch_subagent(h, workspace="reader")
+        reader_cwd = await _dispatch_subagent(
+            h, runtime=full_capability_runtime, workspace="reader"
+        )
         assert Path(reader_cwd).is_dir()
 
         await h.coord.settle_subagent_result("ses-exec", {"agent_id": "agent-1"})
@@ -708,11 +760,12 @@ async def test_reader_subagent_completion_releases_snapshot_workspace(tmp_path: 
 
 async def test_subagent_completion_conflict_emits_fault_and_keeps_workspace(
     tmp_path: Path,
+    full_capability_runtime: str,
 ) -> None:
     """集成被拒：落 fault.workspace_conflict，子工作区与子分支保留，入口照常返回。"""
     h = await _setup_run(tmp_path)
     try:
-        child_cwd = await _dispatch_subagent(h)
+        child_cwd = await _dispatch_subagent(h, runtime=full_capability_runtime)
         node_workspace = next(
             s["workspace_path"]
             for s in await h.coord.list_run_scopes(h.run_id)
@@ -741,11 +794,12 @@ async def test_subagent_completion_conflict_emits_fault_and_keeps_workspace(
 
 async def test_subagent_completion_quiesce_failure_emits_fault_and_keeps_workspace(
     tmp_path: Path,
+    full_capability_runtime: str,
 ) -> None:
     """闸门不可静止：落 fault.scope_quiesce_failed，子工作区保留，入口照常返回。"""
     h = await _setup_run(tmp_path)
     try:
-        child_cwd = await _dispatch_subagent(h)
+        child_cwd = await _dispatch_subagent(h, runtime=full_capability_runtime)
         (Path(child_cwd) / "design" / "from-child.md").write_text("child\n", encoding="utf-8")
 
         async def never_drains(_scope_id: str) -> None:
@@ -764,12 +818,14 @@ async def test_subagent_completion_quiesce_failure_emits_fault_and_keeps_workspa
         await _finish_run(h)
 
 
-async def test_subagent_completion_wait_window_closes_with_fault(tmp_path: Path) -> None:
+async def test_subagent_completion_wait_window_closes_with_fault(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
     """有界等待：超窗落 fault.scope_quiesce_failed 后放行，钩子不挂死。"""
     slow = SlowSnapshotDriver(_hold_plan("slow"), delay_s=0.0)
     h = await _setup_run(tmp_path, driver=slow)
     try:
-        child_cwd = await _dispatch_subagent(h)
+        child_cwd = await _dispatch_subagent(h, runtime=full_capability_runtime)
         slow._delay_s = 1.0  # 收尾链里的编排快照变慢，撞上收窄后的等待窗口
         h.coord._workspace_trees[h.run_id].barrier_wait_timeout_s = 0.05
 

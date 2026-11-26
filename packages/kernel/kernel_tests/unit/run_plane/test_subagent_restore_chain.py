@@ -17,6 +17,9 @@
 覆盖：组检查点恢复撤回整组副作用（#23/#24）、恢复会话绑定四元组、
 RestoreCommitted 前不创建会话的定序崩溃注入、多副作用组 replay 拒绝
 （#35）、reader 子代理 detached 快照与永不集成、子会话映射回填。
+
+派发以能力全备的假 runtime 为前提（夹具 full_capability_runtime），不依赖
+任何真实 runtime 的能力声明。
 """
 
 from __future__ import annotations
@@ -99,7 +102,8 @@ class OpChainDriver(ProbeDriver):
 class ChainHarness:
     """run 平面装配：真实协调器 + 真实 git + 阶段化探针计划。"""
 
-    def __init__(self, tmp_path: Path, transcript: Path | None = None) -> None:
+    def __init__(self, tmp_path: Path, *, runtime: str, transcript: Path | None = None) -> None:
+        self.runtime = runtime
         self.work_root = tmp_path / "root"
         (self.work_root / "design").mkdir(parents=True)
         (self.work_root / "design" / "base.md").write_text("base\n", encoding="utf-8")
@@ -217,7 +221,7 @@ class ChainHarness:
                 "native_session_id": "ses-native-exec",
                 "prompt_id": "msg-1",
             },
-            runtime="claude_sdk",
+            runtime=self.runtime,
             workspace=workspace,
         )
 
@@ -264,9 +268,13 @@ async def _node_workspace_path(h: ChainHarness) -> Path:
     return Path(row["workspace_path"])
 
 
-async def test_group_rollback_withdraws_integrated_sibling_changes(tmp_path: Path) -> None:
+async def test_group_rollback_withdraws_integrated_sibling_changes(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
     """#23 核心：组内 task A 已集成、回滚 task B 时 A 的修改随组检查点一并撤回。"""
-    h = ChainHarness(tmp_path, transcript=_write_transcript(tmp_path))
+    h = ChainHarness(
+        tmp_path, runtime=full_capability_runtime, transcript=_write_transcript(tmp_path)
+    )
     await h.start()
     try:
         outcome_a = await h.barrier("dispatch", "toolu-1")
@@ -313,9 +321,13 @@ async def test_group_rollback_withdraws_integrated_sibling_changes(tmp_path: Pat
         await h.finish()
 
 
-async def test_restore_session_bound_to_run_scope_new_epoch(tmp_path: Path) -> None:
+async def test_restore_session_bound_to_run_scope_new_epoch(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
     """恢复会话绑定原 run/作用域/新 epoch，cwd 指向父作用域工作区。"""
-    h = ChainHarness(tmp_path, transcript=_write_transcript(tmp_path))
+    h = ChainHarness(
+        tmp_path, runtime=full_capability_runtime, transcript=_write_transcript(tmp_path)
+    )
     await h.start()
     try:
         await h.barrier("dispatch", "toolu-1")
@@ -360,9 +372,13 @@ async def test_restore_session_bound_to_run_scope_new_epoch(tmp_path: Path) -> N
         await h.finish()
 
 
-async def test_crash_before_restore_commit_creates_no_session(tmp_path: Path) -> None:
+async def test_crash_before_restore_commit_creates_no_session(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
     """定序崩溃注入：RestoreCommitted 前链路停摆，不创建新 session。"""
-    h = ChainHarness(tmp_path, transcript=_write_transcript(tmp_path))
+    h = ChainHarness(
+        tmp_path, runtime=full_capability_runtime, transcript=_write_transcript(tmp_path)
+    )
     await h.start()
     try:
         await h.barrier("dispatch", "toolu-1")
@@ -394,9 +410,13 @@ async def test_crash_before_restore_commit_creates_no_session(tmp_path: Path) ->
         await h.finish()
 
 
-async def test_write_tool_side_effect_withdrawn_and_not_reproduced(tmp_path: Path) -> None:
+async def test_write_tool_side_effect_withdrawn_and_not_reproduced(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
     """#24：组内写文件工具的修改随组撤回，恢复后不重复产生。"""
-    h = ChainHarness(tmp_path, transcript=_write_transcript(tmp_path))
+    h = ChainHarness(
+        tmp_path, runtime=full_capability_runtime, transcript=_write_transcript(tmp_path)
+    )
     await h.start()
     try:
         write_outcome = await h.barrier(
@@ -428,9 +448,13 @@ async def test_write_tool_side_effect_withdrawn_and_not_reproduced(tmp_path: Pat
         await h.finish()
 
 
-async def test_multi_side_effect_group_rejects_replay_dispatch(tmp_path: Path) -> None:
+async def test_multi_side_effect_group_rejects_replay_dispatch(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
     """#35：多副作用组（写工具 + task）的 replay_dispatch 请求被明确拒绝。"""
-    h = ChainHarness(tmp_path, transcript=_write_transcript(tmp_path))
+    h = ChainHarness(
+        tmp_path, runtime=full_capability_runtime, transcript=_write_transcript(tmp_path)
+    )
     await h.start()
     try:
         await h.barrier(
@@ -461,9 +485,13 @@ async def test_multi_side_effect_group_rejects_replay_dispatch(tmp_path: Path) -
         await h.finish()
 
 
-async def test_single_task_group_allows_replay_signal(tmp_path: Path) -> None:
+async def test_single_task_group_allows_replay_signal(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
     """单 task 组：replay 请求通过校验，首轮信号携带原始调用参数。"""
-    h = ChainHarness(tmp_path, transcript=_write_transcript(tmp_path))
+    h = ChainHarness(
+        tmp_path, runtime=full_capability_runtime, transcript=_write_transcript(tmp_path)
+    )
     await h.start()
     try:
         await h.barrier(
@@ -498,9 +526,11 @@ async def test_single_task_group_allows_replay_signal(tmp_path: Path) -> None:
         await h.finish()
 
 
-async def test_reader_subagent_gets_detached_snapshot_never_integrated(tmp_path: Path) -> None:
+async def test_reader_subagent_gets_detached_snapshot_never_integrated(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
     """reader 子代理：detached worktree 只读快照，无分支、永不集成。"""
-    h = ChainHarness(tmp_path)
+    h = ChainHarness(tmp_path, runtime=full_capability_runtime)
     await h.start()
     try:
         outcome = await h.barrier("dispatch", "toolu-1", workspace="reader")
@@ -527,9 +557,11 @@ async def test_reader_subagent_gets_detached_snapshot_never_integrated(tmp_path:
         await h.finish()
 
 
-async def test_subagent_start_backfills_child_session_map(tmp_path: Path) -> None:
+async def test_subagent_start_backfills_child_session_map(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
     """子代理启动回执：按派发准入回填组检查点行的子会话映射。"""
-    h = ChainHarness(tmp_path)
+    h = ChainHarness(tmp_path, runtime=full_capability_runtime)
     await h.start()
     try:
         await h.barrier("dispatch", "toolu-1")
@@ -554,11 +586,15 @@ async def _wait_resumed(h: ChainHarness, *, expected: int) -> None:
     raise AssertionError("恢复会话未在限期内创建")
 
 
-async def test_api_subagent_rollback_validates_and_forwards(tmp_path: Path) -> None:
+async def test_api_subagent_rollback_validates_and_forwards(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
     """API 面：组检查点核验、非组行拒绝与 op 转发。"""
     from workflow_controller.api.run_api import RunAPI
 
-    h = ChainHarness(tmp_path, transcript=_write_transcript(tmp_path))
+    h = ChainHarness(
+        tmp_path, runtime=full_capability_runtime, transcript=_write_transcript(tmp_path)
+    )
     await h.start()
     try:
         await h.barrier("dispatch", "toolu-1")

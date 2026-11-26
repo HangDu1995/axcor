@@ -361,7 +361,9 @@ async def test_cold_recovery_reused_member_session_integrates_into_root(tmp_path
     assert triggers == {"scope_start", "terminal"}
 
 
-async def test_cold_recovery_dispatch_barrier_rebuilds_workspace_tree(tmp_path: Path) -> None:
+async def test_cold_recovery_dispatch_barrier_rebuilds_workspace_tree(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
     """进程重启后工作区树不在内存：成员会话的屏障重建树后执行，不静默直通。
 
     节点沿用原作用域续跑；task 派发拿到子工作区 cwd，副作用落组检查点，
@@ -393,7 +395,7 @@ async def test_cold_recovery_dispatch_barrier_rebuilds_workspace_tree(tmp_path: 
         sid,
         "dispatch",
         {"tool_name": "Task", "tool_use_id": "toolu-1", "prompt_id": "msg-1"},
-        runtime="claude_sdk",
+        runtime=full_capability_runtime,
     )
     assert isinstance(dispatch, BarrierProceed)
     assert dispatch.child_cwd and Path(dispatch.child_cwd).is_dir()
@@ -401,7 +403,7 @@ async def test_cold_recovery_dispatch_barrier_rebuilds_workspace_tree(tmp_path: 
         sid,
         "side_effect",
         {"tool_name": "Bash", "tool_use_id": "toolu-2", "prompt_id": "msg-2"},
-        runtime="claude_sdk",
+        runtime=full_capability_runtime,
     )
     assert isinstance(side_effect, BarrierProceed)
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import pytest
+from claude_agent_sdk.types import SystemMessage
 
 from workflow_controller.driver.claude_sdk import _sdk_to_events
 from workflow_controller.session.events import EventType
@@ -144,6 +145,14 @@ def test_system_message_extracts_session_id() -> None:
     assert ev.event_type is EventType.ITERATION_START
     assert ev.data["session_id"] == "cli-abc"
     assert ev.data["subtype"] == "init"
+
+
+def test_init_frame_session_id_in_data_starts_iteration() -> None:
+    """真实 SDK 的 init 帧不带 session_id 属性（标识在 data 里），同样产出 ITERATION_START。"""
+    init = SystemMessage(subtype="init", data={"session_id": "cli-abc", "model": "m"})
+    events = _sdk_to_events(init, session_id="ops-1", iteration=1)
+    assert [ev.event_type for ev in events] == [EventType.ITERATION_START]
+    assert events[0].data["session_id"] == "cli-abc"
 
 
 def test_task_started_is_not_query_boundary() -> None:

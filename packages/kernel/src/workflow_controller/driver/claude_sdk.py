@@ -437,7 +437,10 @@ def _sdk_system_events(
 
     # 初始化消息建立会话映射；task 消息只是子代理进度，不能作为 query 边界。
     data = {"type": "system", "subtype": subtype, **dict(getattr(msg, "data", {}) or {})}
-    sid = getattr(msg, "session_id", None)
+    # init 帧的原生会话标识随 data 下发，消息本身不带该属性
+    sid = getattr(msg, "session_id", None) or (
+        data.get("session_id") if subtype == "init" else None
+    )
     if sid:
         data["session_id"] = sid
     if sid and not subtype.startswith("task_"):
@@ -515,10 +518,13 @@ async def _sdk_pre_tool_cb(
         and barrier_outcome.child_cwd
         and is_dispatch_tool(tool_name)
     ):
-        # ② cwd 注入：PreToolUse updatedInput 重写 Task 输入，子代理在
-        # 作用域工作区内启动
+        # updatedInput 重写 Task 输入。claude SDK 严格档缺 cwd 注入、派发被拒，
+        # 走到这里的是显式弱化档：cwd 随输入下发，但捆绑 CLI 的 Agent 工具
+        # 输入面不含 cwd，会把它丢弃，子代理实际运行在父工作区；强制同步
+        # 派发则生效——父会话停在工具调用上，子作用域才能在结果交付前并入
         tool_input = dict(input_data.get("tool_input") or {})
         tool_input["cwd"] = barrier_outcome.child_cwd
+        tool_input["run_in_background"] = False
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",

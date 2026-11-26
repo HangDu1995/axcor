@@ -14,13 +14,16 @@
 
 """严格档下成员出生规格的 writer 子代理拒绝测试（能力矩阵出生侧落点）。
 
-runtime 缺子代理 cwd 注入能力（②）且 traceback 工作区严格档开启时，
-成员规格禁用 task 派发工具——writer 子代理拒绝启动的出生侧表现。
+runtime 未声明子代理 cwd 注入能力（现有真实 runtime 均如此）且 traceback
+工作区严格档开启时，成员规格禁用 task 派发工具——writer 子代理拒绝启动
+的出生侧表现；声明了该能力的 runtime 不受影响。
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
+
+import pytest
 
 from workflow_controller.plugin.run_driver import StartSession
 from workflow_controller.plugin.workspace import PrepareScopeWorkspace, ScopeWorkspacePrepared
@@ -67,19 +70,22 @@ def _spawn_spec(driver: GraphDriver) -> dict[str, Any]:
     return dict(starts[0].spec.config_overrides)
 
 
-def test_strict_traceback_denies_dispatch_tools_on_barrierless_runtime(
-    tmp_path: Path,
+@pytest.mark.parametrize("runtime", ["opencode", "claude_sdk"])
+def test_strict_traceback_denies_dispatch_tools_on_runtime_without_cwd_injection(
+    tmp_path: Path, runtime: str
 ) -> None:
-    """严格档 + opencode：成员规格禁 task/Agent，writer 子代理拒绝启动。"""
-    driver = _runtime_driver(tmp_path, "opencode", _TRACEBACK_CFG)
+    """严格档 + 未声明 cwd 注入的 runtime：成员规格禁 task/Agent，writer 子代理拒绝启动。"""
+    driver = _runtime_driver(tmp_path, runtime, _TRACEBACK_CFG)
     overrides = _spawn_spec(driver)
     assert overrides["disallowed_tools"] == ["Task", "Agent"]
-    assert overrides["runtime"] == "opencode"
+    assert overrides["runtime"] == runtime
 
 
-def test_strict_traceback_keeps_claude_sdk_untouched(tmp_path: Path) -> None:
-    """严格档 + claude SDK：五项能力齐备，不禁派发工具。"""
-    driver = _runtime_driver(tmp_path, "claude_sdk", _TRACEBACK_CFG)
+def test_strict_traceback_keeps_capable_runtime_untouched(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
+    """严格档 + 声明了 cwd 注入的 runtime：不禁派发工具。"""
+    driver = _runtime_driver(tmp_path, full_capability_runtime, _TRACEBACK_CFG)
     overrides = _spawn_spec(driver)
     assert "disallowed_tools" not in overrides
 

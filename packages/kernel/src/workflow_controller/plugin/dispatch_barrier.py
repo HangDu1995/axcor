@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""派发屏障能力矩阵——各 runtime 的五项屏障能力声明与 fail-closed 门。
+"""派发屏障能力矩阵——各 runtime 的屏障能力声明与 fail-closed 门。
 
 内核 run 平面与编排插件共用本模块：屏障链在受理派发/副作用屏障时按
 声明执行严格模式门（缺子代理 cwd 注入能力即拒绝 writer 子代理、缺
 message 级组仲裁能力即拒绝派发），编排层在出生规格侧按同一声明禁用
-task 工具。声明是代码级核验结论的落档，核验依据见开发日志 S4a 条。
+task 工具。声明是代码级核验结论的落档，与实测不符的条目不声明。
+目前没有真实 runtime 声明子代理 cwd 注入：严格档下 writer 子代理在所有
+已知 runtime 上都被拒绝，只有显式弱化档可派发，且不提供隔离。
 矩阵另声明子代理完成前置钩子：缺它的 runtime 在严格模式下同样不许
 writer 子代理出生，否则子代理的工作区永远不会并回父作用域。
 """
@@ -72,24 +74,33 @@ class RuntimeDispatchCapabilities:
 _NO_CAPABILITIES = frozenset[DispatchCapability]()
 
 # claude SDK（进程内 hook，经 claude_agent_sdk 0.2.184 + 捆绑 CLI 2.1.327
-# 输入面核验）：PreToolUse 回调先于工具执行（①）；Task 输入含 cwd 参数、
-# PreToolUse 可返回 updatedInput 重写工具输入（②）；父会话停在工具调用
-# 上结构性静止（③）；回调载荷带 session/tool_use/prompt 上下文、锚点可
-# 在派发前形成（④）；写文件类工具前置拦截 matcher 可自建（⑤）。
-_SDK_VERIFIED_CAPS = frozenset(
+# 输入面核验，均为代码级结论、未经真实模型验证）：PreToolUse 回调先于
+# 工具执行；父会话停在工具调用上结构性静止；回调载荷带
+# session/tool_use/prompt 上下文、锚点可在派发前形成；写文件类工具前置
+# 拦截 matcher 可自建。
+_SDK_CODE_LEVEL_CAPS = frozenset(
     {
         DispatchCapability.TASK_PRE_INTERCEPT,
-        DispatchCapability.CHILD_CWD_INJECTION,
         DispatchCapability.PARENT_LOCAL_QUIESCE,
         DispatchCapability.PRE_DISPATCH_ANCHOR,
         DispatchCapability.SIDE_EFFECT_ARBITRATION,
     }
 )
-# 子代理完成前置钩子不在上述核验内，对 claude SDK 只是代码级推断、未经
-# 真实运行时验证：捆绑 CLI 在子代理自身回合结束处执行 SubagentStop，宿主
-# 回调返回后回合才结束、结果才交回父代理；回调超时或查询被中断时 CLI
-# 不等答复继续，此时结果先于集成交付。
-_SDK_CAPS = _SDK_VERIFIED_CAPS | frozenset({DispatchCapability.SUBAGENT_RESULT_PRE_HOOK})
+# claude SDK 不声明子代理 cwd 注入（捆绑 CLI 2.1.327，本地脚本化网关驱动
+# 实测，非真实模型）：Agent 工具面向模型的输入面不含 cwd，PreToolUse
+# updatedInput 里的 cwd 被丢弃，子代理运行在父工作区。严格档据此拒绝
+# writer 子代理，出生侧禁 task 工具；显式弱化档可派发，但不提供隔离。
+#
+# 子代理完成前置钩子对 claude SDK 只是代码级推断、未经真实模型验证：
+# 捆绑 CLI 在子代理自身回合结束处执行 SubagentStop，宿主回调返回后回合
+# 才结束、结果才交回父代理。读捆绑 CLI 内嵌代码：正常收尾路径等宿主回调
+# 缺省 600 秒，查询被中断后的收尾只等 5 秒，超时即不等答复继续，此时
+# 结果先于集成交付。
+# 同一捆绑 CLI 的实测事实（本地脚本化网关，非真实模型）：子代理缺省在
+# 后台启动、父会话不阻塞，驱动经 updatedInput 强制同步派发后父会话才
+# 停在工具调用上；同步派发下 CLI 等收尾回调返回后才交付结果，收尾注入
+# 8 秒等待仍被等到。
+_SDK_CAPS = _SDK_CODE_LEVEL_CAPS | frozenset({DispatchCapability.SUBAGENT_RESULT_PRE_HOOK})
 
 DISPATCH_CAPABILITIES_BY_RUNTIME: dict[str, RuntimeDispatchCapabilities] = {
     "claude_sdk": RuntimeDispatchCapabilities("claude_sdk", _SDK_CAPS),

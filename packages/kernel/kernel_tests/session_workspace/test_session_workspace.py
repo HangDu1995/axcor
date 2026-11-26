@@ -311,7 +311,7 @@ async def test_crash_window_between_prepare_and_checkpoint_row(tmp_path):
     assert len(rows) == 1  # 重建后的新 scope_start 行
 
 
-async def test_barrier_builds_group_and_child_workspace(tmp_path):
+async def test_barrier_builds_group_and_child_workspace(tmp_path, full_capability_runtime):
     """派发屏障：组检查点先于子代理、子工作区落 cwd、子会话映射回填。"""
     h = Harness(tmp_path)
     await h.migrate()
@@ -345,7 +345,7 @@ async def test_barrier_builds_group_and_child_workspace(tmp_path):
             "tool_name": "Task",
             "tool_input": {"prompt": "sub"},
         },
-        runtime="claude_sdk",
+        runtime=full_capability_runtime,
     )
 
     from workflow_controller.driver.hooks import BarrierProceed
@@ -371,7 +371,7 @@ async def test_barrier_builds_group_and_child_workspace(tmp_path):
     assert group_row["child_session_map"]
 
 
-async def test_subagent_completion_integrates_into_main_writer(tmp_path):
+async def test_subagent_completion_integrates_into_main_writer(tmp_path, full_capability_runtime):
     """子代理完成：产出并入主写者工作区并随终态同步写回，子工作区释放，terminal 行落账。"""
     h = Harness(tmp_path)
     await h.migrate()
@@ -387,7 +387,7 @@ async def test_subagent_completion_integrates_into_main_writer(tmp_path):
             "tool_name": "Task",
             "tool_input": {"prompt": "sub"},
         },
-        runtime="claude_sdk",
+        runtime=full_capability_runtime,
     )
     child_cwd = Path(outcome.child_cwd)
     await h.host.record_subagent_start(
@@ -431,7 +431,9 @@ async def test_strict_barrier_denies_opencode_writer(tmp_path):
     assert isinstance(outcome, BarrierDeny)
 
 
-async def test_subagent_rollback_restores_group_and_binds_session(tmp_path):
+async def test_subagent_rollback_restores_group_and_binds_session(
+    tmp_path, full_capability_runtime
+):
     """子代理回滚：组检查点恢复 + 恢复会话绑定（宿主为确认方）。"""
     h = Harness(tmp_path)
     await h.migrate()
@@ -460,7 +462,7 @@ async def test_subagent_rollback_restores_group_and_binds_session(tmp_path):
             "tool_name": "Task",
             "tool_input": {"prompt": "sub"},
         },
-        runtime="claude_sdk",
+        runtime=full_capability_runtime,
     )
     # 组建立后的副作用：主写者工作区被改
     (managed / "design" / "base.md").write_text("side effect\n", encoding="utf-8")

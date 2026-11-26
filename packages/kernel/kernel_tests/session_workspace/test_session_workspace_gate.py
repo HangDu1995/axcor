@@ -145,7 +145,9 @@ async def test_driver_shaped_barrier_and_result_hooks_reach_run_port(tmp_path, b
         await orch.shutdown()
 
 
-async def test_driver_shaped_hooks_run_whole_chain_on_session_tree(tmp_path, base_config):
+async def test_driver_shaped_hooks_run_whole_chain_on_session_tree(
+    tmp_path, base_config, full_capability_runtime
+):
     """接入托管工作区的会话：驱动的位置调用走完整条链——派发注入子工作区 cwd、完成并入主写者，不进端口。"""
     orch = Orchestrator(base_config, default_project_dir=tmp_path / "gate.db")
     try:
@@ -165,7 +167,7 @@ async def test_driver_shaped_hooks_run_whole_chain_on_session_tree(tmp_path, bas
             SessionConfig(
                 name="s2",
                 cwd=str(project),
-                runtime="claude_sdk",
+                runtime=full_capability_runtime,
                 traceback=SessionTracebackConfig(),
             )
         )
