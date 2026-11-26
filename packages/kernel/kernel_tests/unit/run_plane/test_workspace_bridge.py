@@ -31,7 +31,13 @@ from workflow_controller.core.checkpoints import CheckpointStore
 from workflow_controller.core.run_coordinator import RunConfig, RunCoordinator
 from workflow_controller.core.runs import RunStore
 from workflow_controller.core.session_run_affiliation import SessionRunAffiliationService
-from workflow_controller.plugin.run_driver import FinishOutcome, FinishRun, RunAction
+from workflow_controller.plugin.run_driver import (
+    ArtifactRead,
+    FinishOutcome,
+    FinishRun,
+    ReadArtifact,
+    RunAction,
+)
 from workflow_controller.plugin.workspace import (
     AbandonScope,
     CommitScopeTerminal,
@@ -161,9 +167,11 @@ class BridgeHarness:
         )
         return run.run_id
 
-    async def start_and_finish(self, timeout_s: float = 60.0) -> str:
+    async def start_and_finish(
+        self, timeout_s: float = 60.0, *, work_dir: Path | None = None
+    ) -> str:
         """启动 run 并等待终态，返回 run_id。"""
-        run_id = await self.start()
+        run_id = await self.start(work_dir=work_dir)
         deadline = asyncio.get_running_loop().time() + timeout_s
         while asyncio.get_running_loop().time() < deadline:
             record = await self.store.get(run_id)
@@ -1123,3 +1131,57 @@ async def test_multi_target_retract_second_target_unregistered_rejected(
     # 零改动：两位目标的集成产出仍在根检出
     assert (work_root / "node-a.md").read_text(encoding="utf-8") == "from-node-a\n"
     assert (work_root / "node-b.md").read_text(encoding="utf-8") == "from-node-b\n"
+
+
+async def test_read_artifact_resolves_node_scope_workspace(tmp_path: Path) -> None:
+    """产物读取按发起方节点的活动作用域解析基准目录；没有活动作用域时回落根检出。"""
+    work_root = tmp_path / "root"
+    work_root.mkdir()
+    (work_root / "probe.txt").write_text("from-root\n", encoding="utf-8")
+
+    def plan(driver: ProbeDriver) -> list[RunAction] | None:
+        prepared = _notes_of(driver, ScopeWorkspacePrepared)
+        reads = _notes_of(driver, ArtifactRead)
+        if not prepared:
+            return [
+                PrepareScopeWorkspace(
+                    config=_tree_config(work_root),
+                    scope_key="node-a",
+                    client_op_id="op-1",
+                    owner_ref="a",
+                    context="node=a",
+                )
+            ]
+        if not reads:
+            # 工作区与根检出同名文件内容不同：读到哪一份即说明基准目录是哪
+            (Path(prepared[0].workspace_path) / "probe.txt").write_text(
+                "from-scope\n", encoding="utf-8"
+            )
+            return [
+                ReadArtifact(path="probe.txt", context="node=a"),
+                ReadArtifact(path="probe.txt", context="node=a/verify"),
+                ReadArtifact(path="probe.txt", context="probe"),
+            ]
+        if not _notes_of(driver, ScopeAbandoned):
+            return [
+                AbandonScope(
+                    scope_id="node-a",
+                    expected_scope_epoch=1,
+                    client_op_id="op-2",
+                    context="node=a",
+                )
+            ]
+        if len(reads) == 3:
+            return [ReadArtifact(path="probe.txt", context="node=a")]  # 作用域已废弃
+        return None
+
+    h = BridgeHarness(tmp_path, plan)
+    await h.start_and_finish(work_dir=work_root)
+
+    assert [(n.context, n.value) for n in _notes_of(h.driver, ArtifactRead)] == [
+        ("node=a", "from-scope"),
+        ("node=a/verify", "from-scope"),
+        ("probe", "from-root"),
+        ("node=a", "from-root"),
+    ]
+    assert not _notes_of(h.driver, WorkspaceActionFailed)

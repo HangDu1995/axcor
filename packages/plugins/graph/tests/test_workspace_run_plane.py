@@ -117,6 +117,59 @@ async def test_subgraph_child_with_colon_id_gets_valid_workspace_branch(
     assert (repo_git / "refs" / "heads" / "scope" / "gen%3As1-w1").is_file()
 
 
+_SUBGRAPH = {
+    "workflow": "sub",
+    "max_parallel": 1,
+    "work_dir": ".",
+    "nodes": [
+        {
+            "id": "s1",
+            "task_type": "bash",
+            "command": "echo sub-done > sub-out.txt",
+            "acceptance": {"enabled": False},
+        }
+    ],
+}
+
+
+@pytest.mark.parametrize("generator_type", ["bash", "agent"])
+async def test_generator_reads_subgraph_from_its_scope_workspace(
+    tmp_path: Path, generator_type: str
+) -> None:
+    """开启隔离的 generator：子图 yaml 写在作用域工作区、尚未集成，generator 从该工作区读出。
+
+    bash 进程型由生成命令落盘；agent 型由成员会话写进自己的工作目录。
+    子图并入后子节点照常隔离执行，整图完成。
+    """
+    env = GraphRunPlaneEnv(tmp_path)
+    subgraph_yaml = yaml.safe_dump(_SUBGRAPH)
+    env.so.on_member_spawn = lambda cfg: (Path(cfg.cwd) / "sub.yaml").write_text(
+        subgraph_yaml, encoding="utf-8"
+    )
+    yaml_path = _write_traceback_workflow(
+        env.tmp,
+        [
+            {
+                "id": "gen",
+                "task_type": "generator",
+                "generator_type": generator_type,
+                "command": f"cat > sub.yaml <<'EOF'\n{subgraph_yaml}EOF",
+                "subgraph": {"output": "sub.yaml"},
+                "acceptance": {"enabled": True, "type": "script", "script": "test -f sub.yaml"},
+            }
+        ],
+    )
+    run_id = await env.start_graph_run(yaml_path=yaml_path)
+
+    run = await await_run_status(env, run_id, {"completed", "failed"})
+
+    assert run.status == "completed", env.node_info(run_id, "gen")["failure_reason"]
+    work_root = env.tmp / "wd"
+    assert (work_root / "sub-out.txt").read_text(encoding="utf-8").strip() == "sub-done"
+    assert env.node_info(run_id, "gen")["status"] == "passed"
+    assert env.node_info(run_id, "gen:s1")["status"] == "passed"
+
+
 async def test_parallel_nodes_isolate_then_integrate_into_root(tmp_path: Path) -> None:
     """双节点并行写不相交路径：隔离期互不可见，依次集成后根检出含双方产出。"""
     env = GraphRunPlaneEnv(tmp_path)

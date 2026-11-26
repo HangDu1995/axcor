@@ -855,6 +855,13 @@ def _subagent_fault_identity(session_id: str, data: Mapping[str, Any]) -> dict[s
     return {"session_id": session_id, "agent_id": str(data.get("agent_id") or "")}
 
 
+def _node_id_of_context(context: str | None) -> str | None:
+    """节点归属上下文（node=<id> 或 node=<id>/<相位>）里的节点 id；不是节点上下文返回 None。"""
+    if not context or not context.startswith("node="):
+        return None
+    return context.removeprefix("node=").partition("/")[0]
+
+
 def _workspace_conflict_payload(conflict: IntegrationConflict) -> dict[str, Any]:
     """集成冲突的 run 键事件 payload：路径、双方身份、双侧提交与共同基准。"""
     return {
@@ -2493,39 +2500,80 @@ class RunCoordinator:
             )
         return BarrierProceed(child_cwd=admission.child_cwd)
 
+    async def _active_scope_of_node(
+        self, tree: WorkspaceTreeRuntime, node_id: str
+    ) -> ScopeRecord | None:
+        """节点的活动作用域；没有返回 None。
+
+        只认活动态：节点重试会废弃旧作用域并换键重建，旧作用域仍以相同属主
+        留账。不应出现多个活动作用域并存（重试恒先废弃旧作用域）；并存时
+        会话跑在最近建区的一个里，取它并留痕。
+        """
+        active = [
+            record
+            for record in await tree.manager.list_scopes()
+            if record.owner_ref == node_id and record.state is ScopeState.ACTIVE
+        ]
+        if len(active) > 1:
+            logger.warning(
+                "节点 %s 有多个活动作用域，取最近建立的 %s：%s",
+                node_id,
+                active[-1].scope_id,
+                [record.scope_id for record in active],
+            )
+        return active[-1] if active else None
+
     async def _barrier_parent_scope(
         self, tree: WorkspaceTreeRuntime, req: DispatchBarrierRequest
     ) -> ScopeRecord:
         """按会话归属上下文解析屏障父作用域（node=<id> 或 node=<id>/<相位>）。
 
         执行与验收会话共用节点作用域：相位后缀只区分成员，不区分作用域。
-        只认活动态：节点重试会废弃旧作用域并换键重建，旧作用域仍以相同
-        属主留账。
+        没有活动作用域时拒绝，拒绝原因带出该节点现有作用域及其状态。
         """
-        context = req.context or ""
-        if not context.startswith("node="):
+        node_id = _node_id_of_context(req.context)
+        if node_id is None:
             raise RuntimeError(f"会话 {req.session_id} 缺少节点上下文，屏障无法定位父作用域")
-        node_id = context.removeprefix("node=").partition("/")[0]
         if not node_id:
             raise RuntimeError(f"会话 {req.session_id} 节点上下文为空，屏障无法定位父作用域")
-        owned = [
-            record for record in await tree.manager.list_scopes() if record.owner_ref == node_id
-        ]
-        active = [record for record in owned if record.state is ScopeState.ACTIVE]
-        if len(active) > 1:
-            # 不应出现（重试恒先废弃旧作用域）；并存时会话跑在最近建区的一个里，取它并留痕
-            logger.warning(
-                "节点 %s 有多个活动作用域，屏障取最近建立的 %s：%s",
-                node_id,
-                active[-1].scope_id,
-                [record.scope_id for record in active],
-            )
-        if active:
-            return active[-1]
+        scope = await self._active_scope_of_node(tree, node_id)
+        if scope is not None:
+            return scope
         owned_states = (
-            "、".join(f"{record.scope_id}={record.state.value}" for record in owned) or "无"
+            "、".join(
+                f"{record.scope_id}={record.state.value}"
+                for record in await tree.manager.list_scopes()
+                if record.owner_ref == node_id
+            )
+            or "无"
         )
         raise RuntimeError(f"屏障父作用域未找到：node={node_id}（现有作用域：{owned_states}）")
+
+    async def _artifact_base_dir(self, rt: RunRuntime, context: str | None) -> str | None:
+        """产物读取的基准目录：发起方节点有活动作用域时是其工作区，否则返回 None（读根检出）。
+
+        未开启工作区隔离、树重建不出、节点没有活动作用域（产物已集成释放）
+        都回落根检出。读取是只读动作，树的问题只留痕、不中断 run。
+        """
+        node_id = _node_id_of_context(context)
+        if not node_id:
+            return None
+        try:
+            tree = await self._ensure_workspace_tree(rt)
+            if tree is None:
+                return None
+            scope = await self._active_scope_of_node(tree, node_id)
+            if scope is None:
+                return None
+            return self._scope_workspace_path(scope)
+        except Exception as e:
+            logger.warning(
+                "节点 %s 的产物读取基准目录解析失败，回落根检出：%s: %s",
+                node_id,
+                type(e).__name__,
+                e,
+            )
+            return None
 
     @staticmethod
     def _barrier_anchor(req: DispatchBarrierRequest, preallocated_scope_id: str) -> DispatchAnchor:
@@ -2716,7 +2764,10 @@ class RunCoordinator:
         elif isinstance(action, CancelTimer):
             self._host.cancel_timer(rt.run_id, action.timer_id)
         elif isinstance(action, ReadArtifact):
-            await self._host.read_artifact(rt.run_id, action.path, action.field, action.context)
+            base_dir = await self._artifact_base_dir(rt, action.context)
+            await self._host.read_artifact(
+                rt.run_id, action.path, action.field, action.context, base_dir=base_dir
+            )
         elif isinstance(action, EmitEvent):
             await self._host.emit_run_event(
                 rt.run_id, action.event_type, action.data or {}, context=action.context

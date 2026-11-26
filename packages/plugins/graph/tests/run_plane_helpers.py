@@ -40,6 +40,7 @@ from workflow_controller.session.events import Event, EventType, SessionOutcome
 from workflow_controller.store.event_store import EventStore
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -136,6 +137,8 @@ class FakeRunSO:
         self.sessions: dict[str, FakeAgentSession] = {}
         self.spawn_calls: list[dict[str, Any]] = []
         self.applied_overrides: list[tuple[str, dict[str, Any]]] = []
+        # 成员出生即落盘的替身动作（入参是成员配置）：模拟 agent 在自己工作目录的写入
+        self.on_member_spawn: Callable[[Any], None] | None = None
         # registry 替身：当前已装载插件实例（reload 时换内容）
         self.plugins: list[Any] = []
         self.config = SimpleNamespace(runtime="opencode", project_dir=str(tmp))
@@ -181,6 +184,8 @@ class FakeRunSO:
         self.spawn_calls.append({"cfg": cfg, "plugin_metadata": plugin_metadata})
         if cfg.run_id:
             await self._affiliation.attach(sid, cfg.run_id, role=cfg.role)
+        if self.on_member_spawn is not None:
+            self.on_member_spawn(cfg)
         # 激活回执：出生即运行时就绪
         await self.bus.emit(
             Event.create(

@@ -252,9 +252,9 @@ class KillProcesses(RunAction):
 
 @dataclass(frozen=True)
 class ReadArtifact(RunAction):
-    """读 run 工作目录下的产物文件，结果以 ArtifactRead 回投。"""
+    """读产物文件，结果以 ArtifactRead 回投；基准目录由发起方 context 决定。"""
 
-    path: str  # 相对 run.work_dir
+    path: str  # 相对发起方节点的作用域工作区；该节点无活动作用域时相对 run.work_dir
     field: str | None = None  # None = 整文件去空白；给定 = JSON 标量字段
     context: str | None = None
 

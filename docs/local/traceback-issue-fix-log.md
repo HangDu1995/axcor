@@ -20,7 +20,7 @@
 | #62 | 已完成 | 本 commit | 屏障父作用域只认活动态，节点重试后执行与验收会话的屏障落在新作用域；无活动作用域时拒绝并带出现有作用域状态 |
 | #63 | 已完成 | 本 commit | 屏障、作用域查询与重放前置校验在树不在内存时先按盘上配置重建，确实没有树才按原样放行或拒绝；重建的账本行带回属主，重启后 agent 会话的派发拿到子工作区、副作用落组检查点 |
 | #64 | 已完成 | 本 commit | 子代理停止钩子先经宿主把子作用域并入父作用域并释放子工作区，再交付结果；冲突、闸门不可静止与等待超窗按故障事件留痕并放行；能力矩阵新增完成前置钩子，时序只到代码级。同时修掉派发屏障回调的位置传参冲突——它是本链在生产接线上的前置缺陷 |
-| #65 | | | |
+| #65 | 已完成 | 本 commit | 产物读取按发起方节点的活动作用域解析基准目录：有活动作用域读其工作区，否则回落根检出；bash 进程型与 agent 型 generator 在隔离下都跑通 |
 | #66 | | | |
 | #67 | | | |
 | #68 | | | |
@@ -313,6 +313,55 @@ run 平面 `packages/plugins/graph/tests/test_workspace_run_plane.py`：
 
 - 评审的 M7（写入闸门只是记账：后台写进程排空钩子与「父阻塞在结果上」标志未接生产）不在 issue 地图里。本链的「父闸门内集成」目前同样只靠父会话停在工具调用上的结构性静止；`background_drain_timeout_s` 只约束钩子的等待窗口，管理器建闸门用的是默认排空窗口。
 - 子代理完成时若 `child_session_map` 未回填，收尾链找不到子作用域、只记告警。回填依赖 SDK 路径的 `task_started` 消息先于子代理结束到达，且 lineage 先看到 Task 调用；这一点同样只到代码级，归 #66 一并验证。
+
+### #65 [traceback] D11 generator 节点在隔离下读不到子图产物
+
+**根因**
+
+`ReadArtifact` 的唯一发射点是 generator 读子图 yaml（引擎 `_dispatch_subgraph_read`，context 形如 `node=<id>`）。协调器派发该动作时把 run、路径、字段与 context 原样转给宿主的 `read_artifact`，宿主一律以 `run.work_dir`（根检出）为基准目录。开启工作区隔离后，generator 的执行成员与 bash 进程的工作目录是它的作用域工作区，相对路径的 `subgraph.output` 写在工作区里；读取发生在终态提交之后、验收与集成之前，文件此时还没进根检出。宿主读不到文件，回投「不存在」，引擎落 `executor_error`（`subgraph 未就绪: subgraph yaml 不存在`），节点按验收失败收口，整图失败。含 generator 的图在隔离下因此跑不通。
+
+context 到工作区的映射只在工作区树的作用域账本里（作用域属主即节点 id），账本归协调器，宿主不知道。隔离测试里此前只有静态挂载的 subgraph 节点：它不出生执行成员、子图文件本来就在根检出，所以没有暴露。
+
+**修复**
+
+按主 agent 指引，落点在协调器派发 `ReadArtifact` 的地方：
+
+- 协调器新增 `_artifact_base_dir`：按动作的 context 取节点 id，经 `_ensure_workspace_tree` 取出或重建工作区树，定位该节点的活动作用域，把其工作区路径作为基准目录传给宿主。解析不到（未开启隔离、树重建不出、节点没有活动作用域）时返回空，宿主照旧读根检出。重建或定位抛错时同样回落并留告警——产物读取是只读动作，不因树的问题中断 run。
+- `RunHost.read_artifact` 增可选参数 `base_dir`；越界检查相对基准目录。
+- 「节点 id → 活动作用域」的定位抽成 `_active_scope_of_node`，屏障父作用域定位与产物读取共用一份；context → 节点 id 的截取抽成模块级 `_node_id_of_context`。屏障侧两条上下文错误信息与「未找到」错误信息原样保留；多活动作用域的告警去掉「屏障」二字（同一方法现在服务两处），语义不变。
+- SDK `ReadArtifact` 的说明与 `path` 注释随新语义更新。
+
+**决策与偏差**
+
+- 只认活动态，与屏障同一判据。generator 读子图时作用域恒为活动态（集成只发生在子图并入之后，读取在并入之前）；产物已集成、作用域已释放时回落根检出，读到的就是集成后的文件。
+- 读取路径会重建树。重启后重排的 generator 若此前已读出子图、只是验收未过，调度时直接重读子图，之前没有任何工作区动作，树不在内存；不重建会读根检出而失败。为它补了一例协调器层用例，是指引之外多出的一例。
+- 解析失败回落而不是抛错。屏障找不到父作用域必须拒绝，否则隔离静默失效；产物读取只读，回落后的结果就是修复前的行为（读不到，节点显式失败并带原因），树的问题随后会在终态提交或集成动作上显式暴露。
+- run 平面以一个参数化用例覆盖 bash 进程型与 agent 型两例。agent 型靠 `FakeRunSO` 新增的成员出生回调把子图 yaml 写进成员的工作目录：假会话此前不写文件，加一个可选回调即可，成本很低。
+- 测试夹具 `BridgeHarness.start_and_finish` 增可选 `work_dir`：盘上树配置与根检出位置都按 run 工作目录推导，读根检出的用例必须带上它。
+- 缺陷修复，代码向既有设计对齐，未改设计文档。
+
+**验证**
+
+run 平面 `packages/plugins/graph/tests/test_workspace_run_plane.py`：`test_generator_reads_subgraph_from_its_scope_workspace`（参数化两例：bash 进程型、agent 型）——开启隔离的 generator 把子图 yaml 写成相对路径，从作用域工作区读出；验收通过后子图节点并入并各自隔离执行，整图完成，根检出含子图节点产出。修复前两例都失败于 `AssertionError: subgraph 未就绪: subgraph yaml 不存在: sub.yaml`（run 落 failed）。
+
+协调器层（真实 git、探针驱动）：
+
+- `packages/kernel/kernel_tests/unit/run_plane/test_workspace_bridge.py::test_read_artifact_resolves_node_scope_workspace`：节点有活动作用域时，`node=<id>` 与 `node=<id>/verify` 都读到工作区里的内容；非节点上下文读根检出；作用域废弃后再读回落根检出。修复前失败于 `('node=a', 'from-root') != ('node=a', 'from-scope')`，与问题单描述一致。
+- `packages/kernel/kernel_tests/unit/run_plane/test_dispatch_barrier_chain.py::test_read_artifact_rebuilds_tree_left_only_on_disk`：树只在盘上时读取先重建树，读到工作区内容。修复前失败于 `(True, 'base') != (True, 'scope edit')`。
+
+宿主层 `packages/kernel/kernel_tests/unit/run_plane/test_run_host_process.py::TestReadArtifact::test_base_dir_bounds_the_read`：给定基准目录时在其内读取，`..` 越界按缺文件判假。修复前失败于 `TypeError: RunHost.read_artifact() got an unexpected keyword argument 'base_dir'`。
+
+既有屏障链用例零改动通过：屏障父作用域定位改走共用方法后，拒绝原因、告警与落账结论不变。
+
+门禁（最终代码上）：`ruff format --check` 421 个文件已格式化、`ruff check` 全过、`lint-imports` 4 条契约保持 0 破坏、`codespell`（全部 git 跟踪的 markdown）无命中；全量 pytest 2842 通过、15 跳过（基线 2837 通过 + 新增 5 例），2 条告警为 breather 插件既有告警；`uv build --package workflow-controller-kernel` 与 `--package workflow-controller-plugin-graph` 的 sdist 与 wheel 构建成功（graph 插件源码未改动，因测试与夹具有改动一并构建核对）。
+
+**顺带发现**
+
+- 确认「agent 型 generator 崩溃在子图已并入、集成回执未到的窗口」那条，在当前代码上以引擎层探针复现（探针跑完即删）：恢复后执行会话已自然结束，按结局重放重走整条执行收口——终态提交、读子图、验收、验收通过并图，`DAG.add_nodes` 抛 `ValueError: duplicate node id: gen:s1`。两点补充：① 重放把活动相位重置为执行中，不看崩溃前已停在待集成相位，所以收口整条重走；② 它的触发前提「恢复后 DAG 已含子图节点」要求子图 yaml 在恢复时能从根检出读回（插件层的子图重建读 `driver.work_dir`）。未开隔离时 yaml 本来就在根检出，直接命中；开了隔离时该窗口里 yaml 只在 generator 的工作区，恢复读不回、子图节点不进 DAG，走不到重复并图。所以它目前只在未开隔离（或 yaml 因别的原因进了根检出）时可达。本次修复不改这条路径。
+- 同形态的第二个读取面（机制以插件层探针复现；暂停态下的可达性走读）：快照恢复时的 `_restore_subgraph_dag` 与重载定义时的 `_reload_subgraph_plans` 直接按 `driver.work_dir`（根检出）读子图 yaml，不经 `ReadArtifact`。隔离下 generator 的子图「已并入、未集成」期间（验收通过到集成回执之间，或集成被拒后的重试期间），yaml 只在它的工作区。
+  - 重启：恢复读不回 yaml，`fail_unrestorable_subgraph` 丢弃已并入的子图状态；启动恢复随后重跑被中断的 generator。run 平面探针（bash 进程型，在该窗口弃置环境后恢复）里它在新工作区重新生成子图（第 2 次尝试）并整图完成——结局正确，代价是多一次重新编排；agent 型按代码走读是重放已结束的执行会话结局后重新并入，未在 run 平面复现。修复前这条读取路径读根检出，重排同样会以「子图不存在」收场（由同一条读取路径推出，未在修复前源码上重放该窗口）；现在能跑通是本次修复的连带效果，未另立用例（与已有两例是同一条读取路径）。
+  - 重载：读不回即硬拒绝（`子图 yaml 缺失或与已合并节点不一致，拒绝重载`）。探针以「子图节点在档、DAG 未含」的档案形态调重载预案：yaml 不在根检出被拒，在根检出通过；暂停恰好落在该状态下的端到端形态未复现。
+  - 修法方向：两处读取先按 generator 档案里的工作区路径（随驱动快照持久化）取文件，回落根检出。
 
 ## 跳过与延期
 

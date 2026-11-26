@@ -381,15 +381,27 @@ class RunHost:
             handle.cancel()
 
     async def read_artifact(
-        self, run_id: str, path: str, field_name: str | None, context: str | None
+        self,
+        run_id: str,
+        path: str,
+        field_name: str | None,
+        context: str | None,
+        base_dir: str | None = None,
     ) -> None:
-        """读 run 工作目录产物；缺文件/缺字段/非标量折叠为判假payload回投。"""
-        run = await self._run_store.get(run_id)
-        base = Path(run.work_dir) if run.work_dir else self._run_root(run_id) / "work"
+        """读产物文件；缺文件/缺字段/非标量折叠为判假payload回投。
+
+        base_dir 是发起方节点的作用域工作区（隔离下未集成的产物在那里）；
+        缺省读 run 工作目录。
+        """
+        if base_dir is None:
+            run = await self._run_store.get(run_id)
+            base = Path(run.work_dir) if run.work_dir else self._run_root(run_id) / "work"
+        else:
+            base = Path(base_dir)
         target = base / path
         payload: dict[str, Any] = {}
         note = ArtifactRead(context=context, path=path, field=field_name)
-        # 绝对路径或 .. 逃逸 work_dir：按缺文件判假，不读工作目录外
+        # 绝对路径或 .. 逃逸基准目录：按缺文件判假，不读工作目录外
         if not target.resolve().is_relative_to(base.resolve()) or not target.is_file():
             self._notifier(run_id, note)
             return

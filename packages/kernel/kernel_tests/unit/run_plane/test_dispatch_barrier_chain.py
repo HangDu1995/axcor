@@ -36,7 +36,7 @@ from workflow_controller.core.workspace import ScopeState
 from workflow_controller.core.workspace.dispatch_groups import ReplayRejectedError
 from workflow_controller.core.workspace.tree_runtime import WorkspaceTreeRuntime
 from workflow_controller.driver.hooks import BarrierDeny, BarrierProceed
-from workflow_controller.plugin.run_driver import EmitEvent, TimerFired
+from workflow_controller.plugin.run_driver import ArtifactRead, EmitEvent, ReadArtifact, TimerFired
 from workflow_controller.plugin.workspace import (
     AbandonScope,
     PrepareScopeWorkspace,
@@ -455,6 +455,41 @@ async def test_list_run_scopes_rebuilds_tree_left_only_on_disk(tmp_path: Path) -
             for s in await h.coord.list_run_scopes(h.run_id)
         }
         assert scopes == {f"{h.run_id}-root": (None, "active"), "node-a": ("a", "active")}
+    finally:
+        await _finish_run(h)
+
+
+async def test_read_artifact_rebuilds_tree_left_only_on_disk(tmp_path: Path) -> None:
+    """树只在盘上：产物读取先按持久化配置重建树，再从节点作用域工作区读出。"""
+    h = await _setup_run(tmp_path)
+    try:
+        node_workspace = next(
+            s["workspace_path"]
+            for s in await h.coord.list_run_scopes(h.run_id)
+            if s["scope_id"] == "node-a"
+        )
+        (Path(node_workspace) / "design" / "base.md").write_text("scope edit\n", encoding="utf-8")
+        hold = h.driver._plan
+
+        def plan(driver: ProbeDriver) -> list[Any] | None:
+            """读回执到达前发一次读取，之后沿用挂起计划。"""
+            if any(isinstance(n, ArtifactRead) for n in driver.notes):
+                return hold(driver)
+            return [ReadArtifact(path="design/base.md", context="node=a")]
+
+        h.driver._plan = plan
+        _drop_workspace_tree(h)
+        h.coord.notify_run(h.run_id, TimerFired(timer_id="poke"))
+        deadline = asyncio.get_running_loop().time() + 30.0
+        while asyncio.get_running_loop().time() < deadline:
+            reads = [n for n in h.driver.notes if isinstance(n, ArtifactRead)]
+            if reads:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("产物读取回执未在限期内到达")
+        assert (reads[0].exists, reads[0].value) == (True, "scope edit")
+        assert h.run_id in h.coord._workspace_trees  # 树已重建
     finally:
         await _finish_run(h)
 

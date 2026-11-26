@@ -684,6 +684,22 @@ class TestReadArtifact:
         (note,) = [n for n in notes if isinstance(n, ArtifactRead)]
         assert note.exists and note.value == "fallback"
 
+    async def test_base_dir_bounds_the_read(self, tmp_path):
+        """给定基准目录：在其内读取，越界按缺文件判假（不回落 run 工作目录）。"""
+        host, notes, store = await self._make_host(tmp_path)
+        work = tmp_path / "wd"
+        work.mkdir()
+        (work / "f.txt").write_text(" in-root ", encoding="utf-8")
+        scope = tmp_path / "scope"
+        scope.mkdir()
+        (scope / "f.txt").write_text(" in-scope ", encoding="utf-8")
+        run = await store.create(
+            "", "", status=RunStatus.RUNNING, kind=RunKind.CONTAINER, work_dir=str(work)
+        )
+        await host.read_artifact(run.run_id, "f.txt", None, None, base_dir=str(scope))
+        await host.read_artifact(run.run_id, "../wd/f.txt", None, None, base_dir=str(scope))
+        assert [(n.exists, n.value) for n in notes] == [(True, "in-scope"), (False, None)]
+
     async def test_driver_roundtrip(self, tmp_path):
         class ReadDriver(ProcDriver):
             def __init__(self) -> None:
