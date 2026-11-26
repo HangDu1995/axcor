@@ -21,6 +21,7 @@ run 平面装配（探针驱动）。能力矩阵门与有界等待收口同在�
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -28,9 +29,14 @@ from typing import Any
 import pytest
 
 from workflow_controller.core.checkpoints import BarrierQuality
+from workflow_controller.core.workspace import ScopeState
 from workflow_controller.driver.hooks import BarrierDeny, BarrierProceed
 from workflow_controller.plugin.run_driver import EmitEvent, TimerFired
-from workflow_controller.plugin.workspace import PrepareScopeWorkspace, WorkspaceTreeConfig
+from workflow_controller.plugin.workspace import (
+    AbandonScope,
+    PrepareScopeWorkspace,
+    WorkspaceTreeConfig,
+)
 
 from .test_workspace_bridge import BridgeHarness, ProbeDriver
 
@@ -61,23 +67,44 @@ class SlowSnapshotDriver(ProbeDriver):
         return {"schema_version": 1, "state": {}, "pending_timers": []}
 
 
-def _prepare_then_hold(h: BridgeHarness, work_root: Path, overrides: dict[str, Any]) -> Any:
-    """「首轮建区 → 回执后按 READY 收口」的完整计划。"""
+def _prepare_then_hold(
+    h: BridgeHarness,
+    work_root: Path,
+    overrides: dict[str, Any],
+    *,
+    scope_keys: tuple[str, ...] = ("node-a",),
+    abandon_previous: bool = True,
+) -> Any:
+    """「逐键建区 → 回执后按 READY 收口」的计划。
+
+    多键且 abandon_previous 时先废弃前一作用域再建下一个，即节点重试路径：
+    旧作用域以已废弃态留账，新作用域换键重建，两者的属主相同。
+    """
     base = _hold_plan(h.run_id)
 
     def plan(driver: ProbeDriver) -> list[Any] | None:
         prepared = [n for n in driver.notes if type(n).__name__ == "ScopeWorkspacePrepared"]
-        if not prepared:
+        if len(prepared) == len(scope_keys):
+            return base(driver)
+        abandoned = [n for n in driver.notes if type(n).__name__ == "ScopeAbandoned"]
+        if prepared and abandon_previous and not abandoned:
             return [
-                PrepareScopeWorkspace(
-                    config=WorkspaceTreeConfig(root_dir=str(work_root), **overrides),
-                    scope_key="node-a",
-                    client_op_id="prepare-1",
-                    owner_ref="a",
+                AbandonScope(
+                    scope_id=prepared[-1].scope_id,
+                    expected_scope_epoch=prepared[-1].scope_epoch,
+                    client_op_id=f"abandon-{len(prepared)}",
                     context="node=a",
                 )
             ]
-        return base(driver)
+        return [
+            PrepareScopeWorkspace(
+                config=WorkspaceTreeConfig(root_dir=str(work_root), **overrides),
+                scope_key=scope_keys[len(prepared)],
+                client_op_id=f"prepare-{len(prepared) + 1}",
+                owner_ref="a",
+                context="node=a",
+            )
+        ]
 
     return plan
 
@@ -108,17 +135,21 @@ async def _setup_run(
     *,
     driver: ProbeDriver | None = None,
     tree_overrides: dict[str, Any] | None = None,
+    scope_keys: tuple[str, ...] = ("node-a",),
+    abandon_previous: bool = True,
 ) -> BridgeHarness:
-    """启动 run、建节点作用域并挂执行会话归属；返回装配。"""
+    """启动 run、按序建节点作用域并挂执行会话归属；返回装配。"""
     work_root = _make_work_root(tmp_path)
     h = BridgeHarness(tmp_path, _hold_plan("boot"), driver=driver)
     h.run_id = await h.start()
     _READY[h.run_id] = False
-    h.driver._plan = _prepare_then_hold(h, work_root, tree_overrides or {})
+    h.driver._plan = _prepare_then_hold(
+        h, work_root, tree_overrides or {}, scope_keys=scope_keys, abandon_previous=abandon_previous
+    )
     deadline = asyncio.get_running_loop().time() + 30.0
     while asyncio.get_running_loop().time() < deadline:
         scopes = await h.coord.list_run_scopes(h.run_id)
-        if any(s["scope_id"] == "node-a" for s in scopes):
+        if any(s["scope_id"] == scope_keys[-1] for s in scopes):
             break
         await asyncio.sleep(0.02)
     else:
@@ -216,6 +247,85 @@ async def test_verifier_session_barrier_lands_on_node_scope(
         assert [
             (r["scope_id"], r["dispatch_anchor"]["parent_native_session_id"]) for r in group_rows
         ] == [("node-a", "ses-native-verify")]
+    finally:
+        await _finish_run(h)
+
+
+@pytest.mark.parametrize(
+    ("role", "context", "abandon_previous"),
+    [
+        ("executor", "node=a", True),
+        ("verifier", "node=a/verify", True),
+        ("executor", "node=a", False),
+    ],
+)
+async def test_barrier_lands_on_latest_active_scope_of_node(
+    tmp_path: Path,
+    role: str,
+    context: str,
+    abandon_previous: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """节点重试后旧作用域已废弃、新作用域活动：执行与验收会话的屏障都落在活动作用域。
+
+    旧作用域未废弃就重建（不应发生）时同样落在最近建立的活动作用域，并告警。
+    """
+    h = await _setup_run(
+        tmp_path, scope_keys=("node-a", "node-a2"), abandon_previous=abandon_previous
+    )
+    try:
+        await h.affiliation.attach("ses-call", h.run_id, role=role, context=context)
+        with caplog.at_level(logging.WARNING, logger="workflow_controller.core.run_coordinator"):
+            side_effect = await h.coord.submit_dispatch_barrier(
+                "ses-call",
+                "side_effect",
+                {"tool_name": "Bash", "tool_use_id": "toolu-r1", "prompt_id": "msg-retry"},
+                runtime="claude_sdk",
+            )
+            dispatch = await h.coord.submit_dispatch_barrier(
+                "ses-call",
+                "dispatch",
+                {"tool_name": "Task", "tool_use_id": "toolu-r2", "prompt_id": "msg-retry"},
+                runtime="claude_sdk",
+            )
+        assert isinstance(side_effect, BarrierProceed)
+        assert isinstance(dispatch, BarrierProceed)
+        assert dispatch.child_cwd
+
+        group_rows = [
+            r
+            for r in await h.coord.list_run_checkpoints(h.run_id)
+            if r["trigger"] == "before_child"
+        ]
+        assert {r["scope_id"] for r in group_rows} == {"node-a2"}
+        child_parents = [
+            s["parent_scope_id"]
+            for s in await h.coord.list_run_scopes(h.run_id)
+            if s["scope_kind"] == "subagent"
+        ]
+        assert child_parents == ["node-a2"]
+        assert ("有多个活动作用域" in caplog.text) is (not abandon_previous)
+    finally:
+        await _finish_run(h)
+
+
+async def test_barrier_denied_when_node_scope_left_active(tmp_path: Path) -> None:
+    """节点作用域停在待集成或冲突态：屏障拒绝，拒绝原因带出作用域及其状态。"""
+    h = await _setup_run(tmp_path)
+    try:
+        await h.affiliation.attach("ses-exec", h.run_id, role="executor", context="node=a")
+        ledger = h.coord._workspace_trees[h.run_id].scope_tree
+        for state in (ScopeState.AWAITING_INTEGRATION, ScopeState.CONFLICTED):
+            await ledger.set_state("node-a", state)
+            outcome = await h.coord.submit_dispatch_barrier(
+                "ses-exec",
+                "side_effect",
+                {"tool_name": "Bash", "tool_use_id": "toolu-1", "prompt_id": "msg-1"},
+                runtime="claude_sdk",
+            )
+            assert isinstance(outcome, BarrierDeny)
+            assert "屏障父作用域未找到" in outcome.reason
+            assert f"node-a={state.value}" in outcome.reason
     finally:
         await _finish_run(h)
 

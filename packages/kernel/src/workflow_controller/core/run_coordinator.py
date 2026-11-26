@@ -80,6 +80,7 @@ from workflow_controller.core.status_maps import (
 )
 from workflow_controller.core.workspace import (
     ScopeKind,
+    ScopeState,
 )
 from workflow_controller.core.workspace.actions import (
     AbandonScope as CoreAbandonScope,
@@ -2411,6 +2412,8 @@ class RunCoordinator:
         """按会话归属上下文解析屏障父作用域（node=<id> 或 node=<id>/<相位>）。
 
         执行与验收会话共用节点作用域：相位后缀只区分成员，不区分作用域。
+        只认活动态：节点重试会废弃旧作用域并换键重建，旧作用域仍以相同
+        属主留账。
         """
         context = req.context or ""
         if not context.startswith("node="):
@@ -2418,10 +2421,24 @@ class RunCoordinator:
         node_id = context.removeprefix("node=").partition("/")[0]
         if not node_id:
             raise RuntimeError(f"会话 {req.session_id} 节点上下文为空，屏障无法定位父作用域")
-        for record in await tree.manager.list_scopes():
-            if record.owner_ref == node_id:
-                return record
-        raise RuntimeError(f"屏障父作用域未找到：node={node_id}")
+        owned = [
+            record for record in await tree.manager.list_scopes() if record.owner_ref == node_id
+        ]
+        active = [record for record in owned if record.state is ScopeState.ACTIVE]
+        if len(active) > 1:
+            # 不应出现（重试恒先废弃旧作用域）；并存时会话跑在最近建区的一个里，取它并留痕
+            logger.warning(
+                "节点 %s 有多个活动作用域，屏障取最近建立的 %s：%s",
+                node_id,
+                active[-1].scope_id,
+                [record.scope_id for record in active],
+            )
+        if active:
+            return active[-1]
+        owned_states = (
+            "、".join(f"{record.scope_id}={record.state.value}" for record in owned) or "无"
+        )
+        raise RuntimeError(f"屏障父作用域未找到：node={node_id}（现有作用域：{owned_states}）")
 
     @staticmethod
     def _barrier_anchor(req: DispatchBarrierRequest, preallocated_scope_id: str) -> DispatchAnchor:
