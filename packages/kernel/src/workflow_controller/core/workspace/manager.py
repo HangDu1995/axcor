@@ -212,7 +212,11 @@ class WorkspaceManager:
                 expected_old_head=base,
                 scope_epoch=parent.scope_epoch,
                 root_epoch=parent.root_epoch,
-                metadata={"scope_id": request.scope_key, "parent_scope_id": parent.scope_id},
+                metadata={
+                    "scope_id": request.scope_key,
+                    "parent_scope_id": parent.scope_id,
+                    "owner_ref": request.spec.owner_ref,
+                },
             )
             workspace = await self._create_workspace_guarded(
                 scope_id=request.scope_key,

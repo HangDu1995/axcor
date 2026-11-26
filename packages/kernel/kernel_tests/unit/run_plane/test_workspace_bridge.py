@@ -149,9 +149,16 @@ class BridgeHarness:
         self.program = tmp_path / "prog.txt"
         self.program.write_text("probe", encoding="utf-8")
 
-    async def start(self) -> str:
-        """启动 run（不等待终态，供运行中查询与 op 通道用例）。"""
-        run = await self.coord.start_run(RunConfig(format="probe@1"), self.program)
+    async def start(self, *, work_dir: Path | None = None) -> str:
+        """启动 run（不等待终态，供运行中查询与 op 通道用例）。
+
+        work_dir 即工作区树的根目录：盘上树配置按它推导位置，须与建区
+        动作携带的树配置一致。
+        """
+        run = await self.coord.start_run(
+            RunConfig(format="probe@1", work_dir=str(work_dir) if work_dir is not None else None),
+            self.program,
+        )
         return run.run_id
 
     async def start_and_finish(self, timeout_s: float = 60.0) -> str:

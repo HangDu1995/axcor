@@ -17,16 +17,16 @@
 重开或崩溃后工作区树运行时（内存账本）缺席——本模块基于检查点账
 （scope_checkpoints 行）与私有仓 refs 重建作用域账本：两层代次按行
 取最新、状态按「工作区在盘 / 分支进过集成线 / 其余已废弃」推断、
-claims 从行内声明列重建。随后对操作日志做三态核对：意图未生效可放
-弃、已写只补账（集成线回退的引用推进幂等重做）、对不上账显式失败
-（分叉即停，绝不自动回退）。做不到全量恢复的边角在报告中显式降级，
-不静默。
+claims 从行内声明列重建、属主从操作日志的建区意图回填。随后对操作
+日志做三态核对：意图未生效可放弃、已写只补账（集成线回退的引用推进
+幂等重做）、对不上账显式失败（分叉即停，绝不自动回退）。做不到全量
+恢复的边角在报告中显式降级，不静默。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from workflow_controller.core.workspace.oplog import (
     OperationPhase,
@@ -46,7 +46,7 @@ from workflow_controller.core.workspace.scope_tree import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
     from pathlib import Path
 
     from workflow_controller.core.checkpoints import CheckpointStore, ScopeCheckpoint
@@ -64,6 +64,8 @@ __all__ = [
 
 # 集成线回退在操作日志中的操作种类词面（与 manager 记账一致）
 _RETRACT_OP_KIND = "retract_integration_line"
+# 建区在操作日志中的操作种类词面（属主随建区意图持久化）
+_PREPARE_OP_KIND = "prepare_scope_workspace"
 
 
 class WorkspaceRecoveryError(RuntimeError):
@@ -110,6 +112,7 @@ async def rebuild_workspace_tree(
     integrated_scopes = {
         scope_id for scope_id, _commit in await integration.line_integration_order(head)
     }
+    operations = oplog.all_operations()
     records = await _rebuild_records(
         rows,
         root_scope_id=root_scope_id,
@@ -117,10 +120,11 @@ async def rebuild_workspace_tree(
         seed=seed,
         repository=repository,
         integrated_scopes=integrated_scopes,
+        owners=_creating_owners(operations),
         root_checkout_dir=root_checkout_dir,
         main_writer_workspace_dir=main_writer_workspace_dir,
     )
-    root_epoch = _infer_root_epoch(records, oplog.all_operations())
+    root_epoch = _infer_root_epoch(records, operations)
     records[0] = replace(records[0], root_epoch=root_epoch)
     await scope_tree.load_records(records)
     report.rebuilt_scope_ids = [record.scope_id for record in records]
@@ -154,10 +158,11 @@ async def _rebuild_records(
     seed: str,
     repository: WorkspaceRepository,
     integrated_scopes: set[str],
+    owners: Mapping[str, str | None],
     root_checkout_dir: Path | None = None,
     main_writer_workspace_dir: Path | None = None,
 ) -> list[ScopeRecord]:
-    """由检查点行推断作用域行：根在前、子按行序，状态按事实定档。"""
+    """由检查点行推断作用域行：根在前、子按行序，状态按事实定档、属主取建区意图。"""
     root = ScopeRecord(
         scope_id=root_scope_id,
         parent_scope_id=None,
@@ -213,7 +218,7 @@ async def _rebuild_records(
                 scope_id=scope_id,
                 parent_scope_id=latest.parent_scope_id,
                 scope_kind=ScopeKind(latest.scope_kind),
-                owner_ref=None,
+                owner_ref=owners.get(scope_id),
                 workspace_ref=workspace_ref,
                 scope_base_commit=latest.workspace_commit,
                 integration_base_commit=_scope_start_base(rows, scope_id),
@@ -225,6 +230,21 @@ async def _rebuild_records(
             )
         )
     return records
+
+
+def _creating_owners(operations: Sequence[SagaOperation]) -> dict[str, str | None]:
+    """作用域 → 建区时登记的属主。
+
+    账本的属主只在作用域建立时写入、此后不变（同键重建不覆盖），所以取
+    该作用域第一条未被放弃的建区操作。
+    """
+    owners: dict[str, str | None] = {}
+    for operation in operations:
+        if operation.op_kind != _PREPARE_OP_KIND or operation.phase is OperationPhase.ABANDONED:
+            continue
+        owner = cast("str | None", operation.metadata.get("owner_ref"))
+        owners.setdefault(str(operation.metadata.get("scope_id")), owner)
+    return owners
 
 
 def _scope_start_base(rows: Sequence[ScopeCheckpoint], scope_id: str) -> str | None:

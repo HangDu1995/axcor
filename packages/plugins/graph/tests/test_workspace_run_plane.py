@@ -27,6 +27,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from workflow_controller.driver.hooks import BarrierProceed
+
 from .run_plane_helpers import GraphRunPlaneEnv, await_run_status
 
 
@@ -275,7 +277,7 @@ async def test_cold_recovery_reused_member_session_integrates_into_root(tmp_path
     await rebooted.recover()
     resumed = rebooted.so.sessions[sid]
     await _wait_until(lambda: resumed.state.value == "running", 30.0, "恢复后成员会话未被续跑")
-    assert await rebooted.coord.list_run_scopes(run_id) == []  # 工作区树不在内存
+    assert run_id not in rebooted.coord._workspace_trees  # 工作区树不在内存
 
     rebooted.so.release_all()
     await _wait_until(
@@ -304,3 +306,59 @@ async def test_cold_recovery_reused_member_session_integrates_into_root(tmp_path
             )
         }
     assert triggers == {"scope_start", "terminal"}
+
+
+async def test_cold_recovery_dispatch_barrier_rebuilds_workspace_tree(tmp_path: Path) -> None:
+    """进程重启后工作区树不在内存：成员会话的屏障重建树后执行，不静默直通。
+
+    节点沿用原作用域续跑；task 派发拿到子工作区 cwd，副作用落组检查点，
+    作用域查询带回节点属主（属主随建区意图持久化、恢复时回填）。
+    """
+    env = GraphRunPlaneEnv(tmp_path, auto_release=False)
+    yaml_path = _write_traceback_workflow(
+        env.tmp,
+        [{"id": "a", "task_type": "agent", "acceptance": {"enabled": False}}],
+    )
+    run_id = await env.start_graph_run(yaml_path=yaml_path)
+    await _wait_until(
+        lambda: env.node_info(run_id, "a")["workflow_controller_session_id"],
+        30.0,
+        "崩溃前节点 a 的成员未出生",
+    )
+    crashed = env.node_info(run_id, "a")
+    sid = crashed["workflow_controller_session_id"]
+
+    # 模拟 kill -9：弃置环境（无 stop 收尾）；重启后成员从持久层恢复为可续跑的暂停态
+    rebooted = GraphRunPlaneEnv(tmp_path)
+    rebooted.so.restore_paused_session(sid)
+    await rebooted.recover()
+    resumed = rebooted.so.sessions[sid]
+    await _wait_until(lambda: resumed.state.value == "running", 30.0, "恢复后成员会话未被续跑")
+    assert run_id not in rebooted.coord._workspace_trees  # 工作区树不在内存
+
+    dispatch = await rebooted.coord.submit_dispatch_barrier(
+        sid,
+        "dispatch",
+        {"tool_name": "Task", "tool_use_id": "toolu-1", "prompt_id": "msg-1"},
+        runtime="claude_sdk",
+    )
+    assert isinstance(dispatch, BarrierProceed)
+    assert dispatch.child_cwd and Path(dispatch.child_cwd).is_dir()
+    side_effect = await rebooted.coord.submit_dispatch_barrier(
+        sid,
+        "side_effect",
+        {"tool_name": "Bash", "tool_use_id": "toolu-2", "prompt_id": "msg-2"},
+        runtime="claude_sdk",
+    )
+    assert isinstance(side_effect, BarrierProceed)
+
+    scope_a = crashed["workspace_scope_id"]
+    group_rows = [
+        (row["scope_id"], row["dispatch_anchor"]["tool_use_id"])
+        for row in await rebooted.coord.list_run_checkpoints(run_id)
+        if row["trigger"] == "before_child"
+    ]
+    assert group_rows == [(scope_a, "toolu-1"), (scope_a, "toolu-2")]
+    scopes = {s["scope_id"]: s for s in await rebooted.coord.list_run_scopes(run_id)}
+    assert (scopes[scope_a]["owner_ref"], scopes[scope_a]["state"]) == ("a", "active")
+    await rebooted.coord.stop_run(run_id)

@@ -30,6 +30,8 @@ import pytest
 
 from workflow_controller.core.checkpoints import BarrierQuality
 from workflow_controller.core.workspace import ScopeState
+from workflow_controller.core.workspace.dispatch_groups import ReplayRejectedError
+from workflow_controller.core.workspace.tree_runtime import WorkspaceTreeRuntime
 from workflow_controller.driver.hooks import BarrierDeny, BarrierProceed
 from workflow_controller.plugin.run_driver import EmitEvent, TimerFired
 from workflow_controller.plugin.workspace import (
@@ -141,7 +143,7 @@ async def _setup_run(
     """启动 run、按序建节点作用域并挂执行会话归属；返回装配。"""
     work_root = _make_work_root(tmp_path)
     h = BridgeHarness(tmp_path, _hold_plan("boot"), driver=driver)
-    h.run_id = await h.start()
+    h.run_id = await h.start(work_dir=work_root)
     _READY[h.run_id] = False
     h.driver._plan = _prepare_then_hold(
         h, work_root, tree_overrides or {}, scope_keys=scope_keys, abandon_previous=abandon_previous
@@ -400,6 +402,150 @@ async def test_barrier_wait_window_closes_with_fault(tmp_path: Path) -> None:
         assert "超窗" in outcome.reason
     finally:
         await _finish_run(h)
+
+
+def _drop_workspace_tree(h: BridgeHarness) -> None:
+    """让内存里的工作区树运行时离场（模拟重启或重开后树只在盘上）。"""
+    tree = h.coord._workspace_trees.pop(h.run_id)
+    tree.checkpoints.close()
+
+
+async def test_barrier_rebuilds_tree_left_only_on_disk(tmp_path: Path) -> None:
+    """树只在盘上：屏障先按持久化配置重建树再执行，不静默直通。"""
+    h = await _setup_run(tmp_path)
+    try:
+        _drop_workspace_tree(h)
+        dispatch = await h.coord.submit_dispatch_barrier(
+            "ses-exec",
+            "dispatch",
+            {"tool_name": "Task", "tool_use_id": "toolu-1", "prompt_id": "msg-1"},
+            runtime="claude_sdk",
+        )
+        assert isinstance(dispatch, BarrierProceed)
+        assert dispatch.child_cwd
+        assert Path(dispatch.child_cwd).is_dir()
+        side_effect = await h.coord.submit_dispatch_barrier(
+            "ses-exec",
+            "side_effect",
+            {"tool_name": "Bash", "tool_use_id": "toolu-2", "prompt_id": "msg-2"},
+            runtime="claude_sdk",
+        )
+        assert isinstance(side_effect, BarrierProceed)
+        assert side_effect.child_cwd is None
+        group_rows = [
+            (row["scope_id"], row["dispatch_anchor"]["tool_use_id"])
+            for row in await h.coord.list_run_checkpoints(h.run_id)
+            if row["trigger"] == "before_child"
+        ]
+        assert group_rows == [("node-a", "toolu-1"), ("node-a", "toolu-2")]
+    finally:
+        await _finish_run(h)
+
+
+async def test_list_run_scopes_rebuilds_tree_left_only_on_disk(tmp_path: Path) -> None:
+    """树只在盘上而 run 仍在运行：作用域查询重建树，账面行带回属主。"""
+    h = await _setup_run(tmp_path)
+    try:
+        _drop_workspace_tree(h)
+        scopes = {
+            s["scope_id"]: (s["owner_ref"], s["state"])
+            for s in await h.coord.list_run_scopes(h.run_id)
+        }
+        assert scopes == {f"{h.run_id}-root": (None, "active"), "node-a": ("a", "active")}
+    finally:
+        await _finish_run(h)
+
+
+async def test_replay_validation_rebuilds_tree_left_only_on_disk(tmp_path: Path) -> None:
+    """树只在盘上：重放前置校验先重建树，结论与树在内存时一致。"""
+    h = await _setup_run(tmp_path)
+    try:
+        # 节点作用域上每个消息的首个副作用各建一个组：一个单 task，一个 task 加 Bash
+        for kind, tool_name, tool_use_id, message in (
+            ("dispatch", "Task", "toolu-task-1", "msg-single"),
+            ("side_effect", "Bash", "toolu-bash", "msg-multi"),
+            ("dispatch", "Task", "toolu-task-2", "msg-multi"),
+        ):
+            await h.coord.submit_dispatch_barrier(
+                "ses-exec",
+                kind,
+                {"tool_name": tool_name, "tool_use_id": tool_use_id, "prompt_id": message},
+                runtime="claude_sdk",
+            )
+        group_rows = {
+            row["dispatch_anchor"]["tool_use_id"]: row["checkpoint_id"]
+            for row in await h.coord.list_run_checkpoints(h.run_id)
+            if row["trigger"] == "before_child"
+        }
+        single_task_group = group_rows["toolu-task-1"]  # 首个派发即建组行
+        multi_effect_group = group_rows["toolu-bash"]  # Bash 建组，task 入组
+
+        async def assert_conclusions() -> None:
+            """单 task 组通过，多副作用组拒绝。"""
+            await h.coord.validate_dispatch_replay(h.run_id, single_task_group)
+            with pytest.raises(ReplayRejectedError, match="仅允许单 task"):
+                await h.coord.validate_dispatch_replay(h.run_id, multi_effect_group)
+
+        await assert_conclusions()  # 树在内存
+        _drop_workspace_tree(h)
+        await assert_conclusions()  # 树只在盘上：重建后结论不变
+    finally:
+        await _finish_run(h)
+    with pytest.raises(ReplayRejectedError, match="无工作区树运行时"):  # run 已无运行时
+        await h.coord.validate_dispatch_replay(h.run_id, single_task_group)
+
+
+async def test_query_and_barrier_rebuild_tree_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """查询面与屏障并发到场只重建一次树：后到者等同一棵树，不各建一棵。"""
+    h = await _setup_run(tmp_path)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    builds: list[WorkspaceTreeRuntime] = []
+    original_initialize = WorkspaceTreeRuntime.initialize
+
+    async def gated_initialize(self: WorkspaceTreeRuntime) -> None:
+        builds.append(self)
+        entered.set()
+        await release.wait()
+        await original_initialize(self)
+
+    monkeypatch.setattr(WorkspaceTreeRuntime, "initialize", gated_initialize)
+    try:
+        _drop_workspace_tree(h)
+        query = asyncio.create_task(h.coord.list_run_scopes(h.run_id))
+        await asyncio.wait_for(entered.wait(), 30)
+        barrier = asyncio.create_task(
+            h.coord.submit_dispatch_barrier(
+                "ses-exec",
+                "dispatch",
+                {"tool_name": "Task", "tool_use_id": "toolu-1", "prompt_id": "msg-1"},
+                runtime="claude_sdk",
+            )
+        )
+        await asyncio.sleep(0.5)  # 留出 run 任务取到屏障请求的时间
+        release.set()
+        assert isinstance((await barrier).child_cwd, str)
+        assert [s["scope_id"] for s in await query] == [f"{h.run_id}-root", "node-a"]
+        assert len(builds) == 1
+    finally:
+        release.set()
+        await _finish_run(h)
+
+
+async def test_barrier_denied_when_persisted_tree_has_no_runtime(tmp_path: Path) -> None:
+    """盘上有树而 run 已无运行时：屏障拒绝，不因树不在内存而直通。"""
+    h = await _setup_run(tmp_path)
+    await _finish_run(h)  # 运行时与内存树随之退出，树配置留在盘上
+    outcome = await h.coord.submit_dispatch_barrier(
+        "ses-exec",
+        "dispatch",
+        {"tool_name": "Task", "tool_use_id": "toolu-1", "prompt_id": "msg-1"},
+        runtime="claude_sdk",
+    )
+    assert isinstance(outcome, BarrierDeny)
+    assert "无可用驱动运行时" in outcome.reason
 
 
 async def test_run_without_tree_passes_through(tmp_path: Path) -> None:

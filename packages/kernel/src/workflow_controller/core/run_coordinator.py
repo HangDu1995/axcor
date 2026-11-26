@@ -411,6 +411,8 @@ class RunRuntime:
     terminal_accepted: bool = False  # 终态裁决权已归控制侧：其后驱动 FinishRun 不落账
     poisoned: bool = False  # 驱动实例中毒弃用（超时/异常后不再调用）
     checkpoint_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # 工作区树建树互斥：run 任务的建区/屏障与查询面并发到场只建一次
+    workspace_tree_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     amt_injected: bool = False  # AllSessionsTerminal 已注入（防重复；新派发复位）
     rounds: int = 0  # decide 轮次（超时/异常报错点名用）
     await_tasks: set[asyncio.Task[None]] = field(default_factory=set)  # 在途 session 等待任务
@@ -1274,9 +1276,13 @@ class RunCoordinator:
         return [self._run_session_info(row, rt) for row in rows]
 
     async def list_run_scopes(self, run_id: str) -> list[dict[str, Any]]:
-        """run 的作用域账面查询（工作区树运行时在位时；不在位为空）。"""
+        """run 的作用域账面查询：树不在内存时按盘上配置重建。
+
+        重建需要 run 仍在运行（有驱动运行时）；未开启工作区隔离、或 run 已
+        无运行时（终态）时返回空。
+        """
         await self._run_store.get(run_id)
-        tree = self._workspace_trees.get(run_id)
+        tree = await self._ensure_workspace_tree_if_running(run_id)
         if tree is None:
             return []
         return [
@@ -1526,24 +1532,31 @@ class RunCoordinator:
         """派发屏障入口：会话宿主发起，经 FIFO 在 run 任务内执行核心动作。
 
         有界等待：窗口与后台排空同界，超窗按 fault.scope_quiesce_failed
-        语义收口为拒绝，不让 hook 挂死。非 traceback 工作区 run（无树）
-        直接放行——不注入 cwd、不建组，与既有路径零差异。
+        语义收口为拒绝，不让 hook 挂死。盘上没有树配置的 run（未开启工作
+        区隔离）直接放行——不注入 cwd、不建组，与既有路径零差异；树只在
+        盘上的 run（重启或重开之后）照常入队，由 run 任务重建树后执行。
         """
         affiliation = self._affiliation.resolve(session_id)
         if affiliation is None:
             return BarrierProceed()
-        tree = self._workspace_trees.get(affiliation.run_id)
-        if tree is None:
-            return BarrierProceed()
-        rt = self._runtimes.get(affiliation.run_id)
+        run_id = affiliation.run_id
+        tree = self._workspace_trees.get(run_id)
+        if tree is not None:
+            wait_timeout_s = tree.barrier_wait_timeout_s
+        else:
+            config = await self._persisted_tree_config(run_id)
+            if config is None:
+                return BarrierProceed()
+            wait_timeout_s = config.background_drain_timeout_s
+        rt = self._runtimes.get(run_id)
         if rt is None or rt.poisoned:
             return BarrierDeny(
-                reason=f"run {affiliation.run_id} 无可用驱动运行时，屏障无法受理",
+                reason=f"run {run_id} 无可用驱动运行时，屏障无法受理",
                 fault=None,
             )
         reply: asyncio.Future[BarrierOutcome] = asyncio.get_running_loop().create_future()
         self._notify(
-            affiliation.run_id,
+            run_id,
             DispatchBarrierRequest(
                 kind=kind,
                 session_id=session_id,
@@ -1555,11 +1568,11 @@ class RunCoordinator:
             ),
         )
         try:
-            return await asyncio.wait_for(reply, timeout=tree.barrier_wait_timeout_s)
+            return await asyncio.wait_for(reply, timeout=wait_timeout_s)
         except TimeoutError:
             return BarrierDeny(
                 reason=(
-                    f"派发屏障等待超窗（>{tree.barrier_wait_timeout_s}s），"
+                    f"派发屏障等待超窗（>{wait_timeout_s}s），"
                     f"按 {fault_event_type(SCOPE_QUIESCE_FAILED_RULE)} 收口，本次副作用不执行"
                 ),
                 fault=fault_event_type(SCOPE_QUIESCE_FAILED_RULE),
@@ -1587,8 +1600,12 @@ class RunCoordinator:
             logger.warning("子会话映射回填失败（不阻塞子代理运行）：checkpoint=%s", checkpoint_id)
 
     async def validate_dispatch_replay(self, run_id: str, checkpoint_id: str) -> None:
-        """replay_dispatch 前置校验：目标组须单 task 且无其他副作用。"""
-        tree = self._workspace_trees.get(run_id)
+        """replay_dispatch 前置校验：目标组须单 task 且无其他副作用。
+
+        树不在内存而 run 仍有运行时则先重建再校验。本方法只做受理前的
+        只读校验，回滚动作本身仍经驱动 op 在 run 任务内执行。
+        """
+        tree = await self._ensure_workspace_tree_if_running(run_id)
         if tree is None:
             raise ReplayRejectedError(
                 f"run {run_id} 无工作区树运行时，无法校验重放组：{checkpoint_id}"
@@ -2363,9 +2380,10 @@ class RunCoordinator:
         """执行屏障核心动作链：能力门 → 编排状态先持久化 → 组仲裁 → 回 cwd/放行。
 
         屏障内一切 I/O 由本方法（宿主侧）执行，hook 不直写核心；编排状态
-        版本先于文件提交（与生命周期检查点同一持久化顺序）。
+        版本先于文件提交（与生命周期检查点同一持久化顺序）。树不在内存
+        时先按盘上配置重建（重启或重开后的首个屏障）；没有树的 run 放行。
         """
-        tree = self._workspace_trees.get(rt.run_id)
+        tree = await self._ensure_workspace_tree(rt)
         if tree is None:
             return BarrierProceed()
         caps = dispatch_capabilities_for(req.runtime)
@@ -2627,27 +2645,52 @@ class RunCoordinator:
     ) -> WorkspaceTreeRuntime | None:
         """取本 run 的工作区树；缺席时按持久化配置（或建区携带的配置）重建。
 
-        建区动作携带完整配置，可全新初始化；其余动作（废弃/恢复/回退）
-        不携带配置，只能依据仓树目录里持久化的配置经深度恢复重建——
-        两者都不可得时返回 None（按无树失败回执）。
+        建区动作携带完整配置，可全新初始化；屏障、废弃、恢复、回退与查询
+        面不携带配置，只能依据仓树目录里持久化的配置经深度恢复重建——
+        两者都不可得时返回 None（该 run 未开启工作区隔离）。建树按运行时
+        互斥：树配置先于私有仓根引用落盘，建树窗口里并发到场的重建者若
+        不等待会读到半成品仓；等待者随后直接取到已登记的树，只建一次。
         """
-        tree = self._workspace_trees.get(rt.run_id)
+        async with rt.workspace_tree_lock:
+            tree = self._workspace_trees.get(rt.run_id)
+            if tree is not None:
+                return tree
+            if config is None:
+                config = await self._persisted_tree_config(rt.run_id)
+                if config is None:
+                    return None
+            tree = WorkspaceTreeRuntime(
+                config,
+                rt.run_id,
+                CheckpointStore(self._run_store.db_path),
+                drain_background_writers=self._workspace_drain_hook,
+            )
+            await tree.initialize()
+            if self._runtimes.get(rt.run_id) is not rt:
+                # 建树期间运行时已被替换或退出（查询面触发时可能）：树无人清理，不登记
+                tree.checkpoints.close()
+                return None
+            self._workspace_trees[rt.run_id] = tree
+            return tree
+
+    async def _persisted_tree_config(self, run_id: str) -> WorkspaceTreeConfig | None:
+        """读回 run 盘上持久化的树配置；未开启工作区隔离的 run 返回 None。"""
+        run = await self._run_store.get(run_id)
+        return load_tree_config(run.work_dir, run_id)
+
+    async def _ensure_workspace_tree_if_running(self, run_id: str) -> WorkspaceTreeRuntime | None:
+        """run 任务之外的取树入口（作用域查询与重放前置校验）。
+
+        树不在内存而 run 仍有驱动运行时则重建；run 已无运行时或盘上没有
+        树配置时返回 None，由调用方按各自语义收口。
+        """
+        tree = self._workspace_trees.get(run_id)
         if tree is not None:
             return tree
-        if config is None:
-            run = await self._run_store.get(rt.run_id)
-            config = load_tree_config(run.work_dir, rt.run_id)
-            if config is None:
-                return None
-        tree = WorkspaceTreeRuntime(
-            config,
-            rt.run_id,
-            CheckpointStore(self._run_store.db_path),
-            drain_background_writers=self._workspace_drain_hook,
-        )
-        await tree.initialize()
-        self._workspace_trees[rt.run_id] = tree
-        return tree
+        rt = self._runtimes.get(run_id)
+        if rt is None:
+            return None
+        return await self._ensure_workspace_tree(rt)
 
     async def _execute_workspace_prepare(
         self, rt: RunRuntime, action: PrepareScopeWorkspace

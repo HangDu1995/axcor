@@ -370,7 +370,7 @@ class RunAPI:
     # ── 回滚查询与异步请求面 ────────────────────────────────────
 
     async def list_run_scopes(self, run_id: str) -> list[dict[str, Any]]:
-        """run 的作用域查询（工作区树运行时在位时；不在位为空列表）。"""
+        """run 的作用域查询（树不在内存时按盘上配置重建；未开启隔离或 run 已无运行时为空列表）。"""
         try:
             return await self._coord.list_run_scopes(run_id)
         except RunNotFoundError as e:
