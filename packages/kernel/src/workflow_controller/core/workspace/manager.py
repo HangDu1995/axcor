@@ -463,13 +463,17 @@ class WorkspaceManager:
     ) -> IntegrationLineRetracted:
         """已合并回滚的集成线多目标回退：先校验后 reset，保留者按原集成序重放。
 
-        回退点取各目标建区基线在首父链上的最早者；逐目标过全部校验条件
-        （在册、根直接写者、已集成/已释放、提交在当前线上、是当前集成头
-        的严格祖先、区间不含自建路径变更、根检出干净），任一不满足即拒绝
-        ——根头、根工作树、根代次与账本零变化。失效集 = 目标集 ∪ 基线谱
-        系含任一目标集成提交的写者（含基于失效基线的活动写者）；重放链先
-        在对象库内构造、记新头后再推进引用与根检出，代次递增与失效作用域
-        废弃随后落账、操作日志收口。
+        回退点取线上有集成提交的各目标建区基线在首父链上的最早者——通过
+        但未改动文件的目标线上无成果可撤，不参与回退点；目标集全部如此时
+        线与根检出不动、root epoch 不推进。逐目标过全部校验条件（在册、
+        根直接写者、已集成/已释放、提交在当前线上、是当前集成头的严格祖
+        先、区间不含自建路径变更、根检出干净；空集成目标免线位置与区间
+        校验），任一不满足即拒绝——根头、根工作树、根代次与账本零变化。
+        失效集 = 目标集 ∪ 基线谱系含任一目标集成提交的写者（含基于失效基
+        线的活动写者）；保留者中最晚一条集成提交晚于回退点的按原集成序重
+        放（preserved 只列被重放者，空集成与回退点之前的保留者不在内）；
+        重放链先在对象库内构造、记新头后再推进引用与根检出，根代次只随
+        线动、失效作用域废弃随后落账、操作日志落定。
         """
         root_id = self._tree.root_scope_id
         if root_id is None:
@@ -491,14 +495,28 @@ class WorkspaceManager:
         current_head = await self._repository.resolve_ref(ROOT_INTEGRATION_REF)
         if current_head is None:
             raise WorkspaceManagerError("集成线引用缺失，无法回退")
+        # 线事实一次解析共享：集成序（含各作用域的集成提交）与首父链
+        order_pairs = await self._coordinator.line_integration_order(current_head)
+        line_chain = await self._coordinator.first_parent_commits(current_head)
+        line_integrated_scopes = {scope_id for scope_id, _commit in order_pairs}
+        if not await self._coordinator.root_status_clean(
+            self._manifest.git_line_commit_exclude_specs()
+        ):
+            raise WorkspaceManagerError("根检出存在未提交变化，先经集成落账再回退")
         for target in targets:
-            await self._validate_retract_target(target, current_head)
-        retract_commit = await self._coordinator.earliest_line_commit(
-            current_head, [target.base_commit for target in targets]
-        )
-        if retract_commit is None:
-            raise WorkspaceManagerError("撤回目标不在当前集成线上，无法定回退点")
-        plan = await self._plan_retraction(scope_ids, current_head)
+            await self._validate_retract_target(
+                target, current_head, line_chain, line_integrated_scopes
+            )
+        retract_bases = [
+            target.base_commit for target in targets if target.scope_id in line_integrated_scopes
+        ]
+        retract_commit = current_head
+        if retract_bases:
+            earliest = await self._coordinator.earliest_line_commit(current_head, retract_bases)
+            if earliest is None:
+                raise WorkspaceManagerError("撤回目标不在当前集成线上，无法定回退点")
+            retract_commit = earliest
+        plan = await self._plan_retraction(scope_ids, order_pairs, retract_commit)
         root = await self._require_scope(root_id)
         async with self._quiesced(root_id):
             # 闸门内复核：头与根代次仍与校验时一致，否则按分叉拒绝
@@ -526,9 +544,14 @@ class WorkspaceManager:
             )
             await self._oplog.record_new_head(client_op_id, new_head)
             await self._coordinator.advance_root_checkout(new_head)
-            new_root_epoch = await self._tree.advance_root_epoch(
-                expected_root_epoch=expected_root_epoch
-            )
+            # 根代次只随线动：线未动（目标集全为空集成）时不推进，
+            # 在途写者基线仍属当前代次、集成不被旧代次拒绝
+            if new_head != current_head:
+                new_root_epoch = await self._tree.advance_root_epoch(
+                    expected_root_epoch=expected_root_epoch
+                )
+            else:
+                new_root_epoch = expected_root_epoch
             abandoned: list[tuple[str, int]] = []
             for record in plan.invalidated:
                 for item in await self._abandon_scope_physically(record):
@@ -583,11 +606,18 @@ class WorkspaceManager:
             preserved=tuple(str(i) for i in payload.get("preserved", ())),
         )
 
-    async def _validate_retract_target(self, target: RetractTarget, current_head: str) -> None:
+    async def _validate_retract_target(
+        self,
+        target: RetractTarget,
+        current_head: str,
+        line_chain: set[str],
+        line_integrated_scopes: set[str],
+    ) -> None:
         """单个撤回目标校验：在册、属当前集成线、是当前头祖先、区间无自建变更。
 
         全部为只读判定——任一不满足时本次回退零改动（校验先于闸门与
-        一切落账）。
+        一切落账）。通过但未改动文件的目标在集成线上没有集成提交，免
+        线位置与区间校验（其建区基线不作为回退点）。
         """
         target_scope_id = target.scope_id
         target_commit = target.base_commit
@@ -600,7 +630,10 @@ class WorkspaceManager:
             )
         if not await self._coordinator.commit_exists(target_commit):
             raise WorkspaceManagerError(f"回退目标提交不存在于私有仓：{target_commit}")
-        line_chain = await self._coordinator.first_parent_commits(current_head)
+        if target_scope_id not in line_integrated_scopes:
+            # 线上无集成提交按空集成处理，须以分支事实核对（防解析错位）
+            await self._verify_empty_integration(record)
+            return
         if target_commit not in line_chain:
             raise WorkspaceManagerError(f"回退目标不属于当前集成线：{target_commit}")
         if target_commit == current_head or not await self._coordinator.is_ancestor(
@@ -616,34 +649,36 @@ class WorkspaceManager:
             raise WorkspaceManagerError(
                 f"回退区间含自建路径变更，拒绝回退：{sorted(dirty_paths)[:5]}"
             )
-        if not await self._coordinator.root_status_clean(
-            self._manifest.git_line_commit_exclude_specs()
-        ):
-            raise WorkspaceManagerError("根检出存在未提交变化，先经集成落账再回退")
 
     async def _plan_retraction(
-        self, target_scope_ids: Sequence[str], current_head: str
+        self,
+        target_scope_ids: Sequence[str],
+        order_pairs: Sequence[tuple[str, str]],
+        retract_commit: str,
     ) -> _RetractionPlan:
         """失效集计算（谱系判据）与保留者重放序解析。
 
         谱系基准是各撤回目标的集成提交（其成果进入集成线的那个提交，自
         线历史解析，同目标多次集成取最早），不是回退点——回退点只定线
         回退到哪。已集成写者的建区基线祖先链含任一目标集成提交即失效重
-        跑，不含则保留并按原集成序重放；基于失效基线的活动写者一并废弃。
+        跑；不含则保留，重放判据取其最晚一条集成提交（同目标多次集成、
+        回退点居中时最早一条不代表线上现状）——最晚集成提交严格晚于回
+        退点的按原集成序重放，其余（回退点之前的集成、线上无集成提交的
+        空集成）原样保留不重放；基于失效基线的活动写者一并废弃。
         """
         root_id = self._tree.root_scope_id or ""
         target_set = set(target_scope_ids)
         invalidated: list[ScopeRecord] = []
         preserved: list[ReplayStep] = []
-        order_pairs = await self._coordinator.line_integration_order(current_head)
         order = {scope_id: index for index, (scope_id, _commit) in enumerate(order_pairs)}
+        integration_commits: dict[str, str] = {}
+        for scope_id, commit in order_pairs:
+            # 集成序按时间正序，持续覆盖即取最晚一条（重放判据用）
+            integration_commits[scope_id] = commit
         pivots: dict[str, str] = {}
         for scope_id, commit in order_pairs:
             if scope_id in target_set and scope_id not in pivots:
                 pivots[scope_id] = commit
-        missing = sorted(target_set - pivots.keys())
-        if missing:
-            raise WorkspaceManagerError(f"回退目标在当前集成线上没有集成提交：{missing[0]}")
         for record in await self._tree.list_all_scopes():
             if record.parent_scope_id != root_id or record.scope_id in target_set:
                 continue
@@ -655,7 +690,14 @@ class WorkspaceManager:
                 if consumed:
                     invalidated.append(record)
                 else:
-                    preserved.append(await self._replay_step(record, order))
+                    # 保留者只需重放被回退撤下的集成：最晚集成提交不晚于
+                    # 回退点的（历史原样在线）不重放；线上无集成提交的空
+                    # 集成保留者原样保留
+                    integration = integration_commits.get(record.scope_id)
+                    if integration is None:
+                        await self._verify_empty_integration(record)
+                    elif not await self._coordinator.is_ancestor(integration, retract_commit):
+                        preserved.append(await self._replay_step(record))
             elif record.state in (ScopeState.ACTIVE, ScopeState.AWAITING_INTEGRATION) and consumed:
                 invalidated.append(record)
         target_records = [await self._require_scope(scope_id) for scope_id in target_scope_ids]
@@ -672,10 +714,30 @@ class WorkspaceManager:
                 return True
         return False
 
-    async def _replay_step(self, record: ScopeRecord, order: dict[str, int]) -> ReplayStep:
-        """把一个保留写者解析为重放步：分支头存在且在当前线上有集成序。"""
-        if record.scope_id not in order:
-            raise WorkspaceManagerError(f"保留写者在当前集成线上找不到集成序：{record.scope_id}")
+    async def _verify_empty_integration(self, record: ScopeRecord) -> None:
+        """核对线上无集成提交的作用域确为空集成。
+
+        集成序解析依赖提交信息前缀；分支对建区基线仍带集成路径变更而
+        线上无集成提交时说明解析错位，显式拒绝而非静默按空集成跳过。
+        """
+        if not record.workspace_ref or not record.integration_base_commit:
+            raise WorkspaceManagerError(f"作用域缺少工作区或基线引用：{record.scope_id}")
+        _path, branch = self._parse_workspace_ref(record.workspace_ref)
+        head = await self._repository.resolve_ref(f"refs/heads/{branch}") if branch else None
+        if head is None:
+            raise WorkspaceManagerError(f"作用域分支缺失，无法核对空集成：{record.scope_id}")
+        changed = await self._coordinator.changed_paths(
+            record.integration_base_commit,
+            head,
+            self._manifest.git_diff_restriction_specs(),
+        )
+        if changed:
+            raise WorkspaceManagerError(
+                f"线上无集成提交但作用域分支带集成路径变更：{record.scope_id}"
+            )
+
+    async def _replay_step(self, record: ScopeRecord) -> ReplayStep:
+        """把一个保留写者解析为重放步：分支头存在且在册可解析。"""
         if not record.workspace_ref:
             raise WorkspaceManagerError(f"保留写者缺少工作区引用：{record.scope_id}")
         _path, branch = self._parse_workspace_ref(record.workspace_ref)
@@ -790,11 +852,14 @@ class WorkspaceManager:
         """
         if operation.op_kind != "retract_integration_line":
             raise WorkspaceManagerError(f"非集成线回退操作：{operation.client_op_id}")
-        try:
-            await self._tree.advance_root_epoch(expected_root_epoch=operation.root_epoch)
-        except ScopeTreeError as exc:
-            if exc.current_root_epoch != operation.root_epoch + 1:
-                raise
+        # 线未动（已记新头即旧头）的回退不推进根代次
+        line_moved = operation.actual_new_head != operation.expected_old_head
+        if line_moved:
+            try:
+                await self._tree.advance_root_epoch(expected_root_epoch=operation.root_epoch)
+            except ScopeTreeError as exc:
+                if exc.current_root_epoch != operation.root_epoch + 1:
+                    raise
         abandoned: list[tuple[str, int]] = []
         for scope_id in operation.metadata.get("invalidated", ()):
             record = await self._tree.get_scope(str(scope_id))
@@ -812,7 +877,7 @@ class WorkspaceManager:
             operation.client_op_id,
             result={
                 "new_root_head": operation.actual_new_head,
-                "new_root_epoch": operation.root_epoch + 1,
+                "new_root_epoch": operation.root_epoch + 1 if line_moved else operation.root_epoch,
                 "target_commit": operation.metadata.get("target_commit"),
                 "invalidated": abandoned,
                 "preserved": list(operation.metadata.get("preserved", ())),
