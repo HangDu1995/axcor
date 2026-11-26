@@ -443,6 +443,42 @@ class TestCheckpointRoundtrip:
             "agent-m2": "native-child-2",
         }
 
+    async def test_find_child_scope_walks_parent_chain_within_tree(
+        self, store: CheckpointStore
+    ) -> None:
+        """按子会话原生标识反查：沿父子链走到嵌套层的派发行，他树与空标识不命中。"""
+        await store.record(
+            _checkpoint(
+                checkpoint_id="cp-node",
+                trigger=CheckpointTrigger.BEFORE_CHILD,
+                parent_scope_id="run-1-root",
+            )
+        )
+        await store.record(
+            _checkpoint(
+                checkpoint_id="cp-child",
+                scope_id="node-a-c1",
+                parent_scope_id="node-a",
+                trigger=CheckpointTrigger.BEFORE_CHILD,
+            )
+        )
+        await store.record(
+            _checkpoint(
+                checkpoint_id="cp-other",
+                scope_id="node-x",
+                parent_scope_id="run-2-root",
+                trigger=CheckpointTrigger.BEFORE_CHILD,
+            )
+        )
+        await store.attach_child_session("cp-node", "node-a-c1", "native-child")
+        await store.attach_child_session("cp-child", "node-a-c1-c1", "native-grandchild")
+        await store.attach_child_session("cp-other", "node-x-c1", "native-elsewhere")
+
+        assert await store.find_child_scope("run-1-root", "native-child") == "node-a-c1"
+        assert await store.find_child_scope("run-1-root", "native-grandchild") == "node-a-c1-c1"
+        assert await store.find_child_scope("run-1-root", "native-elsewhere") is None
+        assert await store.find_child_scope("run-1-root", "") is None
+
     async def test_attach_rejected_outside_group_checkpoint(self, store: CheckpointStore) -> None:
         await store.record(_checkpoint())
         with pytest.raises(ValueError, match="派发屏障"):

@@ -24,7 +24,11 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
-from workflow_controller.driver.claude_sdk import ClaudeSDKDriver, _sdk_pre_tool_cb
+from workflow_controller.driver.claude_sdk import (
+    ClaudeSDKDriver,
+    _sdk_pre_tool_cb,
+    _sdk_subagent_stop_cb,
+)
 from workflow_controller.driver.hooks import (
     BarrierDeny,
     BarrierProceed,
@@ -35,20 +39,44 @@ from workflow_controller.driver.hooks import (
 from workflow_controller.driver.opencode import build_restricted_agent_config
 from workflow_controller.plugin.dispatch_barrier import (
     DispatchCapability,
+    RuntimeDispatchCapabilities,
     dispatch_capabilities_for,
     group_arbitration_block_reason,
     writer_dispatch_block_reason,
 )
 
-_ALL = frozenset(DispatchCapability)
+# claude SDK 经代码级核验的五项屏障能力
+_FIVE_VERIFIED = frozenset(
+    {
+        DispatchCapability.TASK_PRE_INTERCEPT,
+        DispatchCapability.CHILD_CWD_INJECTION,
+        DispatchCapability.PARENT_LOCAL_QUIESCE,
+        DispatchCapability.PRE_DISPATCH_ANCHOR,
+        DispatchCapability.SIDE_EFFECT_ARBITRATION,
+    }
+)
 
 
 def test_claude_sdk_declares_all_five_capabilities() -> None:
     """claude SDK：进程内 hook 路径五项能力全备（核验结论落档）。"""
     caps = dispatch_capabilities_for("claude_sdk")
-    assert caps.capabilities == _ALL
+    assert caps.capabilities >= _FIVE_VERIFIED
     assert writer_dispatch_block_reason(caps, strict=True) is None
     assert group_arbitration_block_reason(caps, strict=True) is None
+
+
+def test_claude_sdk_declares_subagent_completion_hook() -> None:
+    """claude SDK 声明子代理完成前置钩子（时序为代码级推断，未在真实 runtime 验证）。"""
+    caps = dispatch_capabilities_for("claude_sdk")
+    assert caps.supports(DispatchCapability.SUBAGENT_RESULT_PRE_HOOK)
+
+
+def test_runtime_missing_completion_hook_denies_writer_in_strict_mode() -> None:
+    """有 cwd 注入但缺完成前置钩子：严格档仍拒绝 writer 子代理，弱化档放行。"""
+    caps = RuntimeDispatchCapabilities("fake", frozenset({DispatchCapability.CHILD_CWD_INJECTION}))
+    reason = writer_dispatch_block_reason(caps, strict=True)
+    assert reason is not None and "完成前置钩子" in reason
+    assert writer_dispatch_block_reason(caps, strict=False) is None
 
 
 def test_opencode_declares_no_capabilities_and_strict_denies() -> None:
@@ -246,7 +274,7 @@ async def test_sdk_pre_tool_without_barriers_keeps_legacy_shape() -> None:
 
 
 def test_sdk_hook_matchers_follow_barrier_wiring() -> None:
-    """matcher 装配：派发屏障接 Task 面，副作用屏障独立可接。"""
+    """matcher 装配：派发屏障接 Task 面，副作用屏障独立可接，子代理停止钩子随回调接线。"""
     driver = ClaudeSDKDriver()
     with_dispatch = driver._build_sdk_hooks(_hooks(dispatch=lambda sid, data: _ok(None)))
     matchers = [m.matcher for m in with_dispatch["PreToolUse"]]
@@ -259,6 +287,44 @@ def test_sdk_hook_matchers_follow_barrier_wiring() -> None:
     legacy_matchers = [m.matcher for m in legacy["PreToolUse"]]
     assert "AskUserQuestion" in legacy_matchers
     assert not any("Task" in matcher for matcher in legacy_matchers)
+
+    async def noop(sid: str, data: dict[str, Any]) -> None:
+        return None
+
+    result_only = driver._build_sdk_hooks(
+        DriverHooks(session_id="ses-1", before_subagent_result=noop)
+    )
+    assert "SubagentStop" in result_only
+    assert "SubagentStop" not in driver._build_sdk_hooks(DriverHooks(session_id="ses-1"))
+
+
+async def test_sdk_subagent_stop_awaits_result_hook_before_tracker() -> None:
+    """子代理停止钩子：先等结果交付前的回调，再通知在途跟踪；回调异常不外抛。"""
+    calls: list[str] = []
+
+    async def before_result(sid: str, data: dict[str, Any]) -> None:
+        calls.append(f"before:{data['agent_id']}")
+
+    async def on_stop(sid: str, data: dict[str, Any]) -> None:
+        calls.append(f"stop:{data['agent_id']}")
+
+    hooks = DriverHooks(
+        session_id="ses-1", before_subagent_result=before_result, on_subagent_stop=on_stop
+    )
+    result = await _sdk_subagent_stop_cb(
+        {"agent_id": "agent-1", "agent_type": "general-purpose"}, None, None, hooks=hooks
+    )
+    assert result == {}
+    assert calls == ["before:agent-1", "stop:agent-1"]
+
+    async def failing(sid: str, data: dict[str, Any]) -> None:
+        raise RuntimeError("并入父作用域失败")
+
+    hooks = DriverHooks(
+        session_id="ses-1", before_subagent_result=failing, on_subagent_stop=on_stop
+    )
+    assert await _sdk_subagent_stop_cb({"agent_id": "agent-2"}, None, None, hooks=hooks) == {}
+    assert calls[-1] == "stop:agent-2"
 
 
 def _ok(cwd: str | None) -> BarrierProceed:

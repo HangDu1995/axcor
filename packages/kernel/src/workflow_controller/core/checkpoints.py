@@ -166,6 +166,26 @@ def _row_to_checkpoint(row: sqlite3.Row) -> ScopeCheckpoint:
     )
 
 
+def _tree_scope_ids(conn: sqlite3.Connection, root_scope_id: str) -> set[str]:
+    """自根按父子链展开树内全部有检查点行的作用域标识（含根）。"""
+    known = {root_scope_id}
+    frontier = [root_scope_id]
+    while frontier:
+        placeholders = ",".join("?" for _ in frontier)
+        children = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT DISTINCT scope_id FROM scope_checkpoints"
+                f" WHERE parent_scope_id IN ({placeholders})",
+                frontier,
+            ).fetchall()
+            if str(row[0]) not in known
+        ]
+        known.update(children)
+        frontier = children
+    return known
+
+
 class CheckpointStore:
     """作用域检查点账本的读写面（建表归 run 记录库统一迁移）。"""
 
@@ -221,6 +241,14 @@ class CheckpointStore:
     async def delete_for_tree(self, root_scope_id: str) -> int:
         """删一棵作用域树的全部检查点行（树回收/残留清理用），返回删除行数。"""
         return await asyncio.to_thread(self._delete_for_tree_locked, root_scope_id)
+
+    async def find_child_scope(
+        self, root_scope_id: str, native_child_session_id: str
+    ) -> str | None:
+        """在一棵树内按子会话原生标识反查子代理作用域；未回填映射返回 None。"""
+        return await asyncio.to_thread(
+            self._find_child_scope_locked, root_scope_id, native_child_session_id
+        )
 
     # ── 同步面（锁内）──
 
@@ -338,31 +366,38 @@ class CheckpointStore:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                known = {root_scope_id}
-                frontier = [root_scope_id]
-                while frontier:
-                    placeholders = ",".join("?" for _ in frontier)
-                    children = [
-                        str(row[0])
-                        for row in conn.execute(
-                            "SELECT DISTINCT scope_id FROM scope_checkpoints"
-                            f" WHERE parent_scope_id IN ({placeholders})",
-                            frontier,
-                        ).fetchall()
-                        if str(row[0]) not in known
-                    ]
-                    known.update(children)
-                    frontier = children
-                placeholders = ",".join("?" for _ in known)
+                scope_ids = sorted(_tree_scope_ids(conn, root_scope_id))
+                placeholders = ",".join("?" for _ in scope_ids)
                 cursor = conn.execute(
                     f"DELETE FROM scope_checkpoints WHERE scope_id IN ({placeholders})",
-                    sorted(known),
+                    scope_ids,
                 )
                 conn.execute("COMMIT")
                 return cursor.rowcount
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
+
+    def _find_child_scope_locked(
+        self, root_scope_id: str, native_child_session_id: str
+    ) -> str | None:
+        """同步面：取树内各作用域的子会话映射，按原生标识反查作用域标识。"""
+        if not native_child_session_id:
+            return None
+        with self._lock, self._connect() as conn:
+            scope_ids = sorted(_tree_scope_ids(conn, root_scope_id))
+            placeholders = ",".join("?" for _ in scope_ids)
+            rows = conn.execute(
+                "SELECT child_session_map FROM scope_checkpoints"
+                f" WHERE scope_id IN ({placeholders}) AND child_session_map IS NOT NULL",
+                scope_ids,
+            ).fetchall()
+        for row in rows:
+            mapping: dict[str, str] = json.loads(row["child_session_map"])
+            for scope_id, native_id in mapping.items():
+                if native_id == native_child_session_id:
+                    return str(scope_id)
+        return None
 
     def _connect(self) -> sqlite3.Connection:
         """懒开复用连接；首次访问核对检查点表已在库（本模块不建表）。"""

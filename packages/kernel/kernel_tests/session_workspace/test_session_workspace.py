@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 
 from workflow_controller.config.settings import SessionTracebackConfig
+from workflow_controller.core.checkpoints import CheckpointStore
 from workflow_controller.core.runs import RunStore
 from workflow_controller.core.session_workspace import (
     SessionWorkspaceHost,
@@ -368,6 +369,47 @@ async def test_barrier_builds_group_and_child_workspace(tmp_path):
         if r["trigger"] == "before_child" and (r["dispatch_anchor"] or {}).get("dispatch_group_id")
     )
     assert group_row["child_session_map"]
+
+
+async def test_subagent_completion_integrates_into_main_writer(tmp_path):
+    """子代理完成：产出并入主写者工作区并随终态同步写回，子工作区释放，terminal 行落账。"""
+    h = Harness(tmp_path)
+    await h.migrate()
+    session = h.add_session("sess-1")
+    await h.host.prepare_session(session)
+    outcome = await h.host.submit_dispatch_barrier(
+        "sess-1",
+        "dispatch",
+        {
+            "prompt_id": "p1",
+            "tool_use_id": "tool-1",
+            "native_session_id": "native-1",
+            "tool_name": "Task",
+            "tool_input": {"prompt": "sub"},
+        },
+        runtime="claude_sdk",
+    )
+    child_cwd = Path(outcome.child_cwd)
+    await h.host.record_subagent_start(
+        "sess-1", {"parent_tool_use_id": "tool-1", "agent_id": "child-native-1"}
+    )
+    (child_cwd / "design" / "from-child.md").write_text("child\n", encoding="utf-8")
+
+    await h.host.settle_subagent("sess-1", {"agent_id": "child-native-1"})
+
+    assert (h.managed_dir("sess-1") / "design" / "from-child.md").read_text(
+        encoding="utf-8"
+    ) == "child\n"
+    assert not child_cwd.exists()
+    checkpoints = CheckpointStore(h.db_path)
+    rows = await checkpoints.list_for_scope("sess-1-main-c1")
+    checkpoints.close()
+    assert [row.trigger.value for row in rows] == ["terminal"]
+    assert rows[0].orchestration_state_ref == "session-ledger:sess-1"
+    # 产出已在主写者分支上：终态同步把它写回原目录
+    report = await h.host.finalize_session("sess-1")
+    assert not report.refused
+    assert (h.original / "design" / "from-child.md").read_text(encoding="utf-8") == "child\n"
 
 
 async def test_strict_barrier_denies_opencode_writer(tmp_path):

@@ -470,6 +470,20 @@ class DispatchBarrierRequest(RunNotification):
     workspace: str = "writer"
 
 
+@dataclass(frozen=True)
+class SubagentResultRequest(RunNotification):
+    """子代理结果交付前的收尾请求：会话宿主发起，run 任务内执行后经 Future 回传。
+
+    data 为驱动层规整后的子代理停止 payload（agent_id）；reply 为
+    asyncio.Future，收尾链结束即回填——没有决策面，钩子只等它完成。
+    """
+
+    session_id: str
+    context: str | None = None
+    data: Mapping[str, Any] = field(default_factory=dict)
+    reply: Any = None
+
+
 # ── 协议 ──────────────────────────────────────────────────────────
 
 

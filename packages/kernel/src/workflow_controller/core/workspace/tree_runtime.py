@@ -17,7 +17,8 @@
 树运行时把私有仓、账本、闸门、操作日志、集成协调器、管理器、检查点
 账本与组仲裁装配为一件可执行单元；首个工作区动作惰性建立，重开或崩
 溃后的既有仓经深度恢复重建账本（对不上账显式失败）。本模块自 run
-协调器抽出，供会话宿主侧等价装配（树 id 与根作用域标识不同）。
+协调器抽出，供会话宿主侧等价装配（树 id 与根作用域标识不同），并
+承载两平面共用的生命周期检查点落账与子代理结果收尾链。
 """
 
 from __future__ import annotations
@@ -25,9 +26,21 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from workflow_controller.core.checkpoints import (
+    BarrierQuality,
+    CheckpointTrigger,
+    ScopeCheckpoint,
+)
+from workflow_controller.core.workspace.actions import (
+    AbandonScope,
+    IntegrateScope,
+    ScopeIntegrated,
+    ScopeIntegrationRejected,
+)
 from workflow_controller.core.workspace.dispatch_groups import (
     DispatchGroupArbiter,
     DispatchReplayLedger,
@@ -36,7 +49,7 @@ from workflow_controller.core.workspace.integration import (
     ConflictPolicy,
     IntegrationCoordinator,
 )
-from workflow_controller.core.workspace.manager import WorkspaceManager
+from workflow_controller.core.workspace.manager import WorkspaceManager, WorkspaceManagerError
 from workflow_controller.core.workspace.manifest import (
     DEFAULT_WRITER_LOCAL_PATHSPECS,
     WorkspaceManifest,
@@ -47,7 +60,12 @@ from workflow_controller.core.workspace.recovery import (
     rebuild_workspace_tree,
 )
 from workflow_controller.core.workspace.repository import WorkspaceRepository
-from workflow_controller.core.workspace.scope_tree import ScopeTree
+from workflow_controller.core.workspace.scope_tree import (
+    ScopeKind,
+    ScopeRecord,
+    ScopeState,
+    ScopeTree,
+)
 from workflow_controller.plugin.dispatch_barrier import COMPAT_LATE_BARRIER
 from workflow_controller.plugin.workspace import RebuildScriptDecl, WorkspaceTreeConfig
 
@@ -267,6 +285,99 @@ class WorkspaceTreeRuntime:
         self._child_seq += 1
         scope_key = f"{parent_scope_id}-c{self._child_seq}"
         return scope_key, f"dispatch-{self._child_seq}"
+
+    async def record_lifecycle_checkpoint(
+        self,
+        *,
+        scope: ScopeRecord,
+        trigger: CheckpointTrigger,
+        workspace_commit: str,
+        integration_commit: str | None,
+        orchestration_state_ref: str,
+        claims: tuple[str, ...] = (),
+    ) -> str:
+        """落一行生命周期检查点（文件提交与编排引用都已先在），返回检查点标识。"""
+        checkpoint_id = f"{scope.scope_id}:{trigger.value}:e{scope.scope_epoch}"
+        # 分支取自工作区引用；根检出与 reader 快照没有分支段
+        workspace_branch = (
+            scope.workspace_ref.rpartition("|")[2] or None if scope.workspace_ref else None
+        )
+        await self.checkpoints.record(
+            ScopeCheckpoint(
+                checkpoint_id=checkpoint_id,
+                scope_id=scope.scope_id,
+                scope_kind=scope.scope_kind,
+                parent_scope_id=scope.parent_scope_id,
+                scope_epoch=scope.scope_epoch,
+                root_epoch=scope.root_epoch,
+                trigger=trigger,
+                barrier_quality=BarrierQuality.PRECISE,
+                workspace_commit=workspace_commit,
+                workspace_branch=workspace_branch,
+                integration_commit=integration_commit,
+                claims=claims,
+                orchestration_state_ref=orchestration_state_ref,
+                created_at=datetime.now(tz=UTC).isoformat(),
+            )
+        )
+        return checkpoint_id
+
+    async def child_scope_for_session(self, native_child_session_id: str) -> str | None:
+        """按子会话原生标识反查树内的子代理作用域；映射未回填返回 None。"""
+        return await self.checkpoints.find_child_scope(self.root_scope_id, native_child_session_id)
+
+    async def settle_subagent_scope(
+        self, scope_id: str, *, orchestration_state_ref: str
+    ) -> ScopeIntegrated | ScopeIntegrationRejected | None:
+        """子代理结果交付前的收尾：终态提交 → terminal 检查点行 → 并入父作用域 → 默认释放。
+
+        编排状态版本由调用方先落（引用随参数给出），其后才是闸门内的
+        文件提交与检查点行，与节点终态提交同一持久化顺序。reader 快照
+        永不集成，只释放工作区。作用域已不在账本或已离开活动态时不做动作，
+        重复回执按幂等跳过；冲突与闸门不可静止原样上抛给调用方按故障留痕。
+        """
+        record = await self.manager.get_scope(scope_id)
+        if record is None or record.state is not ScopeState.ACTIVE:
+            return None
+        if record.scope_kind is not ScopeKind.SUBAGENT:
+            raise WorkspaceManagerError(f"只有子代理作用域可按结果收尾：{scope_id}")
+        parent_id = record.parent_scope_id or ""
+        parent = await self.manager.get_scope(parent_id)
+        if parent is None or parent.state is not ScopeState.ACTIVE:
+            raise WorkspaceManagerError(f"父作用域非活动态，子代理结果不并入：{parent_id}")
+        if self.manager.is_reader_scope(scope_id):
+            await self.manager.abandon_scope(
+                AbandonScope(
+                    scope_id=scope_id,
+                    expected_scope_epoch=record.scope_epoch,
+                    client_op_id=f"subagent-{scope_id}-release",
+                )
+            )
+            return None
+        commit, _branch = await self.manager.commit_scope_terminal(scope_id)
+        scope = await self.manager.get_scope(scope_id)
+        assert scope is not None
+        await self.record_lifecycle_checkpoint(
+            scope=scope,
+            trigger=CheckpointTrigger.TERMINAL,
+            workspace_commit=commit,
+            integration_commit=scope.integration_base_commit,
+            orchestration_state_ref=orchestration_state_ref,
+        )
+        outcome = await self.manager.integrate_scope(
+            IntegrateScope(
+                scope_id=scope_id,
+                receipt=None,
+                client_op_id=f"subagent-{scope_id}-integrate-e{scope.scope_epoch}",
+            )
+        )
+        if isinstance(outcome, ScopeIntegrated) and not self.retain_after_merge:
+            try:
+                await self.manager.release_scope(scope_id)
+            except Exception:
+                # 与节点集成同一语义：释放失败只告警，不回滚已完成的集成
+                logger.warning("作用域 %s 集成后释放失败，工作区暂时保留", scope_id, exc_info=True)
+        return outcome
 
     @property
     def strict_barrier(self) -> bool:

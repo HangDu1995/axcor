@@ -18,6 +18,8 @@
 声明执行严格模式门（缺子代理 cwd 注入能力即拒绝 writer 子代理、缺
 message 级组仲裁能力即拒绝派发），编排层在出生规格侧按同一声明禁用
 task 工具。声明是代码级核验结论的落档，核验依据见开发日志 S4a 条。
+矩阵另声明子代理完成前置钩子：缺它的 runtime 在严格模式下同样不许
+writer 子代理出生，否则子代理的工作区永远不会并回父作用域。
 """
 
 from __future__ import annotations
@@ -51,6 +53,8 @@ class DispatchCapability(StrEnum):
     PARENT_LOCAL_QUIESCE = "parent_local_quiesce"
     PRE_DISPATCH_ANCHOR = "pre_dispatch_anchor"
     SIDE_EFFECT_ARBITRATION = "side_effect_arbitration"
+    # 子代理完成前置钩子：结果交付前可把子作用域并回父作用域
+    SUBAGENT_RESULT_PRE_HOOK = "subagent_result_pre_hook"
 
 
 @dataclass(frozen=True)
@@ -72,7 +76,20 @@ _NO_CAPABILITIES = frozenset[DispatchCapability]()
 # PreToolUse 可返回 updatedInput 重写工具输入（②）；父会话停在工具调用
 # 上结构性静止（③）；回调载荷带 session/tool_use/prompt 上下文、锚点可
 # 在派发前形成（④）；写文件类工具前置拦截 matcher 可自建（⑤）。
-_SDK_CAPS = frozenset(DispatchCapability)
+_SDK_VERIFIED_CAPS = frozenset(
+    {
+        DispatchCapability.TASK_PRE_INTERCEPT,
+        DispatchCapability.CHILD_CWD_INJECTION,
+        DispatchCapability.PARENT_LOCAL_QUIESCE,
+        DispatchCapability.PRE_DISPATCH_ANCHOR,
+        DispatchCapability.SIDE_EFFECT_ARBITRATION,
+    }
+)
+# 子代理完成前置钩子不在上述核验内，对 claude SDK 只是代码级推断、未经
+# 真实运行时验证：捆绑 CLI 在子代理自身回合结束处执行 SubagentStop，宿主
+# 回调返回后回合才结束、结果才交回父代理；回调超时或查询被中断时 CLI
+# 不等答复继续，此时结果先于集成交付。
+_SDK_CAPS = _SDK_VERIFIED_CAPS | frozenset({DispatchCapability.SUBAGENT_RESULT_PRE_HOOK})
 
 DISPATCH_CAPABILITIES_BY_RUNTIME: dict[str, RuntimeDispatchCapabilities] = {
     "claude_sdk": RuntimeDispatchCapabilities("claude_sdk", _SDK_CAPS),
@@ -97,14 +114,23 @@ def dispatch_capabilities_for(runtime: str | None) -> RuntimeDispatchCapabilitie
 
 
 def writer_dispatch_block_reason(caps: RuntimeDispatchCapabilities, *, strict: bool) -> str | None:
-    """严格模式下缺子代理 cwd 注入能力的 writer 派发拒绝理由。"""
-    if not strict or caps.supports(DispatchCapability.CHILD_CWD_INJECTION):
+    """严格模式下 writer 子代理派发的拒绝理由：缺 cwd 注入或缺完成前置钩子。"""
+    if not strict:
         return None
-    return (
-        f"runtime {caps.runtime} 缺少子代理 cwd 注入能力（②），"
-        "严格模式下拒绝启动 writer 子代理：无 cwd 注入则工作区隔离本身不成立，"
-        "可改用 on_no_dispatch_barrier: compat_late_barrier 显式弱化（恢复点保证随之弱化）"
-    )
+    if not caps.supports(DispatchCapability.CHILD_CWD_INJECTION):
+        return (
+            f"runtime {caps.runtime} 缺少子代理 cwd 注入能力（②），"
+            "严格模式下拒绝启动 writer 子代理：无 cwd 注入则工作区隔离本身不成立，"
+            "可改用 on_no_dispatch_barrier: compat_late_barrier 显式弱化（恢复点保证随之弱化）"
+        )
+    if not caps.supports(DispatchCapability.SUBAGENT_RESULT_PRE_HOOK):
+        return (
+            f"runtime {caps.runtime} 缺少子代理完成前置钩子，"
+            "严格模式下拒绝启动 writer 子代理：子代理的工作区无法在结果交付前并回父作用域，"
+            "父代理只能拿到文字结果而看不到文件；"
+            "可改用 on_no_dispatch_barrier: compat_late_barrier 显式弱化"
+        )
+    return None
 
 
 def group_arbitration_block_reason(

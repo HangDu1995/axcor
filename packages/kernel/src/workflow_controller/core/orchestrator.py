@@ -146,6 +146,8 @@ class Orchestrator:
     _dispatch_barrier_port: Callable[..., Awaitable[BarrierOutcome]] | None
     # 子代理启动端口：run 平面注册后据派发准入回填组检查点子会话映射
     _subagent_start_port: Callable[..., Awaitable[None]] | None
+    # 子代理结果端口：run 平面注册后把结果交付前的收尾转交协调器队列
+    _subagent_result_port: Callable[..., Awaitable[None]] | None
 
     def __init__(
         self,
@@ -720,6 +722,10 @@ class Orchestrator:
         """登记子代理启动端口（run 平面注册；此后新激活会话接线回填回调）。"""
         self._subagent_start_port = port
 
+    def set_subagent_result_port(self, port: Callable[..., Awaitable[None]]) -> None:
+        """登记子代理结果端口（run 平面注册；此后新激活会话接线结果交付前的收尾回调）。"""
+        self._subagent_result_port = port
+
     async def _handle_subagent_start(self, session_id: str, data: dict[str, Any]) -> None:
         """子代理启动回执分发：先记入 tracker，再尽力回填组检查点映射。"""
         await self._subagents.on_start(session_id, data)
@@ -735,10 +741,14 @@ class Orchestrator:
     async def _handle_dispatch_barrier(
         self,
         session_id: str,
-        kind: str,
         data: dict[str, Any],
+        *,
+        kind: str,
     ) -> BarrierOutcome:
-        """屏障回调入口：单会话树优先（宿主自任确认方），否则转 run 平面端口。"""
+        """屏障回调入口：单会话树优先（宿主自任确认方），否则转 run 平面端口。
+
+        kind 只收关键字：驱动按 ``(session_id, data)`` 位置调用，类别由接线处绑定。
+        """
         from workflow_controller.driver.factory import resolve_runtime
 
         session = self.pool.get(session_id)
@@ -763,6 +773,15 @@ class Orchestrator:
             runtime=runtime,
             workspace=str(data.get("workspace") or "writer"),
         )
+
+    async def _handle_subagent_result(self, session_id: str, data: dict[str, Any]) -> None:
+        """子代理结果交付前的收尾入口：单会话树优先，否则转 run 平面端口。"""
+        if self._session_workspaces.owns(session_id):
+            await self._session_workspaces.settle_subagent(session_id, data)
+            return
+        port = self._subagent_result_port
+        if port is not None:
+            await port(session_id, data)
 
     def make_driver_hooks(
         self,
@@ -790,12 +809,20 @@ class Orchestrator:
                 mig_session_id,
             )
         # 派发屏障回调：run 平面端口注册或单会话工作区接入后才接线
-        # （两者都缺席时驱动层零变化）
+        # （两者都缺席时驱动层零变化）；子代理结果收尾回调另认结果端口
+        barrier_wired = self._dispatch_barrier_port is not None or self._session_workspaces.owns(
+            mig_session_id
+        )
         before_side_effect_tool = None
         before_subagent_dispatch = None
-        if self._dispatch_barrier_port is not None or self._session_workspaces.owns(mig_session_id):
+        if barrier_wired:
             before_side_effect_tool = partial(self._handle_dispatch_barrier, kind="side_effect")
             before_subagent_dispatch = partial(self._handle_dispatch_barrier, kind="dispatch")
+        before_subagent_result = (
+            self._handle_subagent_result
+            if barrier_wired or self._subagent_result_port is not None
+            else None
+        )
         return DriverHooks(
             session_id=mig_session_id,
             on_pre_tool_use=self._handle_driver_pre_tool_use,
@@ -814,6 +841,7 @@ class Orchestrator:
             on_subagent_stop=self._subagents.on_stop,
             before_side_effect_tool=before_side_effect_tool,
             before_subagent_dispatch=before_subagent_dispatch,
+            before_subagent_result=before_subagent_result,
             subagent_progress_bridge=SubagentProgressBridge(),
             # opencode gate (AskUserQuestion-equivalent); ignored by cc drivers.
             on_gate_question=self._resolve_gate_question,
@@ -2521,6 +2549,7 @@ class Orchestrator:
         # 屏障回调不接线（旧路径零变化）
         self._dispatch_barrier_port = None
         self._subagent_start_port = None
+        self._subagent_result_port = None
 
     def _init_plane_integrations(self) -> None:
         """平面集成组件初始化：watchdog/subagent/overlay/文件变更（__init__ 专用）。"""

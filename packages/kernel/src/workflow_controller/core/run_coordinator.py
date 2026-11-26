@@ -53,7 +53,6 @@ from workflow_controller.core.checkpoints import (
     CheckpointStore,
     CheckpointTrigger,
     DispatchAnchor,
-    ScopeCheckpoint,
     checkpoint_to_dict,
 )
 from workflow_controller.core.restore.conversation import (
@@ -93,6 +92,9 @@ from workflow_controller.core.workspace.actions import (
 )
 from workflow_controller.core.workspace.actions import (
     ScopeIntegrated as CoreScopeIntegrated,
+)
+from workflow_controller.core.workspace.actions import (
+    ScopeIntegrationRejected as CoreScopeIntegrationRejected,
 )
 from workflow_controller.core.workspace.actions import (
     ScopeWorkspaceSpec as CoreScopeWorkspaceSpec,
@@ -148,6 +150,7 @@ from workflow_controller.plugin.run_driver import (
     SessionOutcomeReplayed,
     StartProcess,
     StartSession,
+    SubagentResultRequest,
 )
 from workflow_controller.plugin.workspace import (
     AbandonScope,
@@ -186,6 +189,7 @@ if TYPE_CHECKING:
         SessionRunAffiliation,
         SessionRunAffiliationService,
     )
+    from workflow_controller.core.workspace.integration import IntegrationConflict
     from workflow_controller.core.workspace.manager import BackgroundDrainHook
     from workflow_controller.core.workspace.scope_tree import ScopeRecord
     from workflow_controller.event.event_bus import EventBus
@@ -846,11 +850,21 @@ def _default_transcript_locator(native_session_id: str, workspace_path: str) -> 
     return found
 
 
-def _workspace_branch_of(scope: ScopeRecord) -> str | None:
-    """从工作区引用（路径|分支）解出分支名供检查点行落账。"""
-    if not scope.workspace_ref:
-        return None
-    return scope.workspace_ref.rpartition("|")[2] or None
+def _subagent_fault_identity(session_id: str, data: Mapping[str, Any]) -> dict[str, Any]:
+    """子代理收尾故障事件的归属字段：会话与子代理标识。"""
+    return {"session_id": session_id, "agent_id": str(data.get("agent_id") or "")}
+
+
+def _workspace_conflict_payload(conflict: IntegrationConflict) -> dict[str, Any]:
+    """集成冲突的 run 键事件 payload：路径、双方身份、双侧提交与共同基准。"""
+    return {
+        "scope_id": conflict.writer_scope_id,
+        "parent_scope_id": conflict.parent_scope_id,
+        "conflict_paths": list(conflict.conflict_paths),
+        "base_commit": conflict.base_commit,
+        "writer_head": conflict.writer_head,
+        "parent_head": conflict.parent_head,
+    }
 
 
 class RunCoordinator:
@@ -884,6 +898,10 @@ class RunCoordinator:
         set_start_port = getattr(orchestrator, "set_subagent_start_port", None)
         if callable(set_start_port):
             set_start_port(self.record_subagent_start)
+        # 会话宿主侧的子代理结果端口：结果交付前并入父作用域（经协调器队列执行）
+        set_result_port = getattr(orchestrator, "set_subagent_result_port", None)
+        if callable(set_result_port):
+            set_result_port(self.settle_subagent_result)
         # 工作区闸门的可注入后台写进程排空回调（后台写者清单接线前默认无）
         self._workspace_drain_hook = workspace_drain_hook
         # 对话恢复的 L2 定位器（默认按 claude 系路径解析；测试可注入）
@@ -961,11 +979,17 @@ class RunCoordinator:
     @staticmethod
     def _drain_controls(
         rt: RunRuntime,
-    ) -> tuple[list[ControlNotification], list[OpRequest], list[DispatchBarrierRequest]]:
-        """取走控制通知、应答请求与屏障请求，其余保序滞留 FIFO（暂停期专用，成员事件不丢失）。"""
+    ) -> tuple[
+        list[ControlNotification],
+        list[OpRequest],
+        list[DispatchBarrierRequest],
+        list[SubagentResultRequest],
+    ]:
+        """取走控制通知、应答请求与宿主服务请求，其余保序滞留 FIFO（暂停期专用，成员事件不丢失）。"""
         ctrls: list[ControlNotification] = []
         ops: list[OpRequest] = []
         barriers: list[DispatchBarrierRequest] = []
+        results: list[SubagentResultRequest] = []
         rest: deque[RunNotification] = deque()
         while rt.notifications:
             n = rt.notifications.popleft()
@@ -975,10 +999,12 @@ class RunCoordinator:
                 ops.append(n)
             elif isinstance(n, DispatchBarrierRequest):
                 barriers.append(n)
+            elif isinstance(n, SubagentResultRequest):
+                results.append(n)
             else:
                 rest.append(n)
         rt.notifications.extend(rest)
-        return ctrls, ops, barriers
+        return ctrls, ops, barriers, results
 
     @staticmethod
     def _settle_op_reply(op: OpRequest, outcome: dict[str, Any] | BaseException) -> None:
@@ -1598,6 +1624,44 @@ class RunCoordinator:
             await tree.arbiter.attach_child_session(checkpoint_id, child_scope_id, native_child)
         except Exception:
             logger.warning("子会话映射回填失败（不阻塞子代理运行）：checkpoint=%s", checkpoint_id)
+
+    async def settle_subagent_result(self, session_id: str, data: Mapping[str, Any]) -> None:
+        """子代理结果交付前的收尾入口：请求经 FIFO 在 run 任务内执行，钩子返回前完成。
+
+        没有工作区树的 run（未开启工作区隔离）与无归属会话零动作。等待
+        有界，窗口与派发屏障同界；超窗按 fault.scope_quiesce_failed 留痕
+        后放行，不让钩子挂死——迟到的请求仍由 run 任务执行完毕。
+        """
+        affiliation = self._affiliation.resolve(session_id)
+        if affiliation is None:
+            return
+        run_id = affiliation.run_id
+        tree = self._workspace_trees.get(run_id)
+        rt = self._runtimes.get(run_id)
+        if tree is None or rt is None or rt.poisoned or rt.stopping:
+            return
+        reply: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._notify(
+            run_id,
+            SubagentResultRequest(
+                session_id=session_id,
+                context=affiliation.context,
+                data=dict(data),
+                reply=reply,
+            ),
+        )
+        try:
+            await asyncio.wait_for(reply, timeout=tree.barrier_wait_timeout_s)
+        except TimeoutError:
+            await self._emit_run_event_best_effort(
+                rt,
+                fault_event_type(SCOPE_QUIESCE_FAILED_RULE),
+                {
+                    **_subagent_fault_identity(session_id, data),
+                    "error": f"子代理结果收尾等待超窗（>{tree.barrier_wait_timeout_s}s）",
+                },
+                context=affiliation.context,
+            )
 
     async def validate_dispatch_replay(self, run_id: str, checkpoint_id: str) -> None:
         """replay_dispatch 前置校验：目标组须单 task 且无其他副作用。
@@ -2246,12 +2310,13 @@ class RunCoordinator:
         return LoopState.DRAINING
 
     async def _run_paused_round(self, rt: RunRuntime) -> list[ControlNotification]:
-        """暂停轮：排空控制/应答/屏障、落快照；返回待携带入主路径收尾的终态控制。"""
-        ctrls, ops, barriers = self._drain_controls(rt)
+        """暂停轮：排空控制/应答/宿主服务请求、落快照；返回待携带入主路径收尾的终态控制。"""
+        ctrls, ops, barriers, results = self._drain_controls(rt)
         for c in ctrls:
             await self._call_control(rt, c)
         await self._serve_ops(rt, ops)
         await self._serve_dispatch_barriers(rt, barriers)
+        await self._serve_subagent_results(rt, results)
         await self._persist_snapshot(rt)
         carried = [c for c in ctrls if c.is_terminal()]
         if not carried:
@@ -2262,20 +2327,24 @@ class RunCoordinator:
     async def _drain_round_notifications(
         self, rt: RunRuntime
     ) -> tuple[list[RunNotification], list[ControlNotification]]:
-        """排空通知 FIFO：控制类即时处理、应答与屏障类服务，剩余成员事件按序返回。"""
+        """排空通知 FIFO：控制类即时处理、应答与宿主服务请求类服务，剩余成员事件按序返回。"""
         notes = self._drain_notifications(rt)
         ctrls = [n for n in notes if isinstance(n, ControlNotification)]
         ops = [n for n in notes if isinstance(n, OpRequest)]
         barriers = [n for n in notes if isinstance(n, DispatchBarrierRequest)]
+        results = [n for n in notes if isinstance(n, SubagentResultRequest)]
         notes = [
             n
             for n in notes
-            if not isinstance(n, (ControlNotification, OpRequest, DispatchBarrierRequest))
+            if not isinstance(
+                n, (ControlNotification, OpRequest, DispatchBarrierRequest, SubagentResultRequest)
+            )
         ]
         for c in ctrls:
             await self._call_control(rt, c)
         await self._serve_ops(rt, ops)
         await self._serve_dispatch_barriers(rt, barriers)
+        await self._serve_subagent_results(rt, results)
         return notes, ctrls
 
     async def _settle_round_terminality(
@@ -2488,6 +2557,66 @@ class RunCoordinator:
             )
             return
         reply.set_result(outcome)
+
+    async def _serve_subagent_results(
+        self, rt: RunRuntime, requests: list[SubagentResultRequest]
+    ) -> None:
+        """消费子代理结果收尾请求：run 任务内执行收尾链，与 decide 串行不交错。"""
+        for req in requests:
+            await self._settle_subagent_result(rt, req)
+            if not req.reply.done():
+                # 调用方已超窗或取消离场时无人等这份回执，照常结束
+                req.reply.set_result(None)
+
+    async def _settle_subagent_result(self, rt: RunRuntime, req: SubagentResultRequest) -> None:
+        """执行子代理结果收尾链：定位子作用域 → 终态提交 → 并入父作用域 → 释放工作区。
+
+        失败只留痕、不抛回调用方：集成被拒落 fault.workspace_conflict，闸门
+        不可静止落 fault.scope_quiesce_failed，其余失败只告警。三种情况下
+        子作用域都保留不释放，供排查。
+        """
+        tree = self._workspace_trees.get(rt.run_id)
+        if tree is None:
+            return
+        agent_id = str(req.data.get("agent_id") or "")
+        scope_id = await tree.child_scope_for_session(agent_id)
+        if scope_id is None:
+            logger.warning(
+                "子代理 %s 完成但未找到子作用域，结果未并入父作用域：session=%s",
+                agent_id,
+                req.session_id,
+            )
+            return
+        identity = _subagent_fault_identity(req.session_id, req.data)
+        try:
+            orchestration_ref = await self._persist_orchestration_ref(rt)
+            outcome = await tree.settle_subagent_scope(
+                scope_id, orchestration_state_ref=orchestration_ref
+            )
+        except ScopeQuiesceFailedError as error:
+            await self._emit_run_event_best_effort(
+                rt,
+                fault_event_type(SCOPE_QUIESCE_FAILED_RULE),
+                {**identity, "error": str(error)},
+                context=req.context,
+            )
+            return
+        except Exception as error:
+            logger.warning(
+                "子代理 %s 的作用域 %s 收尾失败，工作区保留待查：%s: %s",
+                agent_id,
+                scope_id,
+                type(error).__name__,
+                error,
+            )
+            return
+        if isinstance(outcome, CoreScopeIntegrationRejected):
+            await self._emit_run_event_best_effort(
+                rt,
+                fault_event_type(WORKSPACE_CONFLICT_RULE),
+                {**_workspace_conflict_payload(outcome.conflict), **identity},
+                context=req.context,
+            )
 
     async def _execute_op(self, rt: RunRuntime, op: OpRequest) -> Any:
         """单个操作的执行体：projection / world op / 普通 op 三分支。"""
@@ -2726,12 +2855,10 @@ class RunCoordinator:
             scope = await tree.manager.get_scope(prepared.scope_id)
             if scope is None:
                 raise RuntimeError(f"建区后作用域账本缺行：{prepared.scope_id}")
-            await self._record_workspace_checkpoint(
-                tree,
+            await tree.record_lifecycle_checkpoint(
                 scope=scope,
                 trigger=CheckpointTrigger.SCOPE_START,
                 workspace_commit=prepared.base_commit,
-                workspace_branch=_workspace_branch_of(scope),
                 integration_commit=prepared.integration_base_commit,
                 orchestration_state_ref=orchestration_ref,
                 claims=claims,
@@ -2834,17 +2961,15 @@ class RunCoordinator:
             return
         try:
             orchestration_ref = await self._persist_orchestration_ref(rt)
-            commit, branch = await tree.manager.commit_scope_terminal(action.scope_id)
+            commit, _branch = await tree.manager.commit_scope_terminal(action.scope_id)
             scope = await tree.manager.get_scope(action.scope_id)
             if scope is None:
                 raise RuntimeError(f"终态提交后作用域账本缺行：{action.scope_id}")
             integration_head = await tree.manager.current_integration_head()
-            checkpoint_id = await self._record_workspace_checkpoint(
-                tree,
+            checkpoint_id = await tree.record_lifecycle_checkpoint(
                 scope=scope,
                 trigger=CheckpointTrigger.TERMINAL,
                 workspace_commit=commit,
-                workspace_branch=branch,
                 integration_commit=integration_head,
                 orchestration_state_ref=orchestration_ref,
             )
@@ -2911,14 +3036,7 @@ class RunCoordinator:
         await self._emit_run_event_best_effort(
             rt,
             fault_event_type(WORKSPACE_CONFLICT_RULE),
-            {
-                "scope_id": conflict.writer_scope_id,
-                "parent_scope_id": conflict.parent_scope_id,
-                "conflict_paths": list(conflict.conflict_paths),
-                "base_commit": conflict.base_commit,
-                "writer_head": conflict.writer_head,
-                "parent_head": conflict.parent_head,
-            },
+            _workspace_conflict_payload(conflict),
             context=action.context,
         )
         self._notify(
@@ -2944,40 +3062,6 @@ class RunCoordinator:
         if seq is None:
             raise RuntimeError("编排状态快照版本缺失：检查点前置持久化失败")
         return f"driver-snapshot:{seq}"
-
-    async def _record_workspace_checkpoint(
-        self,
-        tree: WorkspaceTreeRuntime,
-        *,
-        scope: ScopeRecord,
-        trigger: CheckpointTrigger,
-        workspace_commit: str,
-        workspace_branch: str | None,
-        integration_commit: str | None,
-        orchestration_state_ref: str,
-        claims: tuple[str, ...] = (),
-    ) -> str:
-        """落一行生命周期检查点（文件提交与编排引用都已先在），返回标识。"""
-        checkpoint_id = f"{scope.scope_id}:{trigger.value}:e{scope.scope_epoch}"
-        await tree.checkpoints.record(
-            ScopeCheckpoint(
-                checkpoint_id=checkpoint_id,
-                scope_id=scope.scope_id,
-                scope_kind=scope.scope_kind,
-                parent_scope_id=scope.parent_scope_id,
-                scope_epoch=scope.scope_epoch,
-                root_epoch=scope.root_epoch,
-                trigger=trigger,
-                barrier_quality=BarrierQuality.PRECISE,
-                workspace_commit=workspace_commit,
-                workspace_branch=workspace_branch,
-                integration_commit=integration_commit,
-                claims=claims,
-                orchestration_state_ref=orchestration_state_ref,
-                created_at=datetime.now(tz=UTC).isoformat(),
-            )
-        )
-        return checkpoint_id
 
     async def _execute_workspace_abandon(self, rt: RunRuntime, action: AbandonScope) -> None:
         """执行废弃：移除作用域及后代工作区并各自换代。"""

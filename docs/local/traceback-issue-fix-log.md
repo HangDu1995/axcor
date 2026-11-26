@@ -19,7 +19,7 @@
 | #61 | 已完成 | 本 commit | 屏障按斜杠前的节点 id 定位父作用域，验收会话的副作用与 task 派发屏障放行，账落在节点作用域 |
 | #62 | 已完成 | 本 commit | 屏障父作用域只认活动态，节点重试后执行与验收会话的屏障落在新作用域；无活动作用域时拒绝并带出现有作用域状态 |
 | #63 | 已完成 | 本 commit | 屏障、作用域查询与重放前置校验在树不在内存时先按盘上配置重建，确实没有树才按原样放行或拒绝；重建的账本行带回属主，重启后 agent 会话的派发拿到子工作区、副作用落组检查点 |
-| #64 | | | |
+| #64 | 已完成 | 本 commit | 子代理停止钩子先经宿主把子作用域并入父作用域并释放子工作区，再交付结果；冲突、闸门不可静止与等待超窗按故障事件留痕并放行；能力矩阵新增完成前置钩子，时序只到代码级。同时修掉派发屏障回调的位置传参冲突——它是本链在生产接线上的前置缺陷 |
 | #65 | | | |
 | #66 | | | |
 | #67 | | | |
@@ -244,6 +244,75 @@ run 平面 `packages/plugins/graph/tests/test_workspace_run_plane.py`：
 - 重启前派发过 writer 子代理的节点，重启后再次 task 派发被拒（已复现）：`BarrierDeny(reason='OplogError: 已生效操作不可放弃：dispatch-1（committed）')`。子代理作用域不进重建面、子代理序号归零，是 #74 的范围。修复前同一场景是静默直通（子代理无隔离启动）；修复后是显式拒绝，即决策与偏差里的过渡行为，#74 修复后解除。
 - 盘上树配置的位置按 run 工作目录推导，而树的实际根目录取自建区动作携带的配置。graph 引擎把二者设为同一个；若有插件让二者不同，重建找不到配置，屏障会按「无树」直通。
 - 树配置文件是非原子写入，读回失败（文件损坏）时按「无配置」处理：同一现场下工作区动作是显式失败，屏障则按本修复的判据直通。窗口极窄，未处理。
+
+### #64 [traceback] D4 writer 子代理完成后没有「集成回父作用域」的路径
+
+**根因**
+
+子代理作用域只做了派发侧：task 派发屏障在父作用域下建出子工作区并回填 cwd，子代理启动后把原生会话标识回填进组检查点行的 `child_session_map`。完成侧没有任何接线——`integrate_scope` 在主代码只有两个调用点（节点集成动作、单会话主写者终态），编排器交给驱动的 `on_subagent_stop` 只更新在途跟踪与进度桥。子代理在自己的工作区里写的东西因此永远留在那里：父代理拿到文字结果却看不到文件，子作用域分支不合并、工作区不释放，磁盘随派发数线性增长。仓内「子代理先并入父作用域」的用例是 fake 编排直接调管理器，覆盖的是管理器能力；run 平面里「已集成的兄弟子代理」用例靠测试手工发集成动作，同样不是生产接线。
+
+调查中还复现了一个前置缺陷（已并入本次修复）：派发屏障回调在进程内接线上必然抛 TypeError。`make_driver_hooks` 用 `partial(self._handle_dispatch_barrier, kind="dispatch")` 接线，而处理器的参数序是 `(session_id, kind, data)`，驱动按 `(session_id, data)` 位置调用——第二个位置参数落到 `kind` 上，与关键字冲突：`TypeError: Orchestrator._handle_dispatch_barrier() got multiple values for argument 'kind'`。自派发屏障落地的那次提交（`9d4fe47`）起即如此；既有用例要么直接调协调器入口、要么用桩回调，没有一例经过编排器的这层接线。后果是 claude_sdk 的 task 派发与副作用屏障到不了宿主：不注入 cwd、不建组检查点，也就不会建出子作用域，完成侧的集成链无从触发。所以它是本问题在生产接线上成立的前提，并入同一个 commit 修，不另立 issue。
+
+**修复**
+
+- 派发屏障接线：`_handle_dispatch_barrier` 的 `kind` 改为仅限关键字（`(session_id, data, *, kind)`），两处 `partial(..., kind=...)` 的绑法不动——驱动按位置传的 `(session_id, data)` 落在前两个形参上，类别只能由接线处绑定，不可能再被位置参数撞上。同一条 SDK 回调里排在屏障之后的评审决策也随之恢复可达（此前屏障先抛错，走不到评审）。这条链上其余接线核对过：用 `partial` 的另有一处 `runtime_hook_config_valid`（零参调用，不在本链），其余回调都是绑定方法 `(session_id, data)`，含本次新增的结果回调与两平面的端口方法，没有第二个。
+- 挂载点：`DriverHooks` 新增 `before_subagent_result`（子代理结果交付前的收尾回调）。claude_sdk 驱动的 SubagentStop 回调先 await 它、再走既有 `on_subagent_stop`；回调里的异常不外抛（只记日志），子代理照常结束。两个回调任一接线时才挂 SubagentStop matcher。
+- 路由：编排器新增子代理结果端口，接线条件与派发屏障一致——run 平面端口注册或会话已接入单会话树才接线，两者都缺席时驱动层零变化。入口先看会话是否属于单会话树，是则交给会话宿主，否则转 run 平面端口。
+- run 平面：`RunCoordinator.settle_subagent_result` 把请求作为独立通知（`SubagentResultRequest`）入 run FIFO，在 run 任务内串行执行——运行轮与暂停轮都与派发屏障同道服务，不在 decide 内做 I/O。等待有界，窗口与派发屏障同界；没有工作区树的 run 与无归属会话零动作。
+- 收尾链（两平面共用，住 `WorkspaceTreeRuntime.settle_subagent_scope`）：按停止 payload 的 `agent_id` 在树内反查 `child_session_map` 定位子作用域 → 编排状态版本先落 → 闸门内终态提交 → terminal 检查点行 → 父闸门内并入父作用域 → 默认释放子工作区（`retain_after_merge` 为真时保留）。reader 快照永不集成，完成后只释放工作区（按废弃换代）。单会话侧 `SessionWorkspaceHost.settle_subagent` 走同一条链，与派发屏障共用会话串行锁，并行子代理的收尾不交错。
+- 反查落在检查点账本（`CheckpointStore.find_child_scope`）：自根按父子链展开树内有检查点行的作用域，再比对各行的子会话映射；他树的映射不命中。树展开与 `delete_for_tree` 原有的内联循环是同一段逻辑，抽成 `_tree_scope_ids` 共用。
+- 失败语义：集成被拒发 `fault.workspace_conflict`，闸门不可静止与等待超窗发 `fault.scope_quiesce_failed`（run 键事件，payload 带会话与子代理标识）；三种情况下子作用域都保留不释放，入口正常返回、钩子放行。钩子不用 block——SubagentStop 的 block 会把理由喂回子代理让它继续跑。
+- 能力矩阵：新增「子代理完成前置钩子」。claude_sdk 标为具备，但在矩阵里写明这只是代码级推断、未经真实运行时验证；严格档下缺它的 runtime 同样拒绝 writer 子代理（屏障受理侧与出生侧禁 task 工具两处都据此），claude_sdk 既有五项结论的措辞未动。
+- 两平面各自一份的「生命周期检查点行构造」与「从工作区引用解分支名」合并进树运行时（`record_lifecycle_checkpoint`），新链复用，少两份重复代码。
+
+**决策与偏差**
+
+- 时序结论只到代码级，如实标注。读捆绑 CLI 2.1.327 的内嵌代码：SubagentStop 在子代理自身查询的回合结束处执行（与 Stop 走同一条处理链，可 block），SDK 宿主回调被 await，回调返回后回合才结束、Task 结果才交回父代理；Python SDK 对每个控制请求各起一个任务，回调之间不互相阻塞。两条例外写进矩阵注释：回调超时或查询被中断（收尾时 CLI 只等 5 秒）时 CLI 不等答复继续，此时结果先于集成交付。CLI 对 SubagentStop 宿主回调的默认等待时长未核定。真实运行时的冒烟验证归 #66。
+- 入口不重建树：树不在内存时直接零动作。派发屏障需要重建是因为它要建新作用域；重启后子代理层不进重建面（#74），且子代理不跨进程重启存续，重建对完成侧没有收益。
+- 派发屏障接线的前置缺陷并入本 commit（主 agent 决定），不另立 issue：不修它，完成侧的集成链在这条分支的生产接线上永远不会被触发。修法取「类别改仅限关键字」而不是改 partial 的绑法——绑定处不变，冲突从签名上被排除。修好之后严格子代理屏障在这条分支上第一次真正可达：副作用工具与 task 的每次调用都经编排器进入宿主，未开启工作区隔离的 run 与独立会话照旧直通（每次调用多一次 run 记录与树配置的读盘）。真实运行时上的后续表现归 #66 冒烟。
+- 失败时放行，而不是让子代理失败：规格对「父阻塞在结果上、闸门不可静止」写的是「task result 以 fault 结束，子代理按失败进入重试/回滚预算」。本次按主 agent 指引落地为「发故障事件 + 放行」，没有接子代理失败的重试/回滚预算——父拿到文字结果看不到文件这一点与修复前相同，区别是有显式故障信号。冲突策略（fail_unit / pause_for_repair）本身尚未实现，不在本问题范围。
+- 单会话平面的冲突与闸门失败只记告警日志：该平面没有 run 键故障事件通道，也没有消费方。
+- 完成但找不到子作用域时只记告警：此时没有可并的东西（映射未回填，或作用域已随回滚废弃），现有故障词表里没有对应的词。
+- 父作用域不在活动态时不并入（显式失败并留痕）：父会话已结束后迟到的完成回执（如查询被中断时的收尾回执）若再并入，会污染已打的终态检查点。
+- reader 完成后按「废弃」释放：生命周期表只允许已集成转已释放，reader 永不集成，走废弃动作复用既有的工作区移除与换代，不新增状态迁移。
+- 完成侧不对驱动发通知：子代理完成是纯作用域层事件，没有图语义。冲突后节点照常走终态提交与集成，子代理的产出不在其中，由故障信号交给适配器。
+- 检查点查询面（`list_run_checkpoints` 与会话检查点查询）不返回子代理作用域自己的 terminal 行：树查询仍是非递归（根与直接子作用域），而深度恢复靠同一个查询重建作用域，改递归会改变恢复行为，归 #74 一并考虑。
+- 测试夹具：等待超窗用例在派发成功后把树运行时的等待窗口调小、再把编排快照调慢——派发本身走真实 git，50 毫秒窗口下派发先超时。
+- 缺陷修复，代码向既有设计对齐，未改设计文档。
+
+**验证**
+
+协调器层 `packages/kernel/kernel_tests/unit/run_plane/test_dispatch_barrier_chain.py`（真实 git、探针驱动）：
+
+- `test_writer_subagent_completion_integrates_into_parent_scope`：派发 writer 子代理并在子工作区写文件，触发完成后父分支头是 `integrate node-a-c1` 提交、产出在父工作区可见、子工作区已释放（作用域转 released）、子作用域的 terminal 检查点行落账且编排引用非空；重复回执幂等。
+- `test_reader_subagent_completion_releases_snapshot_workspace`：reader 快照工作区释放，作用域按废弃换代，没有冲突事件。
+- `test_subagent_completion_conflict_emits_fault_and_keeps_workspace`：父子改同一文件，集成被拒，落 `fault.workspace_conflict`（带冲突路径、双方作用域、会话与子代理标识），子工作区与内容保留，作用域转 conflicted，入口照常返回。
+- `test_subagent_completion_quiesce_failure_emits_fault_and_keeps_workspace`：闸门不可静止，落 `fault.scope_quiesce_failed`，子工作区保留。
+- `test_subagent_completion_wait_window_closes_with_fault`：收尾链超过等待窗口时入口按时返回，落 `fault.scope_quiesce_failed`。
+
+单会话 `packages/kernel/kernel_tests/session_workspace/test_session_workspace.py`：`test_subagent_completion_integrates_into_main_writer`——同链一例，另证产出已在主写者分支上：终态同步把它写回原目录。
+
+编排器接线 `packages/kernel/kernel_tests/session_workspace/test_session_workspace_gate.py`（调用形态与驱动一致，一律位置传参）：
+
+- `test_driver_shaped_barrier_and_result_hooks_reach_run_port`：经 `make_driver_hooks` 拿到屏障与结果回调按位置调用，请求带着正确的类别、工具与工作区声明到达 run 平面端口并得到放行。
+- `test_driver_shaped_hooks_run_whole_chain_on_session_tree`：接入托管工作区的会话走会话树、不进端口——SDK 驱动自己的 Task 回调放行并注入子工作区 cwd，副作用回调放行，停止回调把产出并入主写者并释放子工作区。
+
+既有零接线用例补一条断言。
+
+驱动层 `packages/kernel/kernel_tests/unit/driver/test_dispatch_barrier.py`：`test_sdk_subagent_stop_awaits_result_hook_before_tracker`（先等前置回调再通知跟踪，回调异常不外抛）、`test_sdk_hook_matchers_follow_barrier_wiring`（补 SubagentStop 挂载断言）、`test_claude_sdk_declares_subagent_completion_hook`、`test_runtime_missing_completion_hook_denies_writer_in_strict_mode`。
+
+检查点账本 `packages/kernel/kernel_tests/checkpoints/test_checkpoint_store.py`：`test_find_child_scope_walks_parent_chain_within_tree`（沿父子链走到嵌套层，他树与空标识不命中）。
+
+修复前失败（最终的测试代码对未修复的源码）：新增与改动的 14 个用例全部失败。完成侧的 12 个失败于接口不存在——`AttributeError: 'RunCoordinator' object has no attribute 'settle_subagent_result'`、`'SessionWorkspaceHost' object has no attribute 'settle_subagent'`、`'DriverHooks' object has no attribute 'before_subagent_result'`、`'CheckpointStore' object has no attribute 'find_child_scope'`、`type object 'DispatchCapability' has no attribute 'SUBAGENT_RESULT_PRE_HOOK'` 等；屏障接线的两例失败于 `TypeError: Orchestrator._handle_dispatch_barrier() got multiple values for argument 'kind'`，第二例是经 SDK 驱动自己的回调触发的。完成侧是结构性缺失，没有可供断言的旧行为；另以变异验证证明断言针对行为——把收尾链改成空操作后，writer 与单会话用例失败于父工作区没有子代理产出（`FileNotFoundError: …/node-a/design/from-child.md`），reader 用例失败于快照工作区仍在，冲突用例失败于没有故障事件（`assert 0 == 1`）。
+
+另以一次性探针把真实编排器、真实协调器端口与 SDK 驱动回调串起来核对 run 平面整链（探针跑完即删）：副作用屏障放行，task 派发放行并注入 cwd，子代理完成回调后子作用域转已释放、工作区移除，父分支头是集成提交且父工作树干净；节点随后终态提交并入集成线，根检出含子代理产出；映射里查不到的子代理与重复回执都不产生故障事件。
+
+门禁（最终代码上）：`ruff format --check` 421 个文件已格式化、`ruff check` 全过、`lint-imports` 4 条规则保持 0 破坏、`codespell`（全部 git 跟踪的 markdown）无命中；全量 pytest 2837 通过、15 跳过（基线 2825 通过 + 新增 12 例），2 条告警为 breather 插件既有告警；`uv build --package workflow-controller-kernel` 与 `--package workflow-controller-plugin-graph` 的 sdist 与 wheel 构建成功（graph 插件源码未改动，因消费能力矩阵函数一并构建核对）。
+
+**顺带发现**
+
+- 评审的 M7（写入闸门只是记账：后台写进程排空钩子与「父阻塞在结果上」标志未接生产）不在 issue 地图里。本链的「父闸门内集成」目前同样只靠父会话停在工具调用上的结构性静止；`background_drain_timeout_s` 只约束钩子的等待窗口，管理器建闸门用的是默认排空窗口。
+- 子代理完成时若 `child_session_map` 未回填，收尾链找不到子作用域、只记告警。回填依赖 SDK 路径的 `task_started` 消息先于子代理结束到达，且 lineage 先看到 Task 调用；这一点同样只到代码级，归 #66 一并验证。
 
 ## 跳过与延期
 

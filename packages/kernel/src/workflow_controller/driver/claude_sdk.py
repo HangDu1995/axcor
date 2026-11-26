@@ -315,7 +315,7 @@ class ClaudeSDKDriver(CLIDriverBase):
             sdk_hooks["Stop"] = [HookMatcher(hooks=[stop_cb])]  # type: ignore[list-item]
         if hooks.on_subagent_start is not None:
             sdk_hooks["SubagentStart"] = [HookMatcher(hooks=[subagent_start_cb])]  # type: ignore[list-item]
-        if hooks.on_subagent_stop is not None:
+        if hooks.on_subagent_stop is not None or hooks.before_subagent_result is not None:
             sdk_hooks["SubagentStop"] = [HookMatcher(hooks=[subagent_stop_cb])]  # type: ignore[list-item]
         return sdk_hooks
 
@@ -593,6 +593,15 @@ async def _sdk_subagent_start_cb(
 async def _sdk_subagent_stop_cb(
     input_data: dict[str, Any], tool_use_id: str | None, context: object, *, hooks: DriverHooks
 ) -> dict[str, Any]:
+    """子代理停止钩子：先做结果交付前的收尾，再通知在途跟踪。"""
+    if hooks.before_subagent_result is not None:
+        # 收尾失败不外抛：子代理照常结束，失败由宿主侧留痕
+        try:
+            await hooks.before_subagent_result(
+                hooks.session_id, {"agent_id": input_data.get("agent_id", "")}
+            )
+        except Exception:
+            logger.exception("子代理结果交付前的收尾失败 session=%s", hooks.session_id)
     if hooks.on_subagent_stop is not None:
         # Boundary normalization: summarize the cc transcript path into
         # the {content, total_tokens} format.

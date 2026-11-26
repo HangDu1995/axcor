@@ -29,7 +29,6 @@ import base64
 import logging
 import shutil
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -39,7 +38,6 @@ from workflow_controller.core.checkpoints import (
     CheckpointStore,
     CheckpointTrigger,
     DispatchAnchor,
-    ScopeCheckpoint,
 )
 from workflow_controller.core.restore.conversation import (
     ConversationRestorePlan,
@@ -75,7 +73,6 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from workflow_controller.config.settings import SessionTracebackConfig
-    from workflow_controller.core.workspace.scope_tree import ScopeRecord
 
 __all__ = [
     "SessionWorkspaceError",
@@ -483,12 +480,10 @@ class SessionWorkspaceHost:
         scope = await tree.manager.get_scope(prepared.scope_id)
         if scope is None:
             raise SessionWorkspaceError(f"建区后作用域账本缺行：{prepared.scope_id}")
-        await self._record_checkpoint(
-            tree,
+        await tree.record_lifecycle_checkpoint(
             scope=scope,
             trigger=CheckpointTrigger.SCOPE_START,
             workspace_commit=prepared.base_commit,
-            workspace_branch=self._branch_of(scope),
             integration_commit=prepared.integration_base_commit,
             orchestration_state_ref=orchestration_ref,
         )
@@ -627,6 +622,57 @@ class SessionWorkspaceHost:
         except Exception:
             logger.warning("子会话映射回填失败（不阻塞子代理运行）：checkpoint=%s", admission[0])
 
+    async def settle_subagent(self, session_id: str, data: dict[str, Any]) -> None:
+        """子代理结果交付前的收尾：并入父作用域并释放子工作区，钩子返回前完成。
+
+        与派发屏障共用会话串行锁（并行子代理的收尾不交错）。失败只留痕：
+        子作用域保留待查，钩子照常放行；单会话平面没有 run 键故障事件
+        通道，冲突与闸门不可静止以告警日志留痕。
+        """
+        entry = self._resolve(session_id)
+        if entry is None or entry.state != "active":
+            return
+        lock = self._barrier_locks.setdefault(entry.session_id, asyncio.Lock())
+        async with lock:
+            await self._settle_subagent_scope(entry, str(data.get("agent_id") or ""))
+
+    async def _settle_subagent_scope(self, entry: _SessionTreeEntry, agent_id: str) -> None:
+        """定位子作用域并执行收尾链；会话账本版本先于文件提交落账。"""
+        tree = entry.tree
+        scope_id = await tree.child_scope_for_session(agent_id)
+        if scope_id is None:
+            logger.warning(
+                "子代理 %s 完成但未找到子作用域，结果未并入父作用域：session=%s",
+                agent_id,
+                entry.session_id,
+            )
+            return
+        session = await self._resolve_session(entry.session_id)
+        if session is None:
+            logger.warning("会话不在池内，子代理 %s 的结果未并入：%s", agent_id, entry.session_id)
+            return
+        try:
+            orchestration_ref = await self._persist_ledger_ref(session)
+            outcome = await tree.settle_subagent_scope(
+                scope_id, orchestration_state_ref=orchestration_ref
+            )
+        except Exception as error:
+            logger.warning(
+                "子代理 %s 的作用域 %s 收尾失败，工作区保留待查：%s: %s",
+                agent_id,
+                scope_id,
+                type(error).__name__,
+                error,
+            )
+            return
+        if isinstance(outcome, ScopeIntegrationRejected):
+            logger.warning(
+                "子代理 %s 的作用域 %s 并入父作用域被拒，工作区保留待查，冲突路径：%s",
+                agent_id,
+                scope_id,
+                list(outcome.conflict.conflict_paths),
+            )
+
     # ── 终态同步与回收 ────────────────────────────────────────
 
     async def finalize_session(self, session_id: str) -> TerminalSyncReport | None:
@@ -673,16 +719,14 @@ class SessionWorkspaceHost:
             if session is None:
                 raise SessionWorkspaceError(f"会话不在池内，无法落终态检查点：{sid}")
             orchestration_ref = await self._persist_ledger_ref(session)
-            commit, branch = await tree.manager.commit_scope_terminal(tree.main_writer_scope_id)
+            commit, _branch = await tree.manager.commit_scope_terminal(tree.main_writer_scope_id)
             scope = await tree.manager.get_scope(tree.main_writer_scope_id)
             assert scope is not None
             integration_head = await tree.manager.current_integration_head()
-            await self._record_checkpoint(
-                tree,
+            await tree.record_lifecycle_checkpoint(
                 scope=scope,
                 trigger=CheckpointTrigger.TERMINAL,
                 workspace_commit=commit,
-                workspace_branch=branch,
                 integration_commit=integration_head,
                 orchestration_state_ref=orchestration_ref,
             )
@@ -816,45 +860,6 @@ class SessionWorkspaceHost:
     def _run_id_of(session: Any) -> str:
         """会话的 run 归属（隐式 run 保持恢复会话的谱系连续）。"""
         return str(session.config.run_id or "")
-
-    @staticmethod
-    def _branch_of(scope: ScopeRecord) -> str | None:
-        """从工作区引用解出分支名供检查点行落账。"""
-        if not scope.workspace_ref:
-            return None
-        return scope.workspace_ref.rpartition("|")[2] or None
-
-    async def _record_checkpoint(
-        self,
-        tree: SessionWorkspaceTree,
-        *,
-        scope: ScopeRecord,
-        trigger: CheckpointTrigger,
-        workspace_commit: str,
-        workspace_branch: str | None,
-        integration_commit: str | None,
-        orchestration_state_ref: str,
-    ) -> str:
-        """落一行生命周期检查点（文件提交与账本引用都已先在）。"""
-        checkpoint_id = f"{scope.scope_id}:{trigger.value}:e{scope.scope_epoch}"
-        await tree.checkpoints.record(
-            ScopeCheckpoint(
-                checkpoint_id=checkpoint_id,
-                scope_id=scope.scope_id,
-                scope_kind=scope.scope_kind,
-                parent_scope_id=scope.parent_scope_id,
-                scope_epoch=scope.scope_epoch,
-                root_epoch=scope.root_epoch,
-                trigger=trigger,
-                barrier_quality=BarrierQuality.PRECISE,
-                workspace_commit=workspace_commit,
-                workspace_branch=workspace_branch,
-                integration_commit=integration_commit,
-                orchestration_state_ref=orchestration_state_ref,
-                created_at=datetime.now(tz=UTC).isoformat(),
-            )
-        )
-        return checkpoint_id
 
 
 def _default_locator(native_session_id: str, workspace_path: str) -> Path | None:

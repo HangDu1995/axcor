@@ -175,6 +175,8 @@ class DriverHooks:
     on_subagent_start: SubagentHandler | None = None
     on_subagent_progress: SubagentHandler | None = None
     on_subagent_stop: SubagentHandler | None = None
+    # 子代理结果交付前的收尾回调：先于 on_subagent_stop，返回前任凭宿主把子作用域并回父作用域
+    before_subagent_result: SubagentHandler | None = None
     # ⑤ 副作用工具前置屏障：副作用发生前仲裁（组检查点先于本副作用）。
     before_side_effect_tool: SideEffectBarrierHandler | None = None
     # ① 派发前置屏障：task 真正创建前仲裁并返回子代理工作区 cwd。

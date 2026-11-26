@@ -16,19 +16,22 @@
 
 以 fake hook 直接调用协调器屏障入口模拟 runtime 回调；真实 git 与真实
 run 平面装配（探针驱动）。能力矩阵门与有界等待收口同在此固化。
+子代理完成走同一条队列：结果交付前并入父作用域、释放子工作区，
+冲突与超窗按故障事件留痕。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from workflow_controller.core.checkpoints import BarrierQuality
+from workflow_controller.core.checkpoints import BarrierQuality, CheckpointStore
 from workflow_controller.core.workspace import ScopeState
 from workflow_controller.core.workspace.dispatch_groups import ReplayRejectedError
 from workflow_controller.core.workspace.tree_runtime import WorkspaceTreeRuntime
@@ -582,5 +585,167 @@ async def test_unaffiliated_session_passes_through(tmp_path: Path) -> None:
             runtime="claude_sdk",
         )
         assert isinstance(outcome, BarrierProceed)
+    finally:
+        await _finish_run(h)
+
+
+# ── 子代理完成：结果交付前并入父作用域 ────────────────────────────────
+
+
+async def _dispatch_subagent(
+    h: BridgeHarness, *, workspace: str = "writer", agent_id: str = "agent-1"
+) -> str:
+    """派发一个 writer/reader 子代理并回填子会话映射，返回子工作区路径。"""
+    outcome = await h.coord.submit_dispatch_barrier(
+        "ses-exec",
+        "dispatch",
+        {"tool_name": "Task", "tool_use_id": "toolu-1", "prompt_id": "msg-1"},
+        runtime="claude_sdk",
+        workspace=workspace,
+    )
+    assert isinstance(outcome, BarrierProceed) and outcome.child_cwd
+    await h.coord.record_subagent_start(
+        "ses-exec", {"agent_id": agent_id, "parent_tool_use_id": "toolu-1"}
+    )
+    return outcome.child_cwd
+
+
+async def _scope_states(h: BridgeHarness) -> dict[str, str]:
+    """run 内全部作用域的状态表。"""
+    return {s["scope_id"]: s["state"] for s in await h.coord.list_run_scopes(h.run_id)}
+
+
+async def test_writer_subagent_completion_integrates_into_parent_scope(tmp_path: Path) -> None:
+    """writer 子代理完成：子分支并入父作用域、产出在父工作区可见、子工作区释放、terminal 行落账。"""
+    h = await _setup_run(tmp_path)
+    try:
+        child_cwd = await _dispatch_subagent(h)
+        (Path(child_cwd) / "design" / "from-child.md").write_text("child\n", encoding="utf-8")
+
+        await h.coord.settle_subagent_result("ses-exec", {"agent_id": "agent-1"})
+        await h.coord.settle_subagent_result("ses-exec", {"agent_id": "agent-1"})  # 重复回执幂等
+
+        node_workspace = next(
+            s["workspace_path"]
+            for s in await h.coord.list_run_scopes(h.run_id)
+            if s["scope_id"] == "node-a"
+        )
+        assert (Path(node_workspace) / "design" / "from-child.md").read_text(
+            encoding="utf-8"
+        ) == "child\n"
+        # 并入发生在父作用域分支上：父分支头即子作用域的集成提交
+        parent_head_subject = subprocess.run(
+            ["git", "log", "-1", "--format=%s"],
+            cwd=node_workspace,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert parent_head_subject == "integrate node-a-c1"
+        assert not Path(child_cwd).exists()
+        assert (await _scope_states(h))["node-a-c1"] == "released"
+        checkpoints = CheckpointStore(h.store.db_path)
+        rows = await checkpoints.list_for_scope("node-a-c1")
+        checkpoints.close()
+        assert [row.trigger.value for row in rows] == ["terminal"]
+        assert rows[0].parent_scope_id == "node-a"
+        assert len(rows[0].workspace_commit) == 40
+        assert rows[0].orchestration_state_ref.startswith("driver-snapshot:")
+    finally:
+        await _finish_run(h)
+
+
+async def test_reader_subagent_completion_releases_snapshot_workspace(tmp_path: Path) -> None:
+    """reader 子代理完成：快照工作区释放，作用域按废弃换代、永不集成。"""
+    h = await _setup_run(tmp_path)
+    try:
+        reader_cwd = await _dispatch_subagent(h, workspace="reader")
+        assert Path(reader_cwd).is_dir()
+
+        await h.coord.settle_subagent_result("ses-exec", {"agent_id": "agent-1"})
+
+        assert not Path(reader_cwd).exists()
+        assert (await _scope_states(h))["node-a-c1"] == "discarded"
+        assert not h.run_events(h.run_id, "fault.workspace_conflict")
+    finally:
+        await _finish_run(h)
+
+
+async def test_subagent_completion_conflict_emits_fault_and_keeps_workspace(
+    tmp_path: Path,
+) -> None:
+    """集成被拒：落 fault.workspace_conflict，子工作区与子分支保留，入口照常返回。"""
+    h = await _setup_run(tmp_path)
+    try:
+        child_cwd = await _dispatch_subagent(h)
+        node_workspace = next(
+            s["workspace_path"]
+            for s in await h.coord.list_run_scopes(h.run_id)
+            if s["scope_id"] == "node-a"
+        )
+        (Path(node_workspace) / "design" / "base.md").write_text("parent edit\n", encoding="utf-8")
+        (Path(child_cwd) / "design" / "base.md").write_text("child edit\n", encoding="utf-8")
+
+        await h.coord.settle_subagent_result("ses-exec", {"agent_id": "agent-1"})
+
+        events = h.run_events(h.run_id, "fault.workspace_conflict")
+        assert len(events) == 1
+        assert events[0]["conflict_paths"] == ["design/base.md"]
+        assert events[0]["scope_id"] == "node-a-c1"
+        assert events[0]["parent_scope_id"] == "node-a"
+        assert events[0]["session_id"] == "ses-exec"
+        assert events[0]["agent_id"] == "agent-1"
+        assert Path(child_cwd).is_dir()
+        assert (Path(child_cwd) / "design" / "base.md").read_text(
+            encoding="utf-8"
+        ) == "child edit\n"
+        assert (await _scope_states(h))["node-a-c1"] == "conflicted"
+    finally:
+        await _finish_run(h)
+
+
+async def test_subagent_completion_quiesce_failure_emits_fault_and_keeps_workspace(
+    tmp_path: Path,
+) -> None:
+    """闸门不可静止：落 fault.scope_quiesce_failed，子工作区保留，入口照常返回。"""
+    h = await _setup_run(tmp_path)
+    try:
+        child_cwd = await _dispatch_subagent(h)
+        (Path(child_cwd) / "design" / "from-child.md").write_text("child\n", encoding="utf-8")
+
+        async def never_drains(_scope_id: str) -> None:
+            raise RuntimeError("后台写进程无法排空")
+
+        h.coord._workspace_trees[h.run_id].manager._drain_hook = never_drains
+        await h.coord.settle_subagent_result("ses-exec", {"agent_id": "agent-1"})
+
+        events = h.run_events(h.run_id, "fault.scope_quiesce_failed")
+        assert len(events) == 1
+        assert events[0]["agent_id"] == "agent-1"
+        assert "闸门未能静止" in events[0]["error"]
+        assert (Path(child_cwd) / "design" / "from-child.md").exists()
+        assert (await _scope_states(h))["node-a-c1"] == "active"
+    finally:
+        await _finish_run(h)
+
+
+async def test_subagent_completion_wait_window_closes_with_fault(tmp_path: Path) -> None:
+    """有界等待：超窗落 fault.scope_quiesce_failed 后放行，钩子不挂死。"""
+    slow = SlowSnapshotDriver(_hold_plan("slow"), delay_s=0.0)
+    h = await _setup_run(tmp_path, driver=slow)
+    try:
+        child_cwd = await _dispatch_subagent(h)
+        slow._delay_s = 1.0  # 收尾链里的编排快照变慢，撞上收窄后的等待窗口
+        h.coord._workspace_trees[h.run_id].barrier_wait_timeout_s = 0.05
+
+        started = time.monotonic()
+        await h.coord.settle_subagent_result("ses-exec", {"agent_id": "agent-1"})
+
+        assert time.monotonic() - started < 0.9
+        events = h.run_events(h.run_id, "fault.scope_quiesce_failed")
+        assert len(events) == 1
+        assert events[0]["agent_id"] == "agent-1"
+        assert "超窗" in events[0]["error"]
+        assert Path(child_cwd).is_dir()
     finally:
         await _finish_run(h)

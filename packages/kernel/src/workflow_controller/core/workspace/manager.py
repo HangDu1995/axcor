@@ -842,6 +842,10 @@ class WorkspaceManager:
         """查询作用域账本行。"""
         return await self._tree.get_scope(scope_id)
 
+    def is_reader_scope(self, scope_id: str) -> bool:
+        """作用域是否 reader 快照（detached 工作区，永不集成）。"""
+        return scope_id in self._reader_scopes
+
     def restore_claims(self, scope_id: str, claims: tuple[str, ...]) -> None:
         """崩溃恢复后补登记作用域的声明写路径（出生声明的账面重建）。"""
         if claims:
