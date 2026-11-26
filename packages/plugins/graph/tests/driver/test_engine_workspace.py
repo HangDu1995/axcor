@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING
 import yaml
 
 from workflow_controller.plugin.run_driver import (
+    ReadArtifact,
+    RestartSession,
     RunNotification,
     RunSessionInfo,
     SessionActivated,
@@ -43,7 +45,20 @@ from workflow_controller.plugin.workspace import (
     WorkspaceActionFailed,
 )
 
-from .test_engine import _SUB_YAML, _artifact, build_driver, decide, pick, proc_exit
+from .test_engine import (
+    _SUB_YAML,
+    _artifact,
+    activation,
+    agent_node,
+    build_driver,
+    cold_reload,
+    decide,
+    first,
+    member,
+    outcome,
+    pick,
+    proc_exit,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -391,3 +406,110 @@ def test_retry_abandons_stale_scope_before_rebuild(tmp_path: Path) -> None:
     decide(driver, (terminal_note("node=a"),))  # type: ignore[arg-type]
     decide(driver, (proc_exit("node=a/verify", 1),))
     assert driver.state.status("a") == "failed"
+
+
+# ── 冷恢复后复用：重建的活动须带回作用域映射 ────────────────────
+
+
+def test_cold_recovery_reused_executor_session_commits_and_integrates(monkeypatch, tmp_path):
+    """冷恢复后复用执行会话：先终态提交、验收随后出生，集成回执到达才 passed。"""
+    driver = build_driver(
+        tmp_path,
+        [agent_node("a", acceptance={"enabled": True, "type": "script", "script": "true"})],
+        traceback=_TRACEBACK_CFG,
+    )
+    driver.state.set_node_workspace("a", "a-w1", 1, "/tmp/ws-a")
+    driver.state.set_node_status("a", "running", session_id="s1")
+    cold_reload(driver, monkeypatch)
+    driver.prepare_recovery(running=True)
+
+    actions = decide(driver, sessions=(member("s1"),))  # 成员仍在跑：续等，不另建工作区
+    assert not pick(actions, PrepareScopeWorkspace)
+    actions = decide(driver, [outcome("s1", "completed")])
+
+    assert [terminal.scope_id for terminal in pick(actions, CommitScopeTerminal)] == ["a-w1"]
+    assert not pick(actions, StartProcess)  # 终态回执前验收不出生
+    actions = decide(driver, (terminal_note("node=a"),))  # type: ignore[arg-type]
+    assert [verify.context for verify in pick(actions, StartProcess)] == ["node=a/verify"]
+    actions = decide(driver, (proc_exit("node=a/verify", 0),))
+
+    assert [integrate.scope_id for integrate in pick(actions, IntegrateScope)] == ["a-w1"]
+    assert driver.state.status("a") == "running"
+    decide(driver, (integrated_note("node=a"),))  # type: ignore[arg-type]
+    assert driver.state.status("a") == "passed"
+
+
+def test_cold_recovery_reused_verifier_session_integrates_before_passed(monkeypatch, tmp_path):
+    """冷恢复后复用验收会话：验收通过仍经集成；终态提交早在重启前完成，不重复。"""
+    driver = build_driver(
+        tmp_path,
+        [agent_node("a", acceptance={"enabled": True, "type": "agent"})],
+        traceback=_TRACEBACK_CFG,
+    )
+    driver.state.set_node_workspace("a", "a-w1", 1, "/tmp/ws-a")
+    driver.state.set_node_status("a", "running", session_id="exec-1")
+    driver.state.set_verify_session_id("a", "verify-1")
+    cold_reload(driver, monkeypatch)
+    driver.prepare_recovery(running=True)
+
+    actions = decide(driver, sessions=(member("verify-1", "idle", "user_pause"),))
+    assert first(actions, RestartSession).session_id == "verify-1"
+    decide(driver, [activation("verify-1", "node=a/verify")])
+    actions = decide(driver, [outcome("verify-1", "completed", digest="PASS")])
+
+    assert [integrate.scope_id for integrate in pick(actions, IntegrateScope)] == ["a-w1"]
+    assert not pick(actions, CommitScopeTerminal)
+    assert driver.state.status("a") == "running"
+    decide(driver, (integrated_note("node=a"),))  # type: ignore[arg-type]
+    assert driver.state.status("a") == "passed"
+
+
+def test_cold_recovery_rerun_of_orchestrated_generator_integrates_its_scope(monkeypatch, tmp_path):
+    """冷恢复后已编排的 generator 重排：复验沿原作用域集成，不直接 passed。"""
+    driver = build_driver(
+        tmp_path,
+        [
+            {
+                "id": "gen",
+                "task_type": "generator",
+                "generator_type": "bash",
+                "command": "cat > sub.yaml",
+                "subgraph": {"output": "sub.yaml"},
+                "acceptance": {"enabled": True, "type": "script", "script": "true"},
+            }
+        ],
+        traceback=_TRACEBACK_CFG,
+    )
+    driver.state.set_node_workspace("gen", "gen-w1", 1, "/tmp/ws-gen")
+    driver.state.set_node_status("gen", "running")  # 验收进程在途时崩溃（无会话）
+    driver.state.set_subgraph_generated("gen", True)
+    cold_reload(driver, monkeypatch)
+    driver.prepare_recovery(running=True)
+
+    actions = decide(driver)  # 无在途成员：重排后已编排的 generator 短路读子图
+    assert first(actions, ReadArtifact).context == "node=gen"
+    actions = decide(driver, (_artifact("node=gen", "sub.yaml", yaml.safe_dump(_SUB_YAML)),))
+    assert first(actions, StartProcess).cwd == "/tmp/ws-gen"  # 复验仍在原作用域工作区
+    actions = decide(driver, (proc_exit("node=gen/verify", 0),))
+
+    assert [integrate.scope_id for integrate in pick(actions, IntegrateScope)] == ["gen-w1"]
+    assert driver.state.status("gen") == "running"
+    decide(driver, (integrated_note("node=gen"),))  # type: ignore[arg-type]
+    assert driver.state.status("gen") == "passed"
+
+
+def test_member_start_reusing_pooled_session_keeps_scope_mapping(tmp_path):
+    """起步复用在池成员：活动带回档案映射，完成后照常终态提交与集成。"""
+    driver = build_driver(
+        tmp_path,
+        [agent_node("a", acceptance={"enabled": False})],
+        traceback=_TRACEBACK_CFG,
+    )
+    driver.state.set_node_workspace("a", "a-w1", 1, "/tmp/ws-a")
+    driver.state.set_node_status("a", "pending", session_id="s1")
+
+    actions = decide(driver, sessions=(member("s1"),))  # 在跑成员续等，不另建工作区
+    assert not pick(actions, (PrepareScopeWorkspace, StartSession))
+    actions = decide(driver, [outcome("s1", "completed")])
+
+    assert [terminal.scope_id for terminal in pick(actions, CommitScopeTerminal)] == ["a-w1"]

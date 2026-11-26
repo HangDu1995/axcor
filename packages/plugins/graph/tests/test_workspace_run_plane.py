@@ -22,19 +22,16 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 import yaml
 
 from .run_plane_helpers import GraphRunPlaneEnv, await_run_status
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 
 def _write_traceback_workflow(tmp: Path, nodes: list[dict]) -> Path:
-    """开启工作区隔离的 bash 节点工作流。"""
+    """开启工作区隔离的节点工作流。"""
     path = tmp / "wf-traceback.yaml"
     path.write_text(
         yaml.safe_dump(
@@ -226,3 +223,84 @@ async def test_crash_recovery_rebuilds_workspace_tree_and_resumes(tmp_path: Path
     # 集成线与根检出经恢复原样：n1 产出仍在
     work_root = tmp_path / "wd"
     assert (work_root / "n1.txt").read_text(encoding="utf-8").strip() == "one"
+
+
+async def _wait_until(predicate, timeout_s: float, message: str) -> None:
+    """轮询等待条件成立，超时按给定信息判失败。"""
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        if time.monotonic() > deadline:
+            pytest.fail(message)
+        await asyncio.sleep(0.02)
+
+
+async def test_cold_recovery_reused_member_session_integrates_into_root(tmp_path: Path) -> None:
+    """进程重启后复用在途成员会话：终态提交 → 验收 → 集成照常走完。
+
+    重启后工作区树不在内存，终态提交与集成按盘上配置重建树执行；节点
+    产出进根检出、作用域工作区释放，下游从集成头建区读得到产出。
+    """
+    env = GraphRunPlaneEnv(tmp_path, auto_release=False)
+    yaml_path = _write_traceback_workflow(
+        env.tmp,
+        [
+            {
+                "id": "a",
+                "task_type": "agent",
+                "acceptance": {"enabled": True, "type": "script", "script": "test -f a.txt"},
+            },
+            {
+                "id": "b",
+                "task_type": "bash",
+                "command": "test -f a.txt && echo ok > b.txt",
+                "depends_on": ["a"],
+            },
+        ],
+    )
+    run_id = await env.start_graph_run(yaml_path=yaml_path)
+    await _wait_until(
+        lambda: env.node_info(run_id, "a")["workflow_controller_session_id"],
+        30.0,
+        "崩溃前节点 a 的成员未出生",
+    )
+    crashed = env.node_info(run_id, "a")
+    sid = crashed["workflow_controller_session_id"]
+    scope_a = crashed["workspace_scope_id"]
+    # 成员崩溃前已落在作用域工作区的产物（假会话不写文件，由测试代写）
+    (Path(crashed["workspace_path"]) / "a.txt").write_text("from-a", encoding="utf-8")
+
+    # 模拟 kill -9：弃置环境（无 stop 收尾）；重启后成员从持久层恢复为可续跑的暂停态
+    rebooted = GraphRunPlaneEnv(tmp_path)
+    rebooted.so.restore_paused_session(sid)
+    await rebooted.recover()
+    resumed = rebooted.so.sessions[sid]
+    await _wait_until(lambda: resumed.state.value == "running", 30.0, "恢复后成员会话未被续跑")
+    assert await rebooted.coord.list_run_scopes(run_id) == []  # 工作区树不在内存
+
+    rebooted.so.release_all()
+    await _wait_until(
+        lambda: rebooted.node_info(run_id, "b")["status"] != "pending",
+        60.0,
+        "恢复后 a 未收口、下游 b 未起步",
+    )
+    work_root = tmp_path / "wd"
+    assert (work_root / "a.txt").read_text(encoding="utf-8") == "from-a"
+    scope_states = {
+        scope["scope_id"]: scope["state"] for scope in await rebooted.coord.list_run_scopes(run_id)
+    }
+    assert scope_states.get(scope_a) in ("integrated", "released")
+    assert not Path(crashed["workspace_path"]).exists()  # 集成后工作区释放
+
+    run = await await_run_status(rebooted, run_id, {"completed"})
+    assert run.status == "completed"
+    assert (work_root / "b.txt").read_text(encoding="utf-8").strip() == "ok"
+    assert rebooted.node_info(run_id, "a")["status"] == "passed"
+    assert rebooted.node_info(run_id, "b")["status"] == "passed"
+    with sqlite3.connect(rebooted.store.db_path) as conn:
+        triggers = {
+            row[0]
+            for row in conn.execute(
+                "SELECT trigger FROM scope_checkpoints WHERE scope_id = ?", (scope_a,)
+            )
+        }
+    assert triggers == {"scope_start", "terminal"}

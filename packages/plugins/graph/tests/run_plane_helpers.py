@@ -107,6 +107,14 @@ class FakeAgentSession:
         self.loop_status = "no"
         self.finished.set()
 
+    def pause(self) -> None:
+        """落用户暂停态（可续跑的断点）。"""
+        self.state.value = "idle"
+        self.state.name = "IDLE"
+        self.stop_reason = "user_pause"
+        self.pause_requested = True
+        self.loop_status = "no"
+
 
 class FakeRunSO:
     """编排器替身：成员 session 出生与终态事件 + 协调器消费的谓词面。"""
@@ -182,37 +190,40 @@ class FakeRunSO:
                 data={"ok": True, "error": None},
             )
         )
-
-        async def _conclude_and_report() -> None:
-            await session.conclude()
-            await self.bus.emit(
-                Event.create(
-                    session_id=sid,
-                    iteration=1,
-                    event_type=EventType.SESSION_OUTCOME,
-                    data=SessionOutcome(
-                        session_id=sid,
-                        kind="completed",
-                        stop_reason="reviewer_complete",
-                        last_error=None,
-                        result_digest="done",
-                        iteration=1,
-                        context=None,
-                    ).to_payload(),
-                )
-            )
-
-        asyncio.get_running_loop().create_task(_conclude_and_report())
+        asyncio.get_running_loop().create_task(self._report_outcome(session))
         return session
+
+    def restore_paused_session(self, sid: str) -> None:
+        """模拟重启后从持久层恢复出的用户暂停成员：留在池内可续跑，放行后落终态。"""
+        session = FakeAgentSession(sid, asyncio.Event())
+        session.pause()
+        self.sessions[sid] = session
+        asyncio.get_running_loop().create_task(self._report_outcome(session))
+
+    async def _report_outcome(self, session: FakeAgentSession) -> None:
+        """成员放行后落 completed 终态并回投结局事件。"""
+        await session.conclude()
+        await self.bus.emit(
+            Event.create(
+                session_id=session.id,
+                iteration=1,
+                event_type=EventType.SESSION_OUTCOME,
+                data=SessionOutcome(
+                    session_id=session.id,
+                    kind="completed",
+                    stop_reason="reviewer_complete",
+                    last_error=None,
+                    result_digest="done",
+                    iteration=1,
+                    context=None,
+                ).to_payload(),
+            )
+        )
 
     async def pause_session(self, sid: str) -> None:
         session = self.sessions.get(sid)
         if session is not None and session.loop_status == "yes":
-            session.loop_status = "no"
-            session.state.value = "idle"
-            session.state.name = "IDLE"
-            session.stop_reason = "user_pause"
-            session.pause_requested = True
+            session.pause()
             await self.bus.emit(
                 Event.create(
                     session_id=sid,
@@ -426,9 +437,10 @@ class GraphRunPlaneEnv:
         return self.driver_of(run_id).state.snapshot()["nodes"][node_id]
 
     async def recover(self) -> None:
-        """模拟重启后的 run 平面恢复（boot 时序里的 recover_at_boot）。"""
+        """模拟重启后的恢复（boot 时序）：归属缓存先重建，再恢复 run。"""
         if self.coord is None:
             raise RuntimeError("coord 未初始化（需先经 run 平面装配）")
+        await self.affiliation.rebuild()
         await self.coord.recover_at_boot()
 
 

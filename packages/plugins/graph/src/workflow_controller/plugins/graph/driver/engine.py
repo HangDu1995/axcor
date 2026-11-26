@@ -1890,6 +1890,8 @@ class GraphDriver:
         ):
             return False
         act = NodeActivity(node_id=node_id, phase=_PHASE_SUB_READ, attempt=attempt)
+        # 已编排的 generator 沿用原作用域：执行与终态提交已在其中完成
+        self._backfill_workspace_mapping(act)
         self._nodes[node_id] = act
         if merged:
             self._enter_verify(act, actions)
@@ -1920,6 +1922,9 @@ class GraphDriver:
         self._nodes[node_id] = act
         if reuse_sid is None:
             return None
+        # 仅复用分支回填：全新执行的工作区由后续建区动作建立、回执再填映射，
+        # 提前回填会让建区判定误以为工作区已在位
+        self._backfill_workspace_mapping(act)
         act.max_continues = 0
         act.session_id = reuse_sid
         info = self._world_session(world, reuse_sid)
@@ -3909,6 +3914,13 @@ class GraphDriver:
         mapping = self._state.node_workspace(node_id)
         return mapping[2] if mapping is not None else None
 
+    def _backfill_workspace_mapping(self, act: NodeActivity) -> None:
+        """把节点档案的作用域映射回填到重建的活动（缺了映射会跳过终态提交与集成）。"""
+        mapping = self._state.node_workspace(act.node_id)
+        if mapping is None:
+            return
+        act.workspace_scope_id, act.workspace_scope_epoch, act.workspace_path = mapping
+
     def _member_spec(
         self,
         *,
@@ -4063,7 +4075,7 @@ class GraphDriver:
         return None
 
     def _reuse_activity(self, node_id: str, session_id: str) -> NodeActivity:
-        """为 stopped 节点重建等待活动（组恢复/成员恢复的续跑面）。"""
+        """为 stopped 节点重建等待活动（组恢复/成员恢复的续跑面），带回档案里的作用域映射。"""
         act = self._nodes.get(node_id)
         if act is not None:
             return act
@@ -4077,6 +4089,7 @@ class GraphDriver:
             # 复用路径保持原超时语义：不续跑，超时即失败
             max_continues=0,
         )
+        self._backfill_workspace_mapping(act)
         self._nodes[node_id] = act
         return act
 
