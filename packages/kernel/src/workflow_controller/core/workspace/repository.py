@@ -165,6 +165,10 @@ class WorkspaceRepository:
         """作用域键的默认工作区目录（目录名取转义键，作用域键原样保留）。"""
         return self.workspaces_dir / _escape_scope_key(scope_key)
 
+    def scope_branch_for(self, scope_key: str) -> str:
+        """作用域键对应的作用域分支名（建区与建区意图落账共用同一映射）。"""
+        return f"{_SCOPE_BRANCH_PREFIX}{_escape_scope_key(scope_key)}"
+
     async def import_baseline(self, *, writer_local_pathspecs: Sequence[str]) -> RootRefs:
         """导入基线并建立根双引用；私有仓已存在或 git 缺席时拒绝。"""
         if shutil.which("git") is None:
@@ -205,7 +209,7 @@ class WorkspaceRepository:
         """
         if not scope_key or "/" in scope_key:
             raise WorkspaceRepositoryError(f"非法 scope_key：{scope_key!r}")
-        branch = f"{_SCOPE_BRANCH_PREFIX}{_escape_scope_key(scope_key)}"
+        branch = self.scope_branch_for(scope_key)
         workspace_path = (
             workspace_dir if workspace_dir is not None else self.workspace_dir_for(scope_key)
         )
@@ -316,7 +320,7 @@ class WorkspaceRepository:
         if workspace_dir.exists():
             with contextlib.suppress(WorkspaceRepositoryError):
                 await self._run_repo_git(["worktree", "remove", "--force", str(workspace_dir)])
-        prefix = f"{_SCOPE_BRANCH_PREFIX}{_escape_scope_key(scope_key)}"
+        prefix = self.scope_branch_for(scope_key)
         out = await self._run_repo_git(
             ["for-each-ref", "--format=%(refname:short)", f"refs/heads/{prefix}"]
         )

@@ -19,8 +19,9 @@
 取最新、状态按「工作区在盘 / 分支进过集成线 / 其余已废弃」推断、
 claims 从行内声明列重建、属主从操作日志的建区意图回填。随后对操作
 日志做三态核对：意图未生效可放弃、已写只补账（集成线回退的引用推进
-幂等重做）、对不上账显式失败（分叉即停，绝不自动回退）。做不到全量
-恢复的边角在报告中显式降级，不静默。
+幂等重做）、对不上账显式失败（分叉即停，绝不自动回退）。每条操作按
+其种类与阶段在所在的引用上核对。做不到全量恢复的边角在报告中显式
+降级，不静默。
 """
 
 from __future__ import annotations
@@ -62,10 +63,11 @@ __all__ = [
     "rebuild_workspace_tree",
 ]
 
-# 集成线回退在操作日志中的操作种类词面（与 manager 记账一致）
+# 操作日志中的操作种类词面（与 manager 记账一致）
 _RETRACT_OP_KIND = "retract_integration_line"
-# 建区在操作日志中的操作种类词面（属主随建区意图持久化）
 _PREPARE_OP_KIND = "prepare_scope_workspace"
+_INTEGRATE_OP_KIND = "integrate_scope"
+_RESTORE_OP_KIND = "restore_scope"
 
 
 class WorkspaceRecoveryError(RuntimeError):
@@ -134,7 +136,8 @@ async def rebuild_workspace_tree(
         repository=repository,
         integration=integration,
         manager=manager,
-        head=head,
+        root_scope_id=root_scope_id,
+        scope_branches=_scope_branches(records),
         report=report,
     )
     for record in records:
@@ -277,16 +280,28 @@ def _infer_root_epoch(records: Sequence[ScopeRecord], operations: Sequence[SagaO
     return epoch
 
 
+def _scope_branches(records: Sequence[ScopeRecord]) -> dict[str, str]:
+    """重建账本内各作用域的分支名（工作区引用的分支段；根检出与 reader 快照没有）。"""
+    return {
+        record.scope_id: branch
+        for record in records
+        if record.scope_kind is not ScopeKind.ROOT
+        if record.workspace_ref
+        if (branch := record.workspace_ref.rpartition("|")[2])
+    }
+
+
 async def _reconcile_oplog(
     *,
     oplog: SagaOplog,
     repository: WorkspaceRepository,
     integration: IntegrationCoordinator,
     manager: WorkspaceManager,
-    head: str,
+    root_scope_id: str,
+    scope_branches: Mapping[str, str],
     report: WorkspaceRecoveryReport,
 ) -> None:
-    """操作日志三态核对：未生效放弃、已写补账、分叉即停。"""
+    """操作日志三态核对：在操作所在的引用上取实测头，未生效放弃、已写补账、分叉即停。"""
     for operation in await oplog.pending_operations():
         if operation.op_kind == _RETRACT_OP_KIND:
             await _reconcile_retract(
@@ -298,9 +313,15 @@ async def _reconcile_oplog(
                 report=report,
             )
             continue
+        ref, current_head = await _resolve_operation_head(
+            operation,
+            repository=repository,
+            root_scope_id=root_scope_id,
+            scope_branches=scope_branches,
+        )
         decision = await oplog.resolve(
             operation.client_op_id,
-            current_head=head,
+            current_head=current_head,
             read_commit=integration.read_commit_facts,
         )
         if decision.action is RecoveryAction.RETRY_SAFE:
@@ -311,9 +332,66 @@ async def _reconcile_oplog(
             report.completed_op_ids.append(operation.client_op_id)
         else:
             raise WorkspaceRecoveryError(
-                f"操作 {operation.client_op_id}（{operation.op_kind}）与集成线对不上账："
+                f"操作 {operation.client_op_id}（{operation.op_kind}）与引用 {ref} 对不上账："
                 f"{decision.detail}"
             )
+
+
+def _operation_ref(
+    operation: SagaOperation,
+    *,
+    root_scope_id: str,
+    scope_branches: Mapping[str, str],
+) -> str | None:
+    """操作对账所在的引用：已写阶段是新头所在的引用，意图阶段是旧头所在的引用。
+
+    建区的新头落在新作用域的分支（取自建区意图），旧头在父作用域；集成
+    的新旧头都在父作用域（父为根即集成线）；恢复的新旧头都在作用域自己
+    的分支。定位不出返回 None。
+    """
+    metadata = operation.metadata
+    if operation.op_kind == _RESTORE_OP_KIND:
+        return _branch_ref(scope_branches.get(str(metadata.get("scope_id"))))
+    if operation.op_kind == _PREPARE_OP_KIND and operation.phase is OperationPhase.GIT_WRITTEN:
+        return _branch_ref(cast("str | None", metadata.get("branch")))
+    if operation.op_kind in (_PREPARE_OP_KIND, _INTEGRATE_OP_KIND):
+        parent_scope_id = metadata.get("parent_scope_id")
+        if parent_scope_id == root_scope_id:
+            return ROOT_INTEGRATION_REF
+        return _branch_ref(scope_branches.get(str(parent_scope_id)) if parent_scope_id else None)
+    return None
+
+
+def _branch_ref(branch: str | None) -> str | None:
+    """作用域分支名转为完整引用名；没有分支返回 None。"""
+    return f"refs/heads/{branch}" if branch else None
+
+
+async def _resolve_operation_head(
+    operation: SagaOperation,
+    *,
+    repository: WorkspaceRepository,
+    root_scope_id: str,
+    scope_branches: Mapping[str, str],
+) -> tuple[str, str]:
+    """取操作所在引用的实测头，返回 (引用名, 头)。
+
+    引用定位不出（操作种类未知、意图缺分支、作用域不在重建的账本内）
+    或引用已被删除时无从核对，也不能证明操作未生效：显式失败，不按
+    放弃或分叉处理。
+    """
+    ref = _operation_ref(operation, root_scope_id=root_scope_id, scope_branches=scope_branches)
+    if ref is None:
+        raise WorkspaceRecoveryError(
+            f"操作 {operation.client_op_id}（{operation.op_kind}）所在引用无法定位"
+            "（操作种类未知、意图缺分支或作用域不在重建的账本内）：停止恢复"
+        )
+    current_head = await repository.resolve_ref(ref)
+    if current_head is None:
+        raise WorkspaceRecoveryError(
+            f"操作 {operation.client_op_id}（{operation.op_kind}）所在引用不存在：{ref}：停止恢复"
+        )
+    return ref, current_head
 
 
 async def _reconcile_retract(

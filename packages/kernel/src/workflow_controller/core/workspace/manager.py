@@ -186,6 +186,7 @@ class WorkspaceManager:
         if existing is not None and existing.state is not ScopeState.DISCARDED:
             raise WorkspaceManagerError(f"作用域标识已被占用：{request.scope_key}")
         epoch = existing.scope_epoch if existing is not None else INITIAL_EPOCH
+        workspace_scope_key = f"{request.scope_key}-e{epoch}" if epoch > 1 else request.scope_key
 
         claims = tuple(request.spec.claims)
         if claims and self._claims_enforce:
@@ -216,11 +217,11 @@ class WorkspaceManager:
                     "scope_id": request.scope_key,
                     "parent_scope_id": parent.scope_id,
                     "owner_ref": request.spec.owner_ref,
+                    "branch": self._repository.scope_branch_for(workspace_scope_key),
                 },
             )
             workspace = await self._create_workspace_guarded(
-                scope_id=request.scope_key,
-                epoch=epoch,
+                workspace_scope_key=workspace_scope_key,
                 base=base,
                 materialize_from=materialize_from,
                 materialize_specs=materialize_specs,
@@ -903,8 +904,7 @@ class WorkspaceManager:
     async def _create_workspace_guarded(
         self,
         *,
-        scope_id: str,
-        epoch: int,
+        workspace_scope_key: str,
         base: str,
         materialize_from: str | None,
         materialize_specs: tuple[str, ...],
@@ -912,7 +912,6 @@ class WorkspaceManager:
         workspace_dir: Path | None = None,
     ) -> ScopeWorkspace:
         """建区失败即清理半成品工作区并放弃操作意图，异常原样上抛。"""
-        workspace_scope_key = f"{scope_id}-e{epoch}" if epoch > 1 else scope_id
         try:
             return await self._repository.create_scope_workspace(
                 workspace_scope_key,

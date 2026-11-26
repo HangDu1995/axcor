@@ -16,7 +16,7 @@
 
 现场以真实 git 与检查点账构造「已集成 / 已释放 / 活动 / 已废弃」四类
 作用域后丢弃内存账本，断言重建结果、回退崩溃补账（reset 后 epoch 落账
-前）、未生效放弃与分叉即停。
+前）、未生效放弃与分叉即停；建区、恢复、集成按各自所在的引用对账。
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from workflow_controller.core.workspace.actions import (
 from workflow_controller.core.workspace.integration import IntegrationCoordinator
 from workflow_controller.core.workspace.manager import RetractTarget, WorkspaceManager
 from workflow_controller.core.workspace.manifest import WorkspaceManifest
-from workflow_controller.core.workspace.oplog import SagaOplog
+from workflow_controller.core.workspace.oplog import OperationPhase, SagaOperation, SagaOplog
 from workflow_controller.core.workspace.recovery import (
     WorkspaceRecoveryError,
     rebuild_workspace_tree,
@@ -55,6 +55,8 @@ from workflow_controller.core.workspace.scope_tree import ScopeKind, ScopeState,
 from ._support import FakeOrchestrator, build_workspace, run_git
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from workflow_controller.core.workspace.recovery import WorkspaceRecoveryReport
 
 _ROOT_SCOPE_ID = "run-1-root"
@@ -68,7 +70,9 @@ class _CrashSite:
         self.orchestrator = FakeOrchestrator(self.manager)
         self.db_path = tmp_path / "events.db"
         self.checkpoints = CheckpointStore(self.db_path)
+        # bases：建区时的集成头；scope_bases：作用域自己的建区基线提交
         self.bases: dict[str, str] = {}
+        self.scope_bases: dict[str, str] = {}
         self._row_seq = 0
 
     async def build(self) -> None:
@@ -89,16 +93,26 @@ class _CrashSite:
         await self.orchestrator.abandon("node-w3", 1)  # 废弃：工作区无、未进线
         # node-w2 保持活动（工作区在盘）
 
-    async def prepare(self, key: str, *, claims: tuple[str, ...] = ()) -> Path:
-        prepared = await self.orchestrator.prepare(key, claims=claims)
+    async def prepare(
+        self,
+        key: str,
+        *,
+        parent_scope_id: str | None = None,
+        scope_kind: ScopeKind = ScopeKind.MAIN_WRITER,
+        claims: tuple[str, ...] = (),
+    ) -> Path:
+        prepared = await self.orchestrator.prepare(
+            key, parent_scope_id=parent_scope_id, scope_kind=scope_kind, claims=claims
+        )
         self.bases[key] = prepared.integration_base_commit
+        self.scope_bases[key] = prepared.base_commit
         self._row_seq += 1
         await self.checkpoints.record(
             ScopeCheckpoint(
                 checkpoint_id=f"{key}:scope_start:e1",
                 scope_id=key,
-                scope_kind=ScopeKind.MAIN_WRITER,
-                parent_scope_id=_ROOT_SCOPE_ID,
+                scope_kind=scope_kind,
+                parent_scope_id=parent_scope_id or _ROOT_SCOPE_ID,
                 scope_epoch=1,
                 root_epoch=1,
                 trigger=CheckpointTrigger.SCOPE_START,
@@ -126,6 +140,29 @@ class _CrashSite:
             expected_root_epoch=1,
             client_op_id="retract-crash",
         )
+
+    async def pending_op(self) -> SagaOperation:
+        """崩溃现场唯一挂起的操作。"""
+        [operation] = await SagaOplog(self.repository.tree_dir).pending_operations()
+        return operation
+
+    async def crash_at(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        target: type,
+        step: str,
+        action: Callable[[], Awaitable[object]],
+    ) -> SagaOperation:
+        """把指定步骤换成抛错来模拟进程崩溃，返回崩溃后挂起的操作。"""
+
+        async def exploding(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("崩溃注入")
+
+        monkeypatch.setattr(target, step, exploding)
+        with pytest.raises(RuntimeError, match="崩溃注入"):
+            await action()
+        monkeypatch.undo()
+        return await self.pending_op()
 
     async def rebuild(self) -> tuple[WorkspaceManager, WorkspaceRecoveryReport]:
         """丢弃内存账本后以全新部件重建（重开/崩溃后的树运行时再生）。"""
@@ -337,12 +374,216 @@ async def test_recovery_abandons_uneffective_prepared_op(tmp_path: Path) -> None
         expected_old_head=head or "",
         scope_epoch=1,
         root_epoch=1,
+        metadata={"scope_id": "node-w2", "parent_scope_id": _ROOT_SCOPE_ID},
     )
 
     _manager, report = await site.rebuild()
 
     assert report.abandoned_op_ids == ["stale-integrate"]
     assert report.completed_op_ids == []
+
+
+@pytest.mark.parametrize("abandoned_before", [False, True], ids=["first-attempt", "rebuilt"])
+async def test_recovery_completes_prepare_written_before_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, abandoned_before: bool
+) -> None:
+    """建区崩溃在已记新头后、账本落账前：按作用域分支核对补账，不误报分叉。
+
+    废弃后同键重建（rebuilt）的新工作区按代次另起分支，账上只剩上一代的
+    检查点行，分支名只能取自建区意图。
+    """
+    site = _CrashSite(tmp_path)
+    await site.build()
+    key = "node-new"
+    if abandoned_before:
+        await site.prepare(key)
+        await site.orchestrator.abandon(key, 1)
+    ledger_step = "begin_attempt" if abandoned_before else "create_child_scope"
+
+    operation = await site.crash_at(
+        monkeypatch, ScopeTree, ledger_step, lambda: site.orchestrator.prepare(key)
+    )
+    assert operation.phase is OperationPhase.GIT_WRITTEN
+
+    _manager, report = await site.rebuild()
+
+    assert report.completed_op_ids == [operation.client_op_id]
+    assert report.abandoned_op_ids == []
+
+
+async def test_recovery_abandons_prepare_before_new_head_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """子作用域建区崩溃在工作区建成、新头未记时：父作用域分支头仍是旧头，判未生效放弃。"""
+    site = _CrashSite(tmp_path)
+    await site.build()
+    operation = await site.crash_at(
+        monkeypatch,
+        SagaOplog,
+        "record_new_head",
+        lambda: site.orchestrator.prepare(
+            "node-w2-c1", parent_scope_id="node-w2", scope_kind=ScopeKind.SUBAGENT
+        ),
+    )
+    assert operation.phase is OperationPhase.PREPARED
+
+    _manager, report = await site.rebuild()
+
+    assert report.abandoned_op_ids == [operation.client_op_id]
+    assert report.completed_op_ids == []
+
+
+@pytest.mark.parametrize("written", [False, True], ids=["before-reset", "after-record"])
+async def test_recovery_reconciles_restore_against_scope_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, written: bool
+) -> None:
+    """组检查点恢复按作用域自己的分支对账：reset 前崩溃判未生效放弃，已记新头只补账。"""
+    site = _CrashSite(tmp_path)
+    await site.build()
+    crash_target = ScopeTree if written else WorkspaceRepository
+    crash_step = "restore_scope" if written else "reset_workspace_state"
+
+    operation = await site.crash_at(
+        monkeypatch,
+        crash_target,
+        crash_step,
+        lambda: site.manager.restore_scope(
+            "node-w2",
+            restore_commit=site.scope_bases["node-w2"],
+            expected_scope_epoch=1,
+            client_op_id="restore-crash",
+        ),
+    )
+    assert operation.phase is (OperationPhase.GIT_WRITTEN if written else OperationPhase.PREPARED)
+
+    _manager, report = await site.rebuild()
+
+    assert report.completed_op_ids == (["restore-crash"] if written else [])
+    assert report.abandoned_op_ids == ([] if written else ["restore-crash"])
+
+
+@pytest.mark.parametrize("under_scope", [False, True], ids=["parent-root", "parent-scope"])
+@pytest.mark.parametrize(
+    ("crash_target", "crash_step", "phase", "completed"),
+    [
+        (IntegrationCoordinator, "integrate_writer", OperationPhase.PREPARED, False),
+        (SagaOplog, "record_new_head", OperationPhase.PREPARED, True),
+        (SagaOplog, "commit", OperationPhase.GIT_WRITTEN, True),
+    ],
+    ids=["before-commit", "after-commit", "after-record"],
+)
+async def test_recovery_reconciles_integration_against_parent_ref(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    under_scope: bool,
+    crash_target: type,
+    crash_step: str,
+    phase: OperationPhase,
+    completed: bool,
+) -> None:
+    """集成按父作用域的引用对账（父为根即集成线）。
+
+    未落提交判未生效放弃；落了提交未记新头按判据补记新头；已记新头只补账。
+    """
+    site = _CrashSite(tmp_path)
+    await site.build()
+    key = "node-w2"
+    if under_scope:
+        key = "node-w2-c1"
+        ws_child = await site.prepare(key, parent_scope_id="node-w2", scope_kind=ScopeKind.SUBAGENT)
+        (ws_child / "design" / "c1.md").write_text("from-c1\n", encoding="utf-8")
+
+    operation = await site.crash_at(
+        monkeypatch, crash_target, crash_step, lambda: site.orchestrator.integrate(key)
+    )
+    assert operation.phase is phase
+
+    _manager, report = await site.rebuild()
+
+    assert report.completed_op_ids == ([operation.client_op_id] if completed else [])
+    assert report.abandoned_op_ids == ([] if completed else [operation.client_op_id])
+
+
+@pytest.mark.parametrize(
+    ("op_kind", "ref"),
+    [("prepare", "refs/heads/scope/node-fork"), ("integrate", ROOT_INTEGRATION_REF)],
+)
+async def test_recovery_reports_fork_on_operation_ref_without_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, op_kind: str, ref: str
+) -> None:
+    """操作所在引用的头被后续提交推进：停止并报告分叉，不补账、不回退。"""
+    site = _CrashSite(tmp_path)
+    await site.build()
+    if op_kind == "prepare":
+        operation = await site.crash_at(
+            monkeypatch,
+            ScopeTree,
+            "create_child_scope",
+            lambda: site.orchestrator.prepare("node-fork"),
+        )
+    else:
+        operation = await site.crash_at(
+            monkeypatch, SagaOplog, "commit", lambda: site.orchestrator.integrate("node-w2")
+        )
+    head = await site.repository.resolve_ref(ref)
+    fork = run_git(
+        ["commit-tree", f"{head}^{{tree}}", "-p", head or "", "-m", "forked by stranger"],
+        site.repository.repo_dir,
+    ).strip()
+    run_git(["update-ref", ref, fork], site.repository.repo_dir)
+
+    with pytest.raises(WorkspaceRecoveryError, match="分叉") as excinfo:
+        await site.rebuild()
+
+    assert ref in str(excinfo.value)
+    # 引用仍停在被推进后的提交上，已记新头原样保留
+    assert await site.repository.resolve_ref(ref) == fork
+    reloaded = await SagaOplog(site.repository.tree_dir).get(operation.client_op_id)
+    assert reloaded is not None
+    assert reloaded.phase is OperationPhase.GIT_WRITTEN
+    assert reloaded.actual_new_head == operation.actual_new_head
+
+
+async def test_recovery_stops_when_operation_branch_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """已写建区的作用域分支被删除：无从核对，显式失败，不按分叉或放弃处理。"""
+    site = _CrashSite(tmp_path)
+    await site.build()
+    operation = await site.crash_at(
+        monkeypatch,
+        ScopeTree,
+        "create_child_scope",
+        lambda: site.orchestrator.prepare("node-gone"),
+    )
+    # 同键残留清理会一并删掉工作树与分支
+    await site.repository.prune_scope_residue(
+        site.repository.workspaces_dir / "node-gone", "node-gone"
+    )
+
+    with pytest.raises(WorkspaceRecoveryError, match="引用不存在") as excinfo:
+        await site.rebuild()
+
+    assert "refs/heads/scope/node-gone" in str(excinfo.value)
+    reloaded = await SagaOplog(site.repository.tree_dir).get(operation.client_op_id)
+    assert reloaded is not None
+    assert reloaded.phase is OperationPhase.GIT_WRITTEN
+
+
+async def test_recovery_stops_when_operation_ref_cannot_be_located(tmp_path: Path) -> None:
+    """操作意图定位不到所在引用（缺父作用域、作用域不在账本内）：显式失败。"""
+    site = _CrashSite(tmp_path)
+    await site.build()
+    await SagaOplog(site.repository.tree_dir).begin(
+        client_op_id="orphan-integrate",
+        op_kind="integrate_scope",
+        expected_old_head="h0",
+        scope_epoch=1,
+        root_epoch=1,
+    )
+
+    with pytest.raises(WorkspaceRecoveryError, match="无法定位"):
+        await site.rebuild()
 
 
 async def test_recovery_reports_fork_and_stops(
