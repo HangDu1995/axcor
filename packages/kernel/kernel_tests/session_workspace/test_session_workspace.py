@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 
+import workflow_controller.core.session_workspace as session_workspace
 from workflow_controller.config.settings import SessionTracebackConfig
 from workflow_controller.core.checkpoints import CheckpointStore
 from workflow_controller.core.runs import RunStore
@@ -97,6 +98,17 @@ class Harness:
     def tree_dir(self, session_id: str) -> Path:
         """会话树目录。"""
         return self.original / ".workflow-controller" / "scopes" / session_id
+
+    def reopened_host(self) -> SessionWorkspaceHost:
+        """注册表丢失后的新宿主装配（模拟重开）。"""
+        return SessionWorkspaceHost(
+            checkpoint_db_path=lambda: self.db_path,
+            resolve_session=self._resolve_session,
+            persist_session=self._persist_session,
+            stop_session=self._stop_session,
+            start_resumed_session=self._start_resumed_session,
+            transcript_locator=self._locate_transcript,
+        )
 
     def restore_seed_dir(self, session_id: str, client_op_id: str) -> Path:
         """对话恢复种子的落点（树目录下按恢复操作号分目录）。"""
@@ -301,14 +313,7 @@ async def test_crash_reopen_recovers_tree(tmp_path):
     managed = h.managed_dir("sess-1")
     (managed / "design" / "base.md").write_text("in-flight\n", encoding="utf-8")
 
-    fresh_host = SessionWorkspaceHost(
-        checkpoint_db_path=lambda: h.db_path,
-        resolve_session=h._resolve_session,
-        persist_session=h._persist_session,
-        stop_session=h._stop_session,
-        start_resumed_session=h._start_resumed_session,
-        transcript_locator=h._locate_transcript,
-    )
+    fresh_host = h.reopened_host()
     await fresh_host.prepare_session(session)
 
     assert Path(session.config.cwd) == managed
@@ -339,14 +344,7 @@ async def test_crash_window_between_prepare_and_checkpoint_row(tmp_path):
     conn.commit()
     conn.close()
 
-    fresh_host = SessionWorkspaceHost(
-        checkpoint_db_path=lambda: h.db_path,
-        resolve_session=h._resolve_session,
-        persist_session=h._persist_session,
-        stop_session=h._stop_session,
-        start_resumed_session=h._start_resumed_session,
-        transcript_locator=h._locate_transcript,
-    )
+    fresh_host = h.reopened_host()
     await fresh_host.prepare_session(session)
 
     assert Path(session.config.cwd) == h.managed_dir("sess-1")
@@ -355,6 +353,38 @@ async def test_crash_window_between_prepare_and_checkpoint_row(tmp_path):
         r for r in await fresh_host.list_checkpoints("sess-1") if r["scope_id"] == "sess-1-main"
     ]
     assert len(rows) == 1  # 重建后的新 scope_start 行
+
+
+async def test_reopen_after_terminal_integration_rebuilds_main_writer(tmp_path, monkeypatch):
+    """终态集成后、同步前崩溃重开：主写者按已集成重建，废弃后在当前头重建，收口照常。"""
+    h = Harness(tmp_path)
+    await h.migrate()
+    session = h.add_session("sess-1")
+    await h.host.prepare_session(session)
+    (h.managed_dir("sess-1") / "design" / "base.md").write_text("terminal\n", encoding="utf-8")
+
+    async def crashing(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("崩溃注入：集成后、同步前")
+
+    monkeypatch.setattr(session_workspace, "sync_terminal_to_original", crashing)
+    with pytest.raises(RuntimeError, match="崩溃注入"):
+        await h.host.finalize_session("sess-1")
+    monkeypatch.undo()
+
+    fresh_host = h.reopened_host()
+    entry = await fresh_host.prepare_session(session)
+
+    report = entry.tree.recovery_report
+    assert report is not None and report.degraded == []  # 已集成的主写者不按活动重建
+    writer = await entry.tree.manager.get_scope(entry.tree.main_writer_scope_id)
+    assert (writer.state, writer.scope_epoch) == (ScopeState.ACTIVE, 2)  # 废弃换代后重建
+    assert (h.managed_dir("sess-1") / "design" / "base.md").read_text(
+        encoding="utf-8"
+    ) == "terminal\n"
+    # 再次收口：新代次的集成操作不与崩溃前的操作号相撞
+    synced = await fresh_host.finalize_session("sess-1")
+    assert not synced.refused
+    assert (h.original / "design" / "base.md").read_text(encoding="utf-8") == "terminal\n"
 
 
 async def test_barrier_builds_group_and_child_workspace(tmp_path, full_capability_runtime):

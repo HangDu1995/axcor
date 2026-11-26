@@ -65,11 +65,12 @@ _ROOT_SCOPE_ID = "run-1-root"
 class _CrashSite:
     """带检查点账的谱系现场：桥式落 scope_start 行（崩溃重建的事实源）。"""
 
-    def __init__(self, tmp_path: Path) -> None:
+    def __init__(self, tmp_path: Path, *, retain_after_merge: bool = False) -> None:
         self.root, self.repository, self.manager = build_workspace(tmp_path)
         self.orchestrator = FakeOrchestrator(self.manager)
         self.db_path = tmp_path / "events.db"
         self.checkpoints = CheckpointStore(self.db_path)
+        self.retain_after_merge = retain_after_merge
         # bases：建区时的集成头；scope_bases：作用域自己的建区基线提交
         self.bases: dict[str, str] = {}
         self.scope_bases: dict[str, str] = {}
@@ -130,9 +131,9 @@ class _CrashSite:
     async def integrate(self, key: str) -> None:
         outcome = await self.orchestrator.integrate(key)
         assert isinstance(outcome, ScopeIntegrated)
-        # 桥的默认收口：集成成功即释放工作区（分支保留）——重建面的
-        # 状态推断依赖此事实（工作区在盘即活动）
-        await self.manager.release_scope(key)
+        # 默认收口：集成成功即释放工作区（分支保留）；保留配置下工作区留在盘上
+        if not self.retain_after_merge:
+            await self.manager.release_scope(key)
 
     async def retract_a(self) -> None:
         await self.manager.retract_integration_line(
@@ -197,7 +198,7 @@ async def test_recovery_rebuilds_ledger_from_checkpoints_and_repo(tmp_path: Path
     manager, report = await site.rebuild()
 
     states = {r.scope_id: (r.state, r.scope_epoch) for r in await manager.list_scopes()}
-    # 活动推断：工作区在盘；已进线推断：已集成（释放与集成在重建面等价收敛）
+    # 未集成的在盘工作区推断为活动；已集成的无论释放与否都收敛为已集成
     assert states["node-w2"][0] is ScopeState.ACTIVE
     assert states["node-w1"][0] is ScopeState.INTEGRATED
     assert states["node-a"][0] is ScopeState.INTEGRATED
@@ -225,6 +226,74 @@ async def test_recovery_rebuilds_ledger_from_checkpoints_and_repo(tmp_path: Path
         )
     )
     assert len(prepared.base_commit) == 40
+
+
+@pytest.mark.parametrize(
+    ("retain_after_merge", "key"),
+    [(True, "node-b"), (True, "node-empty"), (False, "node-empty")],
+    ids=["on-line-retained", "empty-retained", "empty-released"],
+)
+async def test_recovery_rebuilds_integrated_scope_as_integrated(
+    tmp_path: Path, retain_after_merge: bool, key: str
+) -> None:
+    """已集成作用域无论工作区保留与否、线上有无集成提交，都重建为已集成。"""
+    site = _CrashSite(tmp_path, retain_after_merge=retain_after_merge)
+    await site.build()
+    if key == "node-empty":
+        # 不改 merge 路径文件：空集成，集成线上没有它的集成提交
+        await site.prepare(key)
+        await site.integrate(key)
+
+    manager, _report = await site.rebuild()
+
+    states = {r.scope_id: r.state for r in await manager.list_scopes()}
+    assert states[key] is ScopeState.INTEGRATED
+    assert (site.repository.workspaces_dir / key).exists() is retain_after_merge
+    # 仍在执行的与已废弃的作用域不受影响
+    assert states["node-w2"] is ScopeState.ACTIVE
+    assert states["node-w3"] is ScopeState.DISCARDED
+
+
+async def test_recovery_lets_retraction_preserve_retained_sibling(tmp_path: Path) -> None:
+    """保留配置下恢复后回退：目标按已集成受理，已集成的兄弟按保留者重放、不废弃。"""
+    site = _CrashSite(tmp_path, retain_after_merge=True)
+    await site.build()
+    manager, _report = await site.rebuild()
+
+    outcome = await manager.retract_integration_line(
+        targets=(RetractTarget(scope_id="node-a", base_commit=site.bases["node-a"]),),
+        expected_root_epoch=1,
+        client_op_id="retract-after-recovery",
+    )
+
+    # b 与 w1 的建区基线不含 a 的集成提交、集成在 a 之后：保留并按原集成序重放
+    assert outcome.preserved == ("node-b", "node-w1")
+    assert [scope for scope, _epoch in outcome.invalidated] == ["node-a"]
+    assert not (site.root / "design" / "node-a.md").exists()
+    assert (site.root / "design" / "node-b.md").exists()
+    assert (site.root / "design" / "node-w1.md").exists()
+    states = {r.scope_id: r.state for r in await manager.list_scopes()}
+    assert states["node-b"] is ScopeState.INTEGRATED
+    assert (site.repository.workspaces_dir / "node-b").exists()
+
+
+async def test_recovery_lets_retraction_accept_released_empty_integration(tmp_path: Path) -> None:
+    """默认释放下的空集成作用域重启后仍可作回退目标：直接废弃换代，线不动。"""
+    site = _CrashSite(tmp_path)
+    await site.build()
+    await site.prepare("node-empty")
+    await site.integrate("node-empty")
+    manager, _report = await site.rebuild()
+
+    outcome = await manager.retract_integration_line(
+        targets=(RetractTarget(scope_id="node-empty", base_commit=site.bases["node-empty"]),),
+        expected_root_epoch=1,
+        client_op_id="retract-empty-after-recovery",
+    )
+
+    assert outcome.new_root_epoch == 1
+    assert outcome.preserved == ()
+    assert outcome.invalidated == (("node-empty", 2),)
 
 
 async def test_recovery_completes_retract_ledger_after_reset_crash(

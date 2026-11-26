@@ -16,8 +16,9 @@
 
 重开或崩溃后工作区树运行时（内存账本）缺席——本模块基于检查点账
 （scope_checkpoints 行）与私有仓 refs 重建作用域账本：两层代次按行
-取最新、状态按「工作区在盘 / 分支进过集成线 / 其余已废弃」推断、
-claims 从行内声明列重建、属主从操作日志的建区意图回填。随后对操作
+取最新、状态按「工作区在盘 / 分支进过集成线 / 其余已废弃」推断（集
+成本身已生效的作用域不因工作区仍在盘而判为活动）、claims 从行内声
+明列重建、属主从操作日志的建区意图回填。随后对操作
 日志做三态核对：意图未生效可放弃、已写只补账（集成线回退的引用推进
 幂等重做）、对不上账显式失败（分叉即停，绝不自动回退）。每条操作按
 其种类与阶段在所在的引用上核对。做不到全量恢复的边角在报告中显式
@@ -123,6 +124,7 @@ async def rebuild_workspace_tree(
         repository=repository,
         integrated_scopes=integrated_scopes,
         owners=_creating_owners(operations),
+        effective_integrations=_effective_integrations(operations),
         root_checkout_dir=root_checkout_dir,
         main_writer_workspace_dir=main_writer_workspace_dir,
     )
@@ -162,6 +164,7 @@ async def _rebuild_records(
     repository: WorkspaceRepository,
     integrated_scopes: set[str],
     owners: Mapping[str, str | None],
+    effective_integrations: set[tuple[str, int]],
     root_checkout_dir: Path | None = None,
     main_writer_workspace_dir: Path | None = None,
 ) -> list[ScopeRecord]:
@@ -209,9 +212,17 @@ async def _rebuild_records(
             else:
                 workspace_path = repository.workspaces_dir / branch.removeprefix("scope/")
             workspace_ref = f"{workspace_path.as_posix()}|{branch}"
+            # 本代次的集成已生效：线上有它的集成提交，或操作日志里集成操作已写/已收口。
+            # 删除：作用域账本落表后由账本行承载
+            integrated = (
+                scope_id in integrated_scopes
+                or (scope_id, latest.scope_epoch) in effective_integrations
+            )
             if workspace_path.exists():
-                state = ScopeState.ACTIVE
-            elif scope_id in integrated_scopes:
+                # 集成后工作区可能仍在盘（保留配置、单会话主写者、释放前崩溃），
+                # 在盘不说明仍在执行
+                state = ScopeState.INTEGRATED if integrated else ScopeState.ACTIVE
+            elif integrated:
                 state = ScopeState.INTEGRATED
             elif await repository.resolve_ref(f"refs/heads/{branch}") is None:
                 # 分支引用仍在是历史事实的下界：连分支都不在则对不上账
@@ -248,6 +259,21 @@ def _creating_owners(operations: Sequence[SagaOperation]) -> dict[str, str | Non
         owner = cast("str | None", operation.metadata.get("owner_ref"))
         owners.setdefault(str(operation.metadata.get("scope_id")), owner)
     return owners
+
+
+def _effective_integrations(operations: Sequence[SagaOperation]) -> set[tuple[str, int]]:
+    """已生效的集成操作：(作用域, 代次)。
+
+    已写或已收口的集成才算生效：意图阶段的集成可能根本没发生。按代次
+    匹配，废弃后同键重建的新一代不继承上一代的集成事实。
+    删除：作用域账本落表后由账本行承载。
+    """
+    return {
+        (str(operation.metadata.get("scope_id")), operation.scope_epoch)
+        for operation in operations
+        if operation.op_kind == _INTEGRATE_OP_KIND
+        and operation.phase in (OperationPhase.GIT_WRITTEN, OperationPhase.COMMITTED)
+    }
 
 
 def _scope_start_base(rows: Sequence[ScopeCheckpoint], scope_id: str) -> str | None:
