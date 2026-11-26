@@ -14,11 +14,18 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+import asyncio
+import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from workflow_controller.config.settings import AppConfig, HookServerConfig, SessionConfig
+from workflow_controller.config.settings import (
+    AppConfig,
+    HookServerConfig,
+    ReviewerConfig,
+    SessionConfig,
+)
 from workflow_controller.core.evaluator import PassThroughEvaluator
 from workflow_controller.core.orchestrator import Orchestrator
 
@@ -78,6 +85,147 @@ class TestOrchestrator:
         start_reviewer.assert_not_awaited()
         assert not orchestrator.hook_server_active
         assert not orchestrator.plugin_registry.plugins
+
+    async def test_hook_refresh_failure_stops_started_hook_server(
+        self,
+        monkeypatch,
+        orchestrator,
+    ):
+        from workflow_controller.hooks.server import HookServer, HookServerStartupError
+
+        cleanup_order: list[str] = []
+
+        async def start_hook_server(_hook_server: HookServer) -> None:
+            cleanup_order.append("start")
+
+        async def stop_hook_server(_hook_server: HookServer) -> None:
+            cleanup_order.append("stop")
+
+        def fail_hook_refresh(_project_dir: object) -> None:
+            raise ValueError("settings write failed")
+
+        monkeypatch.setattr(HookServer, "start", start_hook_server)
+        monkeypatch.setattr(HookServer, "stop_server", stop_hook_server)
+        monkeypatch.setattr(orchestrator, "generate_hook_config", fail_hook_refresh)
+        monkeypatch.setattr(orchestrator, "_maybe_start_reviewer", AsyncMock())
+        orchestrator.config.runtime = "claude_cli"
+        orchestrator.config.hook_server = HookServerConfig(
+            enabled=True,
+            host="127.0.0.1",
+            port=18999,
+        )
+
+        with pytest.raises(
+            HookServerStartupError,
+            match=r"Hook Server.*18999.*settings write failed",
+        ):
+            await orchestrator.start()
+
+        assert cleanup_order == ["start", "stop"]
+        assert not orchestrator.hook_server_active
+        assert not orchestrator.plugin_registry.plugins
+
+    async def test_boot_refreshes_claude_cli_hooks(self, monkeypatch, orchestrator, tmp_path):
+        from workflow_controller.hooks.server import HookServer
+
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir()
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "permissions": {"allow": ["Bash(*)"]},
+                    "hooks": {"Stop": [{"hooks": [{"url": "http://localhost:18701/hooks/stop"}]}]},
+                }
+            ),
+            encoding="utf-8",
+        )
+        orchestrator.config.runtime = "claude_cli"
+        orchestrator.config.hook_server = HookServerConfig(
+            enabled=True,
+            port=18999,
+            host="127.0.0.1",
+        )
+        monkeypatch.setattr(HookServer, "start", AsyncMock())
+        monkeypatch.setattr(orchestrator, "_maybe_start_reviewer", AsyncMock())
+
+        await orchestrator.start()
+
+        data = json.loads(settings_file.read_text(encoding="utf-8"))
+        hook = data["hooks"]["Stop"][0]["hooks"][0]
+        assert data["permissions"] == {"allow": ["Bash(*)"]}
+        assert hook["url"] == "http://127.0.0.1:18999/hooks/stop"
+        await orchestrator.shutdown()
+
+    async def test_claude_cli_activation_fails_without_hook_server(
+        self,
+        monkeypatch,
+        orchestrator,
+        tmp_path,
+    ):
+        from workflow_controller.hooks.server import HookServerStartupError
+
+        orchestrator.config.runtime = "claude_cli"
+        orchestrator.config.reviewer = ReviewerConfig(enabled=False)
+        monkeypatch.setattr(orchestrator, "_maybe_start_reviewer", AsyncMock())
+        await orchestrator.start()
+
+        with pytest.raises(HookServerStartupError, match="active Hook Server"):
+            await orchestrator.start_session_with_config(
+                SessionConfig(
+                    name="worker",
+                    role="worker",
+                    cwd=str(tmp_path),
+                    runtime="claude_cli",
+                    initial_prompt="test",
+                )
+            )
+        await orchestrator.shutdown()
+
+    async def test_claude_cli_activation_refreshes_stale_hooks(
+        self,
+        monkeypatch,
+        orchestrator,
+        tmp_path,
+    ):
+        from workflow_controller.hooks.server import HookServer
+
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir()
+        settings_file.write_text(
+            json.dumps({"hooks": {"Stop": []}}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        orchestrator.config.runtime = "claude_sdk"
+        orchestrator.config.hook_server = HookServerConfig(
+            enabled=True,
+            port=18999,
+            host="127.0.0.1",
+        )
+        orchestrator.config.reviewer = ReviewerConfig(enabled=False)
+        monkeypatch.setattr(HookServer, "start", AsyncMock())
+        monkeypatch.setattr(orchestrator, "_maybe_start_reviewer", AsyncMock())
+        loop = MagicMock()
+        loop.take_over = AsyncMock()
+        loop.run = AsyncMock()
+        monkeypatch.setattr(orchestrator, "_new_loop", lambda _session_id: loop)
+        await orchestrator.start()
+
+        session = await orchestrator.start_session_with_config(
+            SessionConfig(
+                name="worker",
+                role="worker",
+                cwd=str(tmp_path),
+                runtime="claude_cli",
+                initial_prompt="test",
+            )
+        )
+        await asyncio.sleep(0)
+
+        data = json.loads(settings_file.read_text(encoding="utf-8"))
+        hook = data["hooks"]["Stop"][0]["hooks"][0]
+        assert hook["url"] == "http://127.0.0.1:18999/hooks/stop"
+        await orchestrator.stop_session(session.id)
+        await orchestrator.shutdown()
 
     async def test_register_session_captures_task_started(self, orchestrator):
         """sdk 路径的 TaskStartedMessage（subtype=task_started）也要存 sdk_session_id，
