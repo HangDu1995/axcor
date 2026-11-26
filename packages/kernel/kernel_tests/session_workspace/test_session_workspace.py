@@ -27,6 +27,7 @@ from workflow_controller.config.settings import SessionTracebackConfig
 from workflow_controller.core.checkpoints import CheckpointStore
 from workflow_controller.core.runs import RunStore
 from workflow_controller.core.session_workspace import (
+    SessionWorkspaceError,
     SessionWorkspaceHost,
     SessionWorkspaceNotFoundError,
 )
@@ -48,6 +49,8 @@ class Harness:
         self.stopped: list[str] = []
         self.started: list[dict[str, Any]] = []
         self.transcript_sources: dict[str, Path] = {}
+        # 置非空时假恢复入口抛该异常（模拟恢复会话创建失败）
+        self.fail_start: Exception | None = None
         self.host = SessionWorkspaceHost(
             checkpoint_db_path=lambda: self.db_path,
             resolve_session=self._resolve_session,
@@ -95,6 +98,10 @@ class Harness:
         """会话树目录。"""
         return self.original / ".workflow-controller" / "scopes" / session_id
 
+    def restore_seed_dir(self, session_id: str, client_op_id: str) -> Path:
+        """对话恢复种子的落点（树目录下按恢复操作号分目录）。"""
+        return self.tree_dir(session_id) / "restore" / client_op_id
+
     async def migrate(self) -> None:
         """铺检查点表（统一迁移）。"""
         await RunStore(self.db_path).list_runs()
@@ -110,6 +117,8 @@ class Harness:
 
     async def _start_resumed_session(self, config: Any, **kwargs: Any) -> Any:
         """假恢复入口：登记启动参数并回一个新假会话。"""
+        if self.fail_start is not None:
+            raise self.fail_start
         new_id = f"restored-{len(self.started) + 1}"
         self.started.append({"session_id": new_id, "config": config, **kwargs})
         session = SimpleNamespace(id=new_id, config=config)
@@ -118,6 +127,31 @@ class Harness:
 
     def _locate_transcript(self, native_session_id: str, workspace_path: str) -> Path | None:
         return self.transcript_sources.get(native_session_id)
+
+    async def writer_dispatch(self, session_id: str, runtime: str) -> Any:
+        """提交一次 writer 子代理的 task 派发屏障，返回屏障结论。"""
+        return await self.host.submit_dispatch_barrier(
+            session_id,
+            "dispatch",
+            {
+                "prompt_id": "p1",
+                "tool_use_id": "tool-1",
+                "native_session_id": "native-1",
+                "tool_name": "Task",
+                "tool_input": {"prompt": "sub"},
+            },
+            runtime=runtime,
+        )
+
+    async def group_checkpoint_row(self, session_id: str) -> dict[str, Any]:
+        """取会话树里当前的组检查点行。"""
+        rows = await self.host.list_checkpoints(session_id)
+        return next(
+            r
+            for r in rows
+            if r["trigger"] == "before_child"
+            and (r["dispatch_anchor"] or {}).get("dispatch_group_id")
+        )
 
     def plant_transcript(self, native_session_id: str, rows: list[dict[str, Any]]) -> None:
         """铺父会话 transcript 源（回滚链的截断输入）。"""
@@ -132,6 +166,18 @@ class Harness:
 def _traceback_on() -> SessionTracebackConfig:
     """默认开启的单会话 traceback 配置。"""
     return SessionTracebackConfig()
+
+
+# 父会话 transcript：用户消息 + 含 task 调用的助手消息（回滚链的截断输入）
+_PARENT_TRANSCRIPT = [
+    {"type": "user", "uuid": "u1", "promptId": "p1", "message": {"content": "go"}},
+    {
+        "type": "assistant",
+        "uuid": "a1",
+        "promptId": "p1",
+        "message": {"content": [{"type": "tool_use", "id": "tool-1"}]},
+    },
+]
 
 
 async def test_prepare_points_cwd_to_managed_workspace(tmp_path):
@@ -317,36 +363,9 @@ async def test_barrier_builds_group_and_child_workspace(tmp_path, full_capabilit
     await h.migrate()
     session = h.add_session("sess-1")
     await h.host.prepare_session(session)
-    h.plant_transcript(
-        "native-1",
-        [
-            {
-                "type": "user",
-                "uuid": "u1",
-                "promptId": "p1",
-                "message": {"content": "go"},
-            },
-            {
-                "type": "assistant",
-                "uuid": "a1",
-                "promptId": "p1",
-                "message": {"content": [{"type": "tool_use", "id": "tool-1"}]},
-            },
-        ],
-    )
+    h.plant_transcript("native-1", _PARENT_TRANSCRIPT)
 
-    outcome = await h.host.submit_dispatch_barrier(
-        "sess-1",
-        "dispatch",
-        {
-            "prompt_id": "p1",
-            "tool_use_id": "tool-1",
-            "native_session_id": "native-1",
-            "tool_name": "Task",
-            "tool_input": {"prompt": "sub"},
-        },
-        runtime=full_capability_runtime,
-    )
+    outcome = await h.writer_dispatch("sess-1", full_capability_runtime)
 
     from workflow_controller.driver.hooks import BarrierProceed
 
@@ -362,12 +381,7 @@ async def test_barrier_builds_group_and_child_workspace(tmp_path, full_capabilit
     await h.host.record_subagent_start(
         "sess-1", {"parent_tool_use_id": "tool-1", "agent_id": "child-native-1"}
     )
-    refreshed = await h.host.list_checkpoints("sess-1")
-    group_row = next(
-        r
-        for r in refreshed
-        if r["trigger"] == "before_child" and (r["dispatch_anchor"] or {}).get("dispatch_group_id")
-    )
+    group_row = await h.group_checkpoint_row("sess-1")
     assert group_row["child_session_map"]
 
 
@@ -377,18 +391,7 @@ async def test_subagent_completion_integrates_into_main_writer(tmp_path, full_ca
     await h.migrate()
     session = h.add_session("sess-1")
     await h.host.prepare_session(session)
-    outcome = await h.host.submit_dispatch_barrier(
-        "sess-1",
-        "dispatch",
-        {
-            "prompt_id": "p1",
-            "tool_use_id": "tool-1",
-            "native_session_id": "native-1",
-            "tool_name": "Task",
-            "tool_input": {"prompt": "sub"},
-        },
-        runtime=full_capability_runtime,
-    )
+    outcome = await h.writer_dispatch("sess-1", full_capability_runtime)
     child_cwd = Path(outcome.child_cwd)
     await h.host.record_subagent_start(
         "sess-1", {"parent_tool_use_id": "tool-1", "agent_id": "child-native-1"}
@@ -440,40 +443,13 @@ async def test_subagent_rollback_restores_group_and_binds_session(
     session = h.add_session("sess-1")
     await h.host.prepare_session(session)
     managed = h.managed_dir("sess-1")
-    h.plant_transcript(
-        "native-1",
-        [
-            {"type": "user", "uuid": "u1", "promptId": "p1", "message": {"content": "go"}},
-            {
-                "type": "assistant",
-                "uuid": "a1",
-                "promptId": "p1",
-                "message": {"content": [{"type": "tool_use", "id": "tool-1"}]},
-            },
-        ],
-    )
-    await h.host.submit_dispatch_barrier(
-        "sess-1",
-        "dispatch",
-        {
-            "prompt_id": "p1",
-            "tool_use_id": "tool-1",
-            "native_session_id": "native-1",
-            "tool_name": "Task",
-            "tool_input": {"prompt": "sub"},
-        },
-        runtime=full_capability_runtime,
-    )
+    h.plant_transcript("native-1", _PARENT_TRANSCRIPT)
+    await h.writer_dispatch("sess-1", full_capability_runtime)
     # 组建立后的副作用：主写者工作区被改
     (managed / "design" / "base.md").write_text("side effect\n", encoding="utf-8")
     (managed / "design" / "extra.md").write_text("extra\n", encoding="utf-8")
 
-    rows = await h.host.list_checkpoints("sess-1")
-    group_row = next(
-        r
-        for r in rows
-        if r["trigger"] == "before_child" and (r["dispatch_anchor"] or {}).get("dispatch_group_id")
-    )
+    group_row = await h.group_checkpoint_row("sess-1")
     result = await h.host.restore_session_subagent(
         "sess-1",
         checkpoint_id=group_row["checkpoint_id"],
@@ -496,6 +472,77 @@ async def test_subagent_rollback_restores_group_and_binds_session(
     # 恢复会话仍可终态收口（别名解析到同一棵树）
     report = await h.host.finalize_session(result["restored_session_id"])
     assert not report.refused
+
+
+@pytest.mark.parametrize("failure", ["transcript_missing", "seed_write_fails"])
+async def test_rollback_fails_before_reset_when_restore_data_unavailable(
+    tmp_path, full_capability_runtime, request, failure
+):
+    """对话恢复数据备不好：回滚失败，文件态、代次、后代工作区原样未动，旧会话不停、树不留种子。"""
+    h = Harness(tmp_path)
+    await h.migrate()
+    session = h.add_session("sess-1")
+    entry = await h.host.prepare_session(session)
+    if failure == "seed_write_fails":
+        h.plant_transcript("native-1", _PARENT_TRANSCRIPT)
+        request.getfixturevalue("restore_seed_write_fails")
+    managed = h.managed_dir("sess-1")
+    dispatch = await h.writer_dispatch("sess-1", full_capability_runtime)
+    child_ws = Path(dispatch.child_cwd)
+    (child_ws / "out.txt").write_text("child\n", encoding="utf-8")
+    (managed / "design" / "base.md").write_text("after group\n", encoding="utf-8")
+    group_row = await h.group_checkpoint_row("sess-1")
+
+    with pytest.raises(Exception) as excinfo:
+        await h.host.restore_session_subagent(
+            "sess-1",
+            checkpoint_id=group_row["checkpoint_id"],
+            expected_epoch=1,
+            client_op_id="rb-1",
+        )
+
+    # 破坏性动作没有发生：文件未回退、后代子工作区仍在、代次未变、旧会话没停
+    assert (managed / "design" / "base.md").read_text(encoding="utf-8") == "after group\n"
+    assert (child_ws / "out.txt").read_text(encoding="utf-8") == "child\n"
+    for scope_id in (entry.tree.main_writer_scope_id, "sess-1-main-c1"):
+        scope = await entry.tree.manager.get_scope(scope_id)
+        assert (scope.scope_epoch, scope.state) == (1, ScopeState.ACTIVE)
+    assert h.stopped == [] and h.started == []
+    assert (await h.host.live_view("sess-1"))["state"] == "active"
+    # 失败说明点名阶段，树目录里不留种子
+    assert isinstance(excinfo.value, SessionWorkspaceError)
+    assert "对话恢复数据准备失败" in str(excinfo.value)
+    assert not h.restore_seed_dir("sess-1", "rb-1").exists()
+
+
+async def test_rollback_failure_after_reset_reports_stage_and_discards_seed(
+    tmp_path, full_capability_runtime
+):
+    """文件已恢复后恢复会话创建失败：报错点名阶段，种子回收，树回到运行态。"""
+    h = Harness(tmp_path)
+    await h.migrate()
+    session = h.add_session("sess-1")
+    await h.host.prepare_session(session)
+    h.plant_transcript("native-1", _PARENT_TRANSCRIPT)
+    managed = h.managed_dir("sess-1")
+    await h.writer_dispatch("sess-1", full_capability_runtime)
+    (managed / "design" / "base.md").write_text("after group\n", encoding="utf-8")
+    group_row = await h.group_checkpoint_row("sess-1")
+    h.fail_start = RuntimeError("运行时启动失败")
+
+    with pytest.raises(SessionWorkspaceError, match="文件已恢复到组检查点、旧会话已停") as excinfo:
+        await h.host.restore_session_subagent(
+            "sess-1",
+            checkpoint_id=group_row["checkpoint_id"],
+            expected_epoch=1,
+            client_op_id="rb-1",
+        )
+
+    assert "运行时启动失败" in str(excinfo.value)
+    assert (managed / "design" / "base.md").read_text(encoding="utf-8") == "base\n"
+    assert h.stopped == ["sess-1"] and h.started == []
+    assert (await h.host.live_view("sess-1"))["state"] == "active"
+    assert not h.restore_seed_dir("sess-1", "rb-1").exists()
 
 
 async def test_live_view_missing_session_rejected(tmp_path):

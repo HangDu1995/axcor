@@ -777,9 +777,11 @@ class SessionWorkspaceHost:
     ) -> dict[str, Any]:
         """单会话子代理回滚：组检查点恢复 + 恢复会话绑定（同一条链内串行）。
 
-        链内次序对齐异步确认链：恢复文件态并备好对话数据 → 宿主落失效
-        账（停旧会话）→ 才创建并绑定恢复会话；恢复会话经别名接续同一棵
-        托管树。
+        链内次序对齐异步确认链：先备好对话恢复数据，再恢复文件态 →
+        宿主落失效账（停旧会话）→ 才创建并绑定恢复会话；恢复会话经别名
+        接续同一棵托管树。对话恢复数据只读 transcript、只写树目录下的种子
+        目录，与作用域文件态无关，故先于 reset：备不好即失败时文件态与
+        代次原样未动。
         """
         entry = self._resolve(session_id)
         if entry is None:
@@ -812,39 +814,50 @@ class SessionWorkspaceHost:
         session = await self._resolve_session(sid)
         if session is None:
             raise SessionWorkspaceError(f"会话不在池内，无法回滚：{sid}")
+        # 代次先于一切准备核对：过期请求不写种子，报错直接点名真实原因
+        await tree.scope_tree.require_scope_epoch(tree.main_writer_scope_id, expected_epoch)
+        plan = ConversationRestorePlan(
+            run_id=self._run_id_of(session),
+            scope_id=tree.main_writer_scope_id,
+            scope_epoch=expected_epoch + 1,
+            checkpoint_id=checkpoint_id,
+            anchor=anchor,
+            workspace_path=str(tree.main_writer_workspace_dir),
+            seed_dir=tree.restore_seed_dir(client_op_id),
+            session_runtime=session.config.runtime,
+            replay_tool_name=replay_task.get("tool_name", "") if replay_task else "",
+            replay_tool_input=(
+                _json_loads_or_none(replay_task.get("tool_input", "")) if replay_task else None
+            ),
+            traceback=session.config.traceback,
+        )
 
         entry.state = "restoring"
+        stage = "对话恢复数据准备失败，作用域文件态与代次未动"
+        completed = False
         try:
+            data = await self._restorer.prepare(plan)
+            stage = "组检查点恢复失败"
             restored = await tree.manager.restore_scope(
                 tree.main_writer_scope_id,
                 restore_commit=checkpoint.workspace_commit,
                 expected_scope_epoch=expected_epoch,
                 client_op_id=client_op_id,
             )
-            plan = ConversationRestorePlan(
-                run_id=self._run_id_of(session),
-                scope_id=tree.main_writer_scope_id,
-                scope_epoch=restored.new_scope_epoch,
-                checkpoint_id=checkpoint_id,
-                anchor=anchor,
-                workspace_path=str(tree.main_writer_workspace_dir),
-                seed_dir=tree.tree_dir / "restore" / client_op_id,
-                session_runtime=session.config.runtime,
-                replay_tool_name=replay_task.get("tool_name", "") if replay_task else "",
-                replay_tool_input=(
-                    _json_loads_or_none(replay_task.get("tool_input", "")) if replay_task else None
-                ),
-                traceback=session.config.traceback,
-            )
-            data = await self._restorer.prepare(plan)
             tree.arbiter.forget(tree.main_writer_scope_id)
+            stage = "文件已恢复到组检查点，但旧会话停止失败"
             # 宿主自任编排确认方：失效账（停旧会话）持久化后才创建新会话
             await self._stop_session(sid)
+            stage = "文件已恢复到组检查点、旧会话已停，但恢复会话创建失败"
             binding = await self._restorer.bind(data)
-        except BaseException:
+            completed = True
+        except Exception as e:
+            raise SessionWorkspaceError(f"{stage}：{e}") from e
+        finally:
             entry.state = "active"
-            raise
-        entry.state = "active"
+            if not completed:
+                # 链没走完：种子无人消费，回收不留半成品
+                await tree.discard_restore_seed(client_op_id)
         self._aliases[str(binding.session_id)] = sid
         return {
             "restored_session_id": str(binding.session_id),

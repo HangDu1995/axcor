@@ -23,8 +23,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -285,6 +287,16 @@ class WorkspaceTreeRuntime:
         self._child_seq += 1
         scope_key = f"{parent_scope_id}-c{self._child_seq}"
         return scope_key, f"dispatch-{self._child_seq}"
+
+    def restore_seed_dir(self, client_op_id: str) -> Path:
+        """对话恢复种子的落点：树目录下按恢复操作号分目录，不在任何作用域工作区内。"""
+        return self.tree_dir / "restore" / client_op_id
+
+    async def discard_restore_seed(self, client_op_id: str) -> None:
+        """回收一次恢复的种子目录：恢复链失败后不留半成品。"""
+        await asyncio.to_thread(
+            shutil.rmtree, self.restore_seed_dir(client_op_id), ignore_errors=True
+        )
 
     async def record_lifecycle_checkpoint(
         self,

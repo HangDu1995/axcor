@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -67,3 +68,21 @@ def mock_evaluator():
         )
     )
     return evaluator
+
+
+@pytest.fixture
+def restore_seed_write_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """让对话恢复种子写到一半失败：配置目录已建、种子文件未落。
+
+    供恢复链用例核对准备失败后不留半成品种子目录。
+    """
+    from workflow_controller.core.restore.conversation import ConversationRestorer
+
+    def _half_written_seed(
+        source: Path, target: Path, rows: list[Any], new_session_id: str
+    ) -> None:
+        """建出配置目录即失败，留下半成品种子。"""
+        target.parent.parent.mkdir(parents=True, exist_ok=True)
+        raise OSError("磁盘已满")
+
+    monkeypatch.setattr(ConversationRestorer, "_write_seed", staticmethod(_half_written_seed))

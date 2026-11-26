@@ -16,7 +16,8 @@
 
 覆盖：组检查点恢复撤回整组副作用（#23/#24）、恢复会话绑定四元组、
 RestoreCommitted 前不创建会话的定序崩溃注入、多副作用组 replay 拒绝
-（#35）、reader 子代理 detached 快照与永不集成、子会话映射回填。
+（#35）、reader 子代理 detached 快照与永不集成、子会话映射回填、对话
+恢复数据备不好时恢复动作在破坏性动作之前失败。
 
 派发以能力全备的假 runtime 为前提（夹具 full_capability_runtime），不依赖
 任何真实 runtime 的能力声明。
@@ -111,23 +112,24 @@ class ChainHarness:
         self.affiliation = SessionRunAffiliationService(self.store)
         self.so = RestoreSO(tmp_path)
         self.driver = OpChainDriver(self._plan)
-        locator = None
-        if transcript is not None:
-
-            def locator(native_session_id: str, workspace_path: str) -> Path | None:  # type: ignore[no-redef]
-                return transcript if native_session_id == "ses-native-exec" else None
-
+        self.transcript = transcript
         self.coord = RunCoordinator(
             orchestrator=self.so,
             run_store=self.store,
             bus=StubBus(),
             driver_factories={"probe@1": _Factory(self.driver)},
             affiliation=self.affiliation,
-            workspace_transcript_locator=locator,
+            workspace_transcript_locator=self._locate_transcript,
         )
         self.program = tmp_path / "prog.txt"
         self.program.write_text("probe", encoding="utf-8")
         self.pending: RunAction | None = None
+
+    def _locate_transcript(self, native_session_id: str, workspace_path: str) -> Path | None:
+        """父会话 transcript 定位：构造时给了路径才找得到，否则明确找不到。"""
+        if native_session_id != "ses-native-exec":
+            return None
+        return self.transcript
 
     def _plan(self, driver: ProbeDriver) -> list[RunAction] | None:
         if _FINISH.get(id(self)):
@@ -168,15 +170,33 @@ class ChainHarness:
         self.pending = action
         self.coord.notify_run(self.run_id, TimerFired(timer_id="poke"))
 
-    async def wait_note(self, kind: type) -> Any:
-        """等待指定类型回执到达驱动。"""
+    async def wait_note(self, kind: type, *, client_op_id: str = "") -> Any:
+        """等待指定类型回执到达驱动（可按操作号过滤）。"""
         deadline = asyncio.get_running_loop().time() + 30.0
         while asyncio.get_running_loop().time() < deadline:
             for note in self.driver.notes:
-                if isinstance(note, kind):
+                if isinstance(note, kind) and (
+                    not client_op_id or note.client_op_id == client_op_id
+                ):
                     return note
             await asyncio.sleep(0.02)
         raise AssertionError(f"回执超时：{kind.__name__}")
+
+    def run_events(self, event_type: str) -> list[dict[str, Any]]:
+        """读取指定类型的 run 键事件载荷。"""
+        rows = self.so.event_router.default_store.get_run_events_sync(self.run_id)
+        return [dict(row["data"]) for row in rows if row["event_type"] == event_type]
+
+    def restore_seed_dir(self, client_op_id: str) -> Path:
+        """对话恢复种子的落点（树目录下按恢复操作号分目录）。"""
+        return (
+            self.work_root
+            / ".workflow-controller"
+            / "scopes"
+            / self.run_id
+            / "restore"
+            / client_op_id
+        )
 
     async def wait_scope_epoch(self, scope_id: str, epoch: int) -> None:
         """等待作用域账面达到指定代次。"""
@@ -406,6 +426,103 @@ async def test_crash_before_restore_commit_creates_no_session(
             )
         )
         await _wait_resumed(h, expected=1)
+    finally:
+        await h.finish()
+
+
+@pytest.mark.parametrize("failure", ["transcript_missing", "seed_write_fails"])
+async def test_restore_fails_before_reset_when_restore_data_unavailable(
+    tmp_path: Path, full_capability_runtime: str, request: pytest.FixtureRequest, failure: str
+) -> None:
+    """对话恢复数据备不好：恢复动作失败回执，文件态、代次、后代工作区与待绑定数据原样未动。"""
+    h = ChainHarness(
+        tmp_path,
+        runtime=full_capability_runtime,
+        transcript=None if failure == "transcript_missing" else _write_transcript(tmp_path),
+    )
+    await h.start()
+    try:
+        if failure == "seed_write_fails":
+            request.getfixturevalue("restore_seed_write_fails")
+        dispatch = await h.barrier("dispatch", "toolu-1")
+        assert dispatch.child_cwd
+        child_ws = Path(dispatch.child_cwd)
+        (child_ws / "out.txt").write_text("child\n", encoding="utf-8")
+        node_ws = await _node_workspace_path(h)
+        (node_ws / "design" / "base.md").write_text("after group\n", encoding="utf-8")
+        checkpoint_id = await h.group_checkpoint_id()
+
+        await h.send(
+            RestoreScope(
+                scope_id="node-a",
+                checkpoint_id=checkpoint_id,
+                expected_scope_epoch=1,
+                client_op_id="rs-1",
+                context="node=a",
+            )
+        )
+        failed = await h.wait_note(WorkspaceActionFailed, client_op_id="rs-1")
+
+        # 破坏性动作没有发生：文件未回退、后代子工作区仍在、代次未变
+        assert (node_ws / "design" / "base.md").read_text(encoding="utf-8") == "after group\n"
+        assert (child_ws / "out.txt").read_text(encoding="utf-8") == "child\n"
+        scopes = {s["scope_id"]: s for s in await h.coord.list_run_scopes(h.run_id)}
+        assert (scopes["node-a"]["scope_epoch"], scopes["node-a"]["state"]) == (1, "active")
+        assert (scopes["node-a-c1"]["scope_epoch"], scopes["node-a-c1"]["state"]) == (1, "active")
+        # 回执点名阶段与原因
+        assert "对话恢复数据准备失败" in failed.error
+        expected_reason = "磁盘已满" if failure == "seed_write_fails" else "未找到父会话 transcript"
+        assert expected_reason in failed.error
+        # 没有恢复数据挂起（绑定确认拿不到待绑定数据），也不留种子目录
+        await h.send(
+            RestoreCommitted(
+                scope_id="node-a",
+                client_op_id="op-1",
+                context="node=a",
+                restore_binding=True,
+            )
+        )
+        unbound = await h.wait_note(WorkspaceActionFailed, client_op_id="op-1")
+        assert "恢复数据缺席" in unbound.error
+        assert not h.restore_seed_dir("rs-1").exists()
+        assert h.so.resumed == []
+    finally:
+        await h.finish()
+
+
+async def test_restore_failure_after_prepare_discards_seed_and_keeps_fault_signal(
+    tmp_path: Path, full_capability_runtime: str
+) -> None:
+    """对话数据备好后文件态恢复失败：种子回收，回执保留管理器的错误，闸门故障事件照常落库。"""
+    h = ChainHarness(
+        tmp_path, runtime=full_capability_runtime, transcript=_write_transcript(tmp_path)
+    )
+    await h.start()
+    try:
+        await h.barrier("dispatch", "toolu-1")
+        checkpoint_id = await h.group_checkpoint_id()
+
+        async def never_drains(_scope_id: str) -> None:
+            """后台写进程永远排不空的排空钩子。"""
+            raise RuntimeError("后台写进程无法排空")
+
+        h.coord._workspace_trees[h.run_id].manager._drain_hook = never_drains
+        await h.send(
+            RestoreScope(
+                scope_id="node-a",
+                checkpoint_id=checkpoint_id,
+                expected_scope_epoch=1,
+                client_op_id="rs-1",
+                context="node=a",
+            )
+        )
+        failed = await h.wait_note(WorkspaceActionFailed, client_op_id="rs-1")
+
+        assert "闸门未能静止" in failed.error
+        assert len(h.run_events("fault.scope_quiesce_failed")) == 1
+        assert not h.restore_seed_dir("rs-1").exists()
+        scopes = {s["scope_id"]: s for s in await h.coord.list_run_scopes(h.run_id)}
+        assert scopes["node-a"]["scope_epoch"] == 1
     finally:
         await h.finish()
 

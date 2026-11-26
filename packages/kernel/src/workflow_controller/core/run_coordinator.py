@@ -3150,11 +3150,13 @@ class RunCoordinator:
         )
 
     async def _execute_workspace_restore(self, rt: RunRuntime, action: RestoreScope) -> None:
-        """执行组检查点恢复：闸门内 reset 撤回组内副作用并备好对话恢复数据。
+        """执行组检查点恢复：先备好对话恢复数据，再闸门内 reset 撤回组内副作用。
 
-        定序保证的前半步：本方法只准备恢复数据（截断 + 种子），不启动
-        新 session——编排层持久化失效状态（RestoreCommitted）之后才创建
-        绑定。检查点须为该父作用域的组检查点行（before_child + 组行）。
+        对话恢复数据只读父会话 transcript、只写树目录下的种子目录，与作用
+        域文件态无关，故整体先于 reset：备不好即失败时文件、代次与后代工
+        作区原样未动。本方法不启动新 session——编排层持久化失效状态
+        （RestoreCommitted）之后才创建绑定。检查点须为该父作用域的组检查
+        点行（before_child + 组行）。
         """
         tree = await self._ensure_workspace_tree(rt)
         if tree is None:
@@ -3188,38 +3190,55 @@ class RunCoordinator:
             scope = await tree.manager.get_scope(action.scope_id)
             if scope is None:
                 raise ValueError(f"作用域不存在：{action.scope_id}")
+            # 代次先于一切准备核对：过期请求不写种子，回执直接点名真实原因
+            await tree.scope_tree.require_scope_epoch(action.scope_id, action.expected_scope_epoch)
             replay_task: dict[str, str] | None = None
             if action.replay_dispatch:
                 replay_task = tree.replay_ledger.require_single_task(
                     anchor.dispatch_group_id, action.checkpoint_id
                 )
-            restored = await tree.manager.restore_scope(
-                action.scope_id,
-                restore_commit=checkpoint.workspace_commit,
-                expected_scope_epoch=action.expected_scope_epoch,
-                client_op_id=action.client_op_id,
-            )
             plan = ConversationRestorePlan(
                 run_id=rt.run_id,
                 scope_id=action.scope_id,
-                scope_epoch=restored.new_scope_epoch,
+                scope_epoch=action.expected_scope_epoch + 1,
                 checkpoint_id=action.checkpoint_id,
                 anchor=anchor,
                 workspace_path=self._scope_workspace_path(scope),
-                seed_dir=tree.tree_dir / "restore" / action.client_op_id,
+                seed_dir=tree.restore_seed_dir(action.client_op_id),
                 session_runtime=action.session_runtime,
                 replay_tool_name=replay_task.get("tool_name", "") if replay_task else "",
                 replay_tool_input=(
                     _json_loads_or_none(replay_task.get("tool_input", "")) if replay_task else None
                 ),
             )
-            data = await self._restorer.prepare(plan)
-            tree.pending_restores[action.scope_id] = PendingSubagentRestore(data=data)
-            # 组恢复点已回退：该作用域的活动组失效（新 message 开新组）
-            tree.arbiter.forget(action.scope_id)
         except Exception as e:
             await self._reply_workspace_failure(rt, action, error=e)
             return
+        try:
+            data = await self._restorer.prepare(plan)
+        except Exception as e:
+            await tree.discard_restore_seed(action.client_op_id)
+            await self._reply_workspace_failure(
+                rt,
+                action,
+                error=RuntimeError(f"对话恢复数据准备失败，作用域文件态与代次未动：{e}"),
+            )
+            return
+        try:
+            restored = await tree.manager.restore_scope(
+                action.scope_id,
+                restore_commit=checkpoint.workspace_commit,
+                expected_scope_epoch=action.expected_scope_epoch,
+                client_op_id=action.client_op_id,
+            )
+        except Exception as e:
+            # 对话数据已备好而文件态恢复未成：种子无人消费，回收
+            await tree.discard_restore_seed(action.client_op_id)
+            await self._reply_workspace_failure(rt, action, error=e)
+            return
+        tree.pending_restores[action.scope_id] = PendingSubagentRestore(data=data)
+        # 组恢复点已回退：该作用域的活动组失效（新 message 开新组）
+        tree.arbiter.forget(action.scope_id)
         self._notify(
             rt.run_id,
             ScopeRestored(

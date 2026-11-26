@@ -23,8 +23,7 @@
 | #65 | 已完成 | 本 commit | 产物读取按发起方节点的活动作用域解析基准目录：有活动作用域读其工作区，否则回落根检出；bash 进程型与 agent 型 generator 在隔离下都跑通 |
 | #66 | 部分完成 | 本 commit | 冒烟落地（真实模型 3 例 + 离线确定性 7 例，均 live_llm）；网关持续 503，真实模型未验证。离线冒烟在真实捆绑 CLI 上通过，暴露并修掉两处驱动缺陷（init 帧原生会话标识取不到、子代理缺省后台启动）。实测子代理 cwd 注入不成立，按裁决在能力矩阵如实降级：严格档下 claude_sdk 拒绝 writer 派发、出生侧禁 task 工具 |
 | #67 | 已完成 | 本 commit | 深度恢复按操作种类与阶段在所在引用上核对：建区与恢复取作用域分支、集成取父作用域引用（父为根即集成线）；引用定位不出或已被删除时显式失败 |
-| #67 | | | |
-| #68 | | | |
+| #68 | 已完成 | 本 commit | 对话恢复数据（定位 transcript、截断、种子）整体前移到组检查点 reset 之前：备不好即失败时文件态、代次、后代工作区与旧会话原样未动；两个平面的失败都回收种子目录，回执或报错点名阶段 |
 | #69 | | | |
 | #70 | | | |
 | #71 | | | |
@@ -522,6 +521,58 @@ run 平面 `packages/plugins/graph/tests/test_workspace_run_plane.py`：`test_ge
 - 恢复操作在「reset 后、记新头前」窗口崩溃无判据可核：reset 不产生提交，作用域分支头等于意图里的 `restore_commit`，既不等于旧头、也没有带操作标识的提交可核，按现状报分叉即停。意图元数据里的 `restore_commit` 可以作唯一判据，是否纳入需要设计确认。建区的同一窗口按未生效放弃处理（见决策）。
 - 引用落在子代理作用域（根的孙代及更深）上的操作在恢复时定位不到引用：检查点查询非递归，这类作用域不进重建的账本。以子代理作用域为对象的恢复操作、以它为父的建区与集成都按「所在引用无法定位」显式失败；子代理自己的建区（分支取自意图）与并入父作用域的集成（引用在父作用域上）不受影响。子代理层不进重建面归 #74；当前派发屏障把子代理自身的调用记在节点作用域下（#71），以子代理作用域为恢复对象或为父的形态暂不可达。
 - `packages/kernel/kernel_tests/unit/run_plane/test_dispatch_barrier_chain.py::test_barrier_wait_window_closes_with_fault` 是墙钟断言（50 毫秒等待窗口对 0.9 秒上界），相关目录批跑时在负载下抖动失败过一次，单独重跑三次通过，全量里通过。与本次改动无关（本次改动不在屏障路径上加等待或子进程）。
+
+### #68 [traceback] D8 RestoreScope 先做破坏性 reset，再定位 transcript、写种子
+
+**根因**
+
+两个平面的子代理回滚链都把「准备对话恢复数据」排在破坏性 reset 之后。run 平面的 `_execute_workspace_restore` 先调 `manager.restore_scope`（闸门内提交当前态、reset --hard 加 clean -fdx、后代工作区移除、账面代次加一），然后才构造恢复计划并调 `restorer.prepare`（定位 transcript、算截断边界、写种子）；单会话的 `restore_session_subagent` 同序。`prepare` 的失败——transcript 定不到、截断后没有用户消息、种子写失败——都发生在文件已回退、代次已变之后。run 平面只回一张失败回执，引擎把操作置败，节点档案里的作用域代次仍是旧值而账本已换代，此后按旧代次发出的动作全部被拒；单会话平面把状态复位后原样抛出，旧会话没停、对话没截断，却在一个已经回退的工作区上继续跑。
+
+核实了整体前移的前提：`prepare` 只读父会话 transcript（按工作目录算项目键，到 CLI 配置目录下定位）、只写树目录下的 `restore/<操作号>/`——它是作用域工作区的同级目录，不在任何作用域工作区内——与作用域 reset 之后的文件态无关；恢复计划里的新代次就是当前代次加一，reset 之前即可确定。
+
+**修复**
+
+- run 平面：次序改为「检查点校验 → 代次核对 → 构造恢复计划（新代次取预期代次加一）→ `prepare` → `manager.restore_scope` → 登记待绑定数据、回 `ScopeRestored`」。三段各有失败收口：校验失败回原错误；`prepare` 失败回收种子目录，回执写「对话恢复数据准备失败，作用域文件态与代次未动」加原因；`prepare` 成功后 `restore_scope` 失败同样回收种子目录，回执保留管理器的原错误。
+- 单会话平面：同一次序；恢复链写成一段 `try`，随进度更新阶段说明（数据准备、组检查点恢复、停旧会话、创建恢复会话），失败抛 `SessionWorkspaceError`，消息是「阶段：原因」并链上原异常。`finally` 把树复位到运行态，链没走完就回收种子目录。
+- 代次核对前移到写种子之前：过期请求不写种子，报错直接是「作用域代次不匹配」。
+- 树运行时新增 `restore_seed_dir`（种子落点的唯一出处）与 `discard_restore_seed`（失败回收），两个平面共用。
+
+**决策与偏差**
+
+- 按指引整体前移，含写种子。核实 `prepare` 不依赖 reset 后的文件态，前移之后任何准备失败都发生在破坏性动作之前，不需要为「写种子失败」另设回滚。
+- run 平面 `prepare` 之后的恢复失败回执不加阶段前缀、保留管理器的原错误类型。失败回执的出口按错误类型落 run 键故障事件，闸门不可静止的 `fault.scope_quiesce_failed` 靠 `ScopeQuiesceFailedError` 的类型识别，包一层就会把它吞掉；引擎把操作置败时已经前缀「组检查点恢复失败」，阶段已经清楚。`prepare` 失败是协调器自己产生的错误，不可能带故障事件类型，所以包装成带阶段说明的 `RuntimeError`。
+- 单会话平面 reset 之后失败也回收种子：停旧会话或创建恢复会话失败时，种子已经无人消费——单会话没有单独重试绑定步的入口，整链重试会带新操作号重新准备。
+- 代次核对前移是多于指引的一步。过期的请求原本会先写一份种子再在 reset 处被拒，回执虽是同一条「作用域代次不匹配」，却白写再删一次种子；过期请求若同时备不好数据，回执会指向数据准备而掩盖真实原因。
+- 测试夹具（仅测试）：`ChainHarness` 不传 transcript 时定位器明确返回找不到，不再回落到默认定位器去读用户目录下的 `~/.claude`；`wait_note` 增按操作号过滤，另增 run 键事件与种子落点两个取值方法。单会话 `Harness` 增 writer 派发、组检查点行与种子落点三个取值方法、恢复会话创建失败开关；文件里三处重复的派发载荷与 transcript 字面量改为共用方法与常量，既有断言未动。`kernel_tests/conftest.py` 新增夹具 `restore_seed_write_fails`，让种子写到一半失败。
+- 缺陷修复，代码向既有设计对齐，未改设计文档。
+
+**验证**
+
+协调器层 `packages/kernel/kernel_tests/unit/run_plane/test_subagent_restore_chain.py`（真实 git、探针驱动）：
+
+- `test_restore_fails_before_reset_when_restore_data_unavailable`（参数化两例：transcript 定不到、种子写到一半失败）：恢复动作回失败回执；节点工作区文件未被回退、后代子工作区仍在、主写者与子作用域代次都是 1 且状态不变；回执含「对话恢复数据准备失败」与各自的原因；随后发绑定确认拿不到待绑定数据（「恢复数据缺席」），种子目录不存在，没有创建恢复会话。
+- `test_restore_failure_after_prepare_discards_seed_and_keeps_fault_signal`：对话数据备好后闸门不可静止，种子目录回收，回执保留管理器的「闸门未能静止」，`fault.scope_quiesce_failed` 事件照常落一条，代次不变。
+
+单会话 `packages/kernel/kernel_tests/session_workspace/test_session_workspace.py`：
+
+- `test_rollback_fails_before_reset_when_restore_data_unavailable`（参数化两例，同款）：回滚抛 `SessionWorkspaceError` 且点名数据准备阶段；文件未回退、子工作区仍在、两个作用域代次不变，旧会话没停、恢复会话没建，树回到运行态，种子目录不存在。
+- `test_rollback_failure_after_reset_reports_stage_and_discards_seed`：文件恢复之后恢复会话创建失败，报错点名「文件已恢复到组检查点、旧会话已停」；文件确已回退、旧会话已停，树回到运行态，种子目录回收。
+
+修复前失败（最终的测试代码对未修复源码）：五个回归用例全部失败。两个参数化用例的四例都断在文件已被回退（`assert 'base\n' == 'after group\n'`）。另以一次性探针记下 run 平面 transcript 定不到时的现场（探针跑完即删）：回执是 `FileNotFoundError: 未找到父会话 transcript，无法准备对话恢复数据…`，此时节点工作区的文件已回到基线、子工作区已移除，账本是 `node-a` 代次 2 活动、`node-a-c1` 代次 2 已废弃。`test_rollback_failure_after_reset_reports_stage_and_discards_seed` 修复前抛的是裸的 `RuntimeError: 运行时启动失败`，没有阶段说明。
+
+`test_restore_failure_after_prepare_discards_seed_and_keeps_fault_signal` 修复前后都通过：闸门不可静止发生在管理器的 reset 之前，修复前 `prepare` 根本没跑到。它守的是新增的回收路径，以及故障信号不被包装吞掉。
+
+变异验证（临时去掉三处种子回收）：对应的三个「种子目录不存在」断言失败（run 平面两例、单会话一例），其余通过，断言针对的是回收行为。
+
+既有的恢复成功链用例零回退：`test_group_rollback_withdraws_integrated_sibling_changes`、`test_restore_session_bound_to_run_scope_new_epoch`、`test_crash_before_restore_commit_creates_no_session`、`test_single_task_group_allows_replay_signal` 与单会话 `test_subagent_rollback_restores_group_and_binds_session` 原样通过。
+
+门禁（最终代码上）：`ruff format --check` 428 个文件已格式化、`ruff check` 全过、`lint-imports` 4 条契约保持 0 破坏、`codespell`（全部 git 跟踪的 markdown）无命中；全量 pytest 2867 通过、25 跳过（基线 2861 通过 + 新增 6 例），2 条告警为 breather 插件既有告警；`uv build --package workflow-controller-kernel` 的 sdist 与 wheel 构建成功（graph 插件源码与测试未改动，未构建）。
+
+**顺带发现**
+
+- 种子目录按恢复操作号命名，待绑定数据引用的就是这个目录。驱动若跨代次复用同一个恢复操作号，后一次失败时的回收会连带删掉前一次还在等绑定的种子。现有引擎每次发恢复动作都换新号，不可达（走读）。
+- 单会话回滚在文件恢复之后失败（停旧会话或创建恢复会话失败），重试要带新代次，而会话检查点查询面返回的是检查点落账时的代次，拿不到恢复后的实时代次。与 #83（单会话回滚不幂等、没有实时代次查询接口）同一族，未在这里处理。
+- 崩溃落在「种子已写、reset 未做」窗口时，种子目录留在盘上：run 平面的树没有回收（#75），单会话随树回收。修复前同一窗口是「已 reset、未通知」，现场更糟；现在只剩一个无人引用的目录。
 
 ## 跳过与延期
 
