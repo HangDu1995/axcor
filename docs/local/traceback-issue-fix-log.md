@@ -16,7 +16,7 @@
 | 问题 | 状态 | commit | 结论 |
 |---|---|---|---|
 | #60 | 已完成 | 本 commit | 沿用原作用域重建的活动从节点档案回填映射，冷恢复后终态提交与集成照常，产出进根检出 |
-| #61 | | | |
+| #61 | 已完成 | 本 commit | 屏障按斜杠前的节点 id 定位父作用域，验收会话的副作用与 task 派发屏障放行，账落在节点作用域 |
 | #62 | | | |
 | #63 | | | |
 | #64 | | | |
@@ -102,6 +102,39 @@ run 平面 `packages/plugins/graph/tests/test_workspace_run_plane.py`：
 - 冷恢复后复用验收侧会话时，活动上的验收方式（`verify_type`）不随档案恢复，节点历史里该字段为空（仅展示面）。
 - 子代理回滚的恢复回执把档案里的作用域代次推进到新值，在途活动上的 `workspace_scope_epoch` 不随更；该字段当前无读取方，无功能影响。
 - agent 型 generator 崩溃在「子图已并入、集成回执未到」窗口时，若恢复后 DAG 已含子图节点，重放执行器结局会再次并图，`DAG.add_nodes` 抛 `duplicate node id`（引擎层已复现，与本修复无关，修复前同样发生）。
+
+### #61 [traceback] D2 验收 agent 会话的副作用屏障一律被拒
+
+**根因**
+
+run 平面的派发屏障按会话归属上下文定位父作用域：`_barrier_parent_scope` 把 `node=` 之后的整段当作节点 id，去匹配作用域的 `owner_ref`。执行器成员的 context 是 `node=<id>`，验收成员的 context 带相位后缀、是 `node=<id>/verify`（驱动靠后缀按 context 对账回执）。验收会话因此被解析成 `<id>/verify`，账本里没有这样的 `owner_ref`，屏障入口抛「屏障父作用域未找到」，在屏障服务的异常收口处转成 `BarrierDeny`。验收 agent 的每次 Bash / Write / Edit / Task 调用都走这条链，全部被拒；验收 agent 通常要跑命令，等于无法验收。定位节点本应与活动定位同径（取斜杠前的节点 id），两处各自实现、没有对齐。
+
+**修复**
+
+`_barrier_parent_scope` 取 `node=` 之后、首个斜杠之前的一段作为节点 id。`node=<id>`（执行器）、`node=<id>/verify`（agent 验收成员，续跑重启同标签）、`node=<id>/verdict`（兜底判定成员）都落到同一节点作用域；作用域匹配与其余屏障逻辑不动。
+
+**决策与偏差**
+
+- 验收侧副作用记在哪：维持现状，验收会话与执行器共用节点作用域。验收侧的副作用屏障在该节点作用域上做组仲裁、落组检查点行，验收侧 task 派发建出的子代理作用域挂在该节点作用域下。理由：验收就在节点工作区目录上进行，文件事实与作用域一致；给验收另立作用域属设计变更，不在本问题范围。
+- 验收侧的组另起、不并入执行器的组：组仲裁按（父作用域，消息标识）判组，验收会话的消息标识与执行器不同，天然开新组。验收侧副作用因此有自己的恢复点，回滚验收组不会把文件退到执行器首个副作用之前。
+- 同一函数里的「只认活动态作用域」未动：节点重试后旧作用域以已废弃态留账且 `owner_ref` 相同，屏障仍取第一个匹配。修复后验收会话与执行器同样受它影响，归 #62。
+- 缺陷修复，代码向既有设计对齐，未改设计文档。
+
+**验证**
+
+协调器层 `packages/kernel/kernel_tests/unit/run_plane/test_dispatch_barrier_chain.py`：
+
+- `test_verifier_session_barrier_lands_on_node_scope`（参数化两例：副作用屏障 `side_effect-Bash`、task 派发屏障 `dispatch-Task`）：验收会话以 context `node=a/verify` 挂靠，屏障放行，`before_child` 组检查点行落在节点作用域 `node-a`、锚点指向验收会话。
+
+修复前两例都失败于 `assert isinstance(outcome, BarrierProceed)`，实得 `BarrierDeny(reason='RuntimeError: 屏障父作用域未找到：node=a/verify')`，与问题单记录的复现输出一致。修复后通过。
+
+另以一次性探针在真实 graph run 平面核对（agent 执行器 + agent 验收 + traceback 开启，真实引擎经宿主挂靠会话，探针跑完即删）：修复前验收会话的 Bash、Task 屏障均 `BarrierDeny`、执行器 `BarrierProceed`；修复后验收会话两种屏障均放行，节点作用域上的检查点行依次为 scope_start → 执行器组 → terminal → 验收组，task 子工作区挂在节点作用域下。
+
+门禁（最终代码上）：`ruff format --check` 421 个文件已格式化、`ruff check` 全过、`lint-imports` 4 条契约保持 0 破坏、`codespell`（全部 git 跟踪的 markdown）无命中；全量 pytest 2815 通过、15 跳过（基线 2813 通过 + 新增 2 例），2 条告警为 breather 插件既有告警；`uv build --package workflow-controller-kernel` 的 sdist 与 wheel 构建成功（graph 插件包未改动，未构建）。
+
+**顺带发现**
+
+- 修复后验收侧的组检查点行可以存在，而子代理回滚的受理面不区分组属于哪个会话：CoreAPI 转发前只核「本 run 的派发组检查点行」，驱动 `rollback_subagent` 只校验节点执行中、在册映射与代次。验收期间以验收侧组为目标的子代理回滚会被受理：文件回到验收首个副作用之前，对话恢复数据取自锚点里的验收会话，恢复出的会话却按节点执行会话绑定回去、原执行会话绑定被清（走读，未复现）。是受理时拒绝验收侧组，还是另定验收期回滚语义，需要设计裁决。
 
 ## 跳过与延期
 

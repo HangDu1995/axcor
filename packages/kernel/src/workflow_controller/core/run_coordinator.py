@@ -2408,11 +2408,14 @@ class RunCoordinator:
     async def _barrier_parent_scope(
         self, tree: WorkspaceTreeRuntime, req: DispatchBarrierRequest
     ) -> ScopeRecord:
-        """按会话归属上下文解析屏障父作用域（成员 context 形如 node=<id>）。"""
+        """按会话归属上下文解析屏障父作用域（node=<id> 或 node=<id>/<相位>）。
+
+        执行与验收会话共用节点作用域：相位后缀只区分成员，不区分作用域。
+        """
         context = req.context or ""
         if not context.startswith("node="):
             raise RuntimeError(f"会话 {req.session_id} 缺少节点上下文，屏障无法定位父作用域")
-        node_id = context.removeprefix("node=")
+        node_id = context.removeprefix("node=").partition("/")[0]
         if not node_id:
             raise RuntimeError(f"会话 {req.session_id} 节点上下文为空，屏障无法定位父作用域")
         for record in await tree.manager.list_scopes():
