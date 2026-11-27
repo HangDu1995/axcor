@@ -16,11 +16,16 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from unittest.mock import patch
+from unittest.mock import ANY, Mock, patch
 
 import pytest
 
 from workflow_controller.core.feedback_evaluator import _EVAL_PROMPT, FeedbackEvaluator
+from workflow_controller.driver.claude_cli import ClaudeCLIDriver
+from workflow_controller.driver.claude_sdk import ClaudeSDKDriver
+from workflow_controller.driver.codex_cli import CodexCLIDriver
+from workflow_controller.driver.opencode import OpenCodeDriver
+from workflow_controller.driver.protocol import Driver
 from workflow_controller.session.events import Event, EventType
 
 
@@ -347,3 +352,35 @@ class TestFeedbackEvaluatorLLMCall:
         options = captured["options"]
         for tool in ("Bash", "Write", "Edit", "Skill", "Read"):
             assert tool in options.disallowed_tools
+        # Claude 驱动自带评估默认模型，基类不声明 Claude 专属回退。
+        assert options.model == "claude-sonnet-4-6"
+
+    def test_evaluation_default_model_is_driver_owned(self) -> None:
+        """反馈评估默认模型由各驱动自备，运行时中立基类不声明 Claude 专属默认。"""
+        assert Driver.evaluation_default_model == ""
+        assert ClaudeSDKDriver.evaluation_default_model == "claude-sonnet-4-6"
+        assert ClaudeCLIDriver.evaluation_default_model == "claude-sonnet-4-6"
+        assert OpenCodeDriver.evaluation_default_model == ""
+
+    @pytest.mark.parametrize("configured_model", [None, "explicit-model"])
+    async def test_codex_feedback_uses_read_only_and_resolves_model(
+        self, monkeypatch, configured_model
+    ):
+        """The Codex feedback query keeps its sandbox and model selection."""
+        monkeypatch.setenv("WORKFLOW_CONTROLLER_DRIVER", "codex_cli")
+        env = {"ANTHROPIC_MODEL": "provider-model"}
+        rotator = Mock()
+        rotator.env_for_driver.return_value = env
+        evaluator = FeedbackEvaluator(model=configured_model)
+        evaluator.set_auth_rotator(rotator)
+
+        async def feedback_events():
+            yield _make_assistant_event('{"is_complete": true, "progress": 1.0}')
+
+        with patch.object(CodexCLIDriver, "query", return_value=feedback_events()) as query:
+            result = await evaluator.evaluate([_make_assistant_event()], {}, 1)
+
+        assert result.is_complete
+        query.assert_called_once_with(
+            ANY, model=configured_model or "provider-model", permission_mode="read-only", env=env
+        )
