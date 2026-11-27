@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from aiohttp.test_utils import TestClient, TestServer
 
-from workflow_controller.config.settings import AppConfig, ReviewerConfig
+from workflow_controller.config.settings import AppConfig, HookServerConfig, ReviewerConfig
 from workflow_controller.core.hook_decision import HookDecision
 from workflow_controller.core.orchestrator import Orchestrator
 from workflow_controller.hooks.server import HookServer
@@ -14,7 +14,11 @@ from workflow_controller.hooks.server import HookServer
 
 async def test_stop_http_uses_background_snapshot_before_reviewer(tmp_path) -> None:
     """Shell and subagent waits bypass review; an empty snapshot reviews again."""
-    config = AppConfig(project_dir=str(tmp_path), reviewer=ReviewerConfig(enabled=True))
+    config = AppConfig(
+        project_dir=str(tmp_path),
+        hook_server=HookServerConfig(enabled=False),
+        reviewer=ReviewerConfig(enabled=True),
+    )
     orch = Orchestrator(config, default_project_dir=tmp_path / "stop.db")
     await orch.start()
     orch._cli_to_workflow_controller_session["claude-1"] = "worker-1"
