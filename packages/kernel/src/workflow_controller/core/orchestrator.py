@@ -851,6 +851,11 @@ class Orchestrator:
         facts = self.get_session_facts(session_id)
         return facts is not None and facts.state == "idle" and facts.stop_reason == "user_pause"
 
+    def has_running_runtime(self, session_id: str) -> bool:
+        """运行中的 runtime task 是否仍绑定该会话（含排空超时后未退出的卡死 task）。"""
+        task = self._loop_tasks.get(session_id)
+        return task is not None and not task.done()
+
     def is_terminal(self, session_id: str) -> bool:
         """终态谓词：loop 落 no 且非用户暂停（暂停是可恢复断点，不是终态）；
         不在池 = 不会再产结局，按终态计。

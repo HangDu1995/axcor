@@ -97,6 +97,7 @@ async def test_send_restores_evicted_session_before_inject_and_resume() -> None:
         affiliation=SimpleNamespace(resolve=lambda _sid: None),
         pool=SimpleNamespace(get=lambda _sid: current[0]),
         restore_session_from_store=restore,
+        has_running_runtime=lambda _sid: False,
         inject_prompt=inject,
         resume_session=resume,
     )
@@ -163,6 +164,36 @@ async def test_send_does_not_inject_when_active_query_does_not_drain() -> None:
     orch = SimpleNamespace(
         affiliation=SimpleNamespace(resolve=lambda _sid: None),
         pool=SimpleNamespace(get=lambda _sid: session),
+        pause_session=AsyncMock(return_value=False),
+        inject_prompt=inject,
+        resume_session=resume,
+    )
+    with pytest.raises(RuntimeError, match="did not drain"):
+        await SessionAPI(orch).send_message("s1", "check old process")
+    inject.assert_not_awaited()
+    resume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_re_drains_leftover_runtime_task_after_timeout() -> None:
+    """排空超时后重试：会话已 idle 但卡死 runtime task 仍在，须再次排空而非跳过。"""
+
+    @asynccontextmanager
+    async def guard():
+        yield
+
+    session = SimpleNamespace(
+        state=SimpleNamespace(value="idle"),
+        is_query_active=False,
+        current_iteration=7,
+        manual_prompt_guard=guard,
+    )
+    inject = AsyncMock()
+    resume = AsyncMock()
+    orch = SimpleNamespace(
+        affiliation=SimpleNamespace(resolve=lambda _sid: None),
+        pool=SimpleNamespace(get=lambda _sid: session),
+        has_running_runtime=lambda _sid: True,
         pause_session=AsyncMock(return_value=False),
         inject_prompt=inject,
         resume_session=resume,

@@ -1021,7 +1021,7 @@ class SessionAPI:
             raise ValueError(f"session not found: {session_id}")
         async with session.manual_prompt_guard():
             was_running = session.is_query_active
-            if was_running:
+            if was_running or self._orch.has_running_runtime(session_id):
                 drained = await self._orch.pause_session(session_id)
                 if not drained:
                     raise RuntimeError(
