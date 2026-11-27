@@ -66,11 +66,14 @@ async def boot_fake_kernel(project_dir: Path, settings_dir: Path) -> tuple[Orche
 
     config = AppConfig(
         project_dir=str(project_dir),
-        hook_server=HookServerConfig(enabled=True, port=0),
+        hook_server=HookServerConfig(enabled=True),
         reviewer=ReviewerConfig(enabled=False),
     )
     return await boot(
-        config, project_dir / "workflow-controller-config.yaml", settings_dir=settings_dir
+        config,
+        project_dir / "workflow-controller-config.yaml",
+        settings_dir=settings_dir,
+        hook_port=0,
     )
 
 

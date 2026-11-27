@@ -104,7 +104,11 @@ def create_core_api(
 
 
 async def boot(
-    config: AppConfig, config_path: Path, settings_dir: Path | None = None
+    config: AppConfig,
+    config_path: Path,
+    settings_dir: Path | None = None,
+    *,
+    hook_port: int | None = None,
 ) -> tuple[Orchestrator, CoreAPI]:
     """统一入口 — Web / Headless 共用。
 
@@ -120,7 +124,11 @@ async def boot(
     # 可变的 config.project_dir 漂移。切项目后 yaml 指针变了，但运行期存储位置
     # 不动，重启也从同一固定位置加载，根治「重启后 session 闪现/丢失」。
     # 测试与 demo 可显式传 default_project_dir 覆盖，不受影响。
-    orch = _Orchestrator(config, default_project_dir=Path.cwd())
+    orch = _Orchestrator(
+        config,
+        default_project_dir=Path.cwd(),
+        hook_server_port_override=hook_port,
+    )
     orch.config_path = config_path  # type: ignore[attr-defined]
     cfg_dir = settings_dir or default_config_dir()
     orch.cfg_dir = cfg_dir  # type: ignore[attr-defined]  # recent_dirs.json 等主机本地状态存此（与 auth_state.json 同目录）
