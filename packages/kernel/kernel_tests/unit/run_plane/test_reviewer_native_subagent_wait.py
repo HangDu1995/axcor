@@ -38,12 +38,15 @@ def _stop_interceptor(
     return ReviewerInterceptor(host, MagicMock(), emitter), host, emitter
 
 
-def _stop_event(text: str = "等待子代理完成") -> Event:
+def _stop_event(text: str = "等待子代理完成", background_tasks=None) -> Event:
+    data = {"final_text": text, "block_key": "claude-query-1"}
+    if background_tasks is not None:
+        data["background_tasks"] = background_tasks
     return Event.create(
         session_id="session-1",
         iteration=1,
         event_type="stop_requested",
-        data={"final_text": text, "block_key": "claude-query-1"},
+        data=data,
     )
 
 
@@ -58,8 +61,8 @@ async def test_in_flight_subagent_allows_stop_without_completing_loop() -> None:
         "stop_hook_native_subagent_wait",
         {
             "action": "stop",
-            "rationale": "query remains active while sub-agents run",
-            "subagents": [{"agent_type": "general-purpose", "agent_id": "agent-1"}],
+            "rationale": "query remains active while background work runs",
+            "background_tasks": [{"agent_type": "general-purpose", "agent_id": "agent-1"}],
         },
     )
     host.reviewer_for.return_value.decide_stop.assert_not_awaited()
@@ -115,3 +118,25 @@ async def test_regular_review_runs_without_in_flight() -> None:
     assert result is not None and result.action == "stop"
     host.reviewer_for.return_value.decide_stop.assert_awaited_once()
     host.mark_loop_let_exit.assert_called_once_with("session-1")
+
+
+async def test_stop_snapshot_allows_background_shell_without_reviewer() -> None:
+    interceptor, host, emitter = _stop_interceptor(in_flight=False)
+    tasks = [{"id": "bash-1", "type": "shell", "status": "running"}]
+
+    result = await getattr(interceptor, "_on_stop")(_stop_event(background_tasks=tasks))
+
+    assert result is not None and result.action == "stop"
+    host.subagent_status.assert_not_called()
+    host.reviewer_for.return_value.decide_stop.assert_not_awaited()
+    assert emitter.emit_async.call_args.args[1] == "stop_hook_background_task_wait"
+
+
+async def test_empty_stop_snapshot_overrides_stale_subagent_tracker() -> None:
+    interceptor, host, _ = _stop_interceptor(in_flight=True)
+
+    result = await getattr(interceptor, "_on_stop")(_stop_event("任务已经完成", []))
+
+    assert result is not None and result.action == "stop"
+    host.subagent_status.assert_not_called()
+    host.reviewer_for.return_value.decide_stop.assert_awaited_once()

@@ -513,7 +513,10 @@ async def _sdk_stop_cb(
 ) -> dict[str, Any]:
     if hooks.on_stop is None:
         return {}
-    data = {"last_assistant_message": get_last_text()}
+    data = {
+        "last_assistant_message": get_last_text(),
+        "background_tasks": input_data.get("background_tasks"),
+    }
     result = await hooks.on_stop(hooks.session_id, data)
     return result or {}
 
